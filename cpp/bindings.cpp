@@ -14,6 +14,8 @@
 #include "Python.h"
 #include "numpy/arrayobject.h"
 #include "rf-class-depth.h"
+#include "rf-pca.h"
+#include "rf-rp.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
 typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
@@ -42,8 +44,9 @@ static PyObject *MLANN_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
 static int MLANN_init(mlannIndex *self, PyObject *args) {
   PyArrayObject *py_data;
   int n, dim;
+  const char *index_type;
 
-  if (!PyArg_ParseTuple(args, "O!ii", &PyArray_Type, &py_data, &n, &dim)) return -1;
+  if (!PyArg_ParseTuple(args, "O!iis", &PyArray_Type, &py_data, &n, &dim, &index_type)) return -1;
 
   float *data = reinterpret_cast<float *>(PyArray_DATA(py_data));
   self->py_data = py_data;
@@ -51,7 +54,13 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
 
   self->n = n;
   self->dim = dim;
-  self->index = new MLANN(data, n, dim);
+
+  if (strcmp(index_type, "RP") == 0)
+    self->index = new RFRP(data, n, dim);
+  else if (strcmp(index_type, "PCA") == 0)
+    self->index = new RFPCA(data, n, dim);
+  else
+    self->index = new RFClass(data, n, dim);
 
   return 0;
 }

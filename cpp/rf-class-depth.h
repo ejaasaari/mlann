@@ -1,5 +1,4 @@
-#ifndef CPP_MLANN_H_
-#define CPP_MLANN_H_
+#pragma once
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -8,36 +7,17 @@
 #include <random>
 #include <stdexcept>
 
-#include "miniselect/pdqselect.h"
+#include "mlann.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
 typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
 
-class MLANN {
+class RFClass : public MLANN {
  public:
-  MLANN(const float *corpus_, int n_corpus_, int dim_)
-      : corpus(Eigen::Map<const RowMatrix>(corpus_, n_corpus_, dim_)),
-        n_corpus(n_corpus_),
-        dim(dim_) {}
+  RFClass(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
-  /**
-   * Build a normal index.
-   *
-   * @param n_trees_ number of trees to be grown
-   * @param depth_ depth of the trees; in the set
-   * \f$\{1,2, \dots ,\lfloor \log_2 (n) \rfloor \}\f$, where \f$n \f$ is the number
-   * of data points
-   * @param knn_ Eigen ref to the knn matrix of training set; a column is a training set point,
-   * and a row is k:th neighbor
-   * @param train_ Eigen ref to the training set; a column is a training set point
-   * @param density_ expected proportion of non-zero components in the
-   * random vectors; on the interval \f$(0,1]\f$; default value sets density to
-   * \f$ 1 / \sqrt{d} \f$, where \f$d\f$ is the dimension of the data
-   * a default value 0 initializes the rng randomly with std::random_device
-   */
   void grow(int n_trees_, int depth_, const Eigen::Ref<const IntRowMatrix> &knn_,
-            const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1,
-            int n_subsample = 100, float tol_ = 0.001) {
+            const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {
     if (!empty()) {
       throw std::logic_error("The index has already been grown.");
     }
@@ -59,7 +39,6 @@ class MLANN {
     b = b_;
     n_pool = n_trees_ * depth_;
     n_array = 1 << (depth_ + 1);
-    tol = tol_;
 
     if (density_ < 0) {
       density = 1.0 / std::sqrt(dim);
@@ -94,33 +73,6 @@ class MLANN {
     }
   }
 
-  /**@}*/
-
-  /**@}*/
-
-  /** @name Approximate k-nn search
-   * A query using a non-autotuned index. Finds k approximate nearest neighbors
-   * from a data set corpus for a query point q. Because the index is not autotuned,
-   * k and vote threshold are set manually. The indices of k nearest neighbors
-   * are written to a buffer out, which has to be preallocated to have at least
-   * length k. Optionally also Euclidean distances to these k nearest points
-   * are written to a buffer out_distances. If there are less than k points in
-   * the candidate set, -1 is written to the remaining locations of the
-   * output buffers.
-   */
-
-  /**
-   * Approximate k-nn search using a normal index.
-   *
-   * @param data pointer to an array containing the query point
-   * @param k number of nearest neighbors searched for
-   * @param vote_threshold - number of votes required for a query point to be included in the
-   * candidate set
-   * @param out output buffer (size = k) for the indices of k approximate nearest neighbors
-   * @param out_distances optional output buffer (size = k) for distances to k approximate nearest
-   * neighbors
-   * @param out_n_elected optional output parameter (size = 1) for the candidate set size
-   */
   void query(const float *data, int k, float vote_threshold, int *out,
              float *out_distances = nullptr, int *out_n_elected = nullptr) const {
     if (k <= 0 || k > n_corpus) {
@@ -166,7 +118,6 @@ class MLANN {
       for (int i = 0; i < n_labels; ++i) {
         if ((votes_total(labels[i]) += votes[i]) >= vote_threshold) {
           elected.push_back(labels[i]);
-          // votes_total(labels[i]) = std::numeric_limits<float>::min();
           votes_total(labels[i]) = -10000;
         }
       }
@@ -176,136 +127,6 @@ class MLANN {
 
     exact_knn(q, k, elected, out, out_distances);
   }
-
-  /**
-   *  Approximate k-nn search using a normal index.
-   *
-   * @param q Eigen ref to the query point
-   * @param k number of nearest neighbors searched for
-   * @param vote_threshold number of votes required for a query point to be included in the
-   * candidate set
-   * @param out output buffer (size = k) for the indices of k approximate nearest neighbors
-   * @param out_distances optional output buffer (size = k) for distances to k approximate nearest
-   * neighbors
-   * @param out_n_elected optional output parameter (size = 1) for the candidate set size
-   */
-  void query(const Eigen::Ref<const Eigen::VectorXf> &q, int k, float vote_threshold, int *out,
-             float *out_distances = nullptr, int *out_n_elected = nullptr) const {
-    query(q.data(), k, vote_threshold, out, out_distances, out_n_elected);
-  }
-
-  /**@}*/
-
-  /** @name Exact k-nn search
-   * Functions for fast exact k-nn search: find k nearest neighbors for a
-   * query point q from a data set corpus_. The indices of k nearest neighbors are
-   * written to a buffer out, which has to be preallocated to have at least
-   * length k. Optionally also the Euclidean distances to these k nearest points
-   * are written to a buffer out_distances. There are both static and member
-   * versions.
-   */
-
-  /**
-   * @param q_data pointer to an array containing the query point
-   * @param X_data pointer to an array containing the data set
-   * @param n_corpus number of points in a data set
-   * @param dim dimension of data
-   * @param k number of neighbors searched for
-   * @param out output buffer (size = k) for the indices of k nearest neighbors
-   * @param out_distances optional output buffer (size = k) for the distances to k nearest neighbors
-   */
-  static void exact_knn(const float *q_data, const float *X_data, int n_corpus, int dim, int k,
-                        int *out, float *out_distances = nullptr) {
-    const Eigen::Map<const RowMatrix> corpus(X_data, n_corpus, dim);
-    const Eigen::Map<const Eigen::VectorXf> q(q_data, dim);
-
-    if (k < 1 || k > n_corpus) {
-      throw std::out_of_range(
-          "k must be positive and no greater than the sample size of data corpus.");
-    }
-
-    Eigen::VectorXf distances(n_corpus);
-
-    for (int i = 0; i < n_corpus; ++i) distances(i) = (corpus.row(i) - q).squaredNorm();
-
-    if (k == 1) {
-      Eigen::MatrixXf::Index index;
-      distances.minCoeff(&index);
-      out[0] = index;
-
-      if (out_distances) out_distances[0] = std::sqrt(distances(index));
-
-      return;
-    }
-
-    Eigen::VectorXi idx(n_corpus);
-    std::iota(idx.data(), idx.data() + n_corpus, 0);
-    miniselect::pdqpartial_sort_branchless(
-        idx.data(), idx.data() + k, idx.data() + n_corpus,
-        [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
-
-    for (int i = 0; i < k; ++i) out[i] = idx(i);
-
-    if (out_distances) {
-      for (int i = 0; i < k; ++i) out_distances[i] = std::sqrt(distances(idx(i)));
-    }
-  }
-
-  /**
-   * @param q Eigen ref to a query point
-   * @param corpus Eigen ref to a data set
-   * @param k number of neighbors searched for
-   * @param out output buffer (size = k) for the indices of k nearest neighbors
-   * @param out_distances optional output buffer (size = k) for the distances to k nearest neighbors
-   */
-  static void exact_knn(const Eigen::Ref<const Eigen::VectorXf> &q,
-                        const Eigen::Ref<const RowMatrix> &corpus, int k, int *out,
-                        float *out_distances = nullptr) {
-    MLANN::exact_knn(q.data(), corpus.data(), corpus.rows(), corpus.cols(), k, out, out_distances);
-  }
-
-  /**
-   * @param q pointer to an array containing the query point
-   * @param k number of neighbors searched for
-   * @param out output buffer (size = k) for the indices of k nearest neighbors
-   * @param out_distances optional output buffer (size = k) for the distances to k nearest neighbors
-   */
-  void exact_knn(const float *q, int k, int *out, float *out_distances = nullptr) const {
-    MLANN::exact_knn(q, corpus.data(), n_corpus, dim, k, out, out_distances);
-  }
-
-  /**
-   * @param q pointer to an array containing the query point
-   * @param k number of points searched for
-   * @param out output buffer (size = k) for the indices of k nearest neighbors
-   * @param out_distances optional output buffer (size = k) for the distances to k nearest neighbors
-   */
-  void exact_knn(const Eigen::Ref<const Eigen::VectorXf> &q, int k, int *out,
-                 float *out_distances = nullptr) const {
-    MLANN::exact_knn(q.data(), corpus.data(), n_corpus, dim, k, out, out_distances);
-  }
-
-  static Eigen::MatrixXi exact_all_pairs(const float *corpus, size_t n_corpus, size_t dim, size_t k,
-                                         const float *training_data, size_t n_train) {
-    Eigen::MatrixXi true_knn(k, n_train);
-    for (size_t i = 0; i < n_train; ++i) {
-      MLANN::exact_knn(training_data + i * dim, corpus, n_corpus, dim, k, true_knn.data() + i * k);
-    }
-    return true_knn;
-  }
-  /**@}*/
-
-  /** @name Utility functions
-   */
-
-  /**
-   * Is the index is already constructed or not?
-   *
-   * @return - is the index empty?
-   */
-  bool empty() const { return n_trees == 0; }
-
-  /**@}*/
 
  private:
   static std::tuple<int, float, float> split(const std::vector<int>::iterator &begin,
@@ -342,7 +163,6 @@ class MLANN {
         return data[*(begin + i1) * cols + d] < data[*(begin + i2) * cols + d];
       });
 
-      // std::unordered_map<int, int> votes;
       std::vector<int> votes(n_corpus, 0);
 
       float entropy = 0;
@@ -425,10 +245,6 @@ class MLANN {
     return {out_labels, out_votes};
   }
 
-  /**
-   * Builds a single random projection tree. The tree is constructed by recursively
-   * projecting the data on a random vector and splitting into two by the median.
-   */
   void grow_subtree(std::vector<int>::iterator begin, std::vector<int>::iterator end,
                     int tree_level, int i, int n_tree, std::vector<std::vector<int>> &labels_tree,
                     std::vector<std::vector<float>> &votes_tree,
@@ -476,66 +292,6 @@ class MLANN {
                  random_dims, r, n_subsample);
   }
 
-  /**
-   * Find k nearest neighbors from data for the query point
-   */
-  void exact_knn(const Eigen::Map<const Eigen::VectorXf> &q, int k, const std::vector<int> &indices,
-                 int *out, float *out_distances = nullptr) const {
-    if (indices.empty()) {
-      for (int i = 0; i < k; ++i) out[i] = -1;
-      if (out_distances) {
-        for (int i = 0; i < k; ++i) out_distances[i] = -1;
-      }
-      return;
-    }
-
-    int n_elected = indices.size();
-    Eigen::VectorXf distances(n_elected);
-
-    for (int i = 0; i < n_elected; ++i) distances(i) = (corpus.row(indices[i]) - q).squaredNorm();
-
-    if (k == 1) {
-      Eigen::MatrixXf::Index index;
-      distances.minCoeff(&index);
-      out[0] = n_elected ? indices[index] : -1;
-
-      if (out_distances) out_distances[0] = n_elected ? std::sqrt(distances(index)) : -1;
-
-      return;
-    }
-
-    int n_to_sort = n_elected > k ? k : n_elected;
-    Eigen::VectorXi idx(n_elected);
-    std::iota(idx.data(), idx.data() + n_elected, 0);
-    miniselect::pdqpartial_sort_branchless(
-        idx.data(), idx.data() + n_to_sort, idx.data() + n_elected,
-        [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
-
-    for (int i = 0; i < k; ++i) out[i] = i < n_elected ? indices[idx(i)] : -1;
-
-    if (out_distances) {
-      for (int i = 0; i < k; ++i)
-        out_distances[i] = i < n_elected ? std::sqrt(distances(idx(i))) : -1;
-    }
-  }
-
-  const Eigen::Map<const RowMatrix> corpus;  // corpus from which nearest neighbors are searched
-  Eigen::MatrixXf split_points;              // all split points in all the trees
-  Eigen::MatrixXi split_dimensions;          // all split dimensions in all the trees
-  std::vector<std::vector<std::vector<int>>> labels_all;
-  std::vector<std::vector<std::vector<float>>> votes_all;
-
-  const int n_corpus;    // size of corpus
-  const int dim;         // dimension of data
-  int n_trees = 0;       // number of RP-trees
-  int depth = 0;         // depth of an RP-tree with median split
-  float density = -1.0;  // expected ratio of non-zero components in a projection matrix
-  int n_pool = 0;        // amount of random vectors needed for all the RP-trees
-  int n_array = 0;       // length of the one RP-tree as array
-  int b = 0;
-  int n_inner_nodes = 0;
-  int n_leaves = 0;
+  int n_subsample = 100;
   float tol = 0.001;
 };
-
-#endif  // CPP_MLANN_H_

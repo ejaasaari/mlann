@@ -1,6 +1,4 @@
 import numpy as np
-from os import name as os_name
-
 import mlannlib
 
 
@@ -9,11 +7,10 @@ class MLANNIndex(object):
     An MLANN index object
     """
 
-    def __init__(self, data, shape=None):
+    def __init__(self, data, index_type="PCA"):
         """
         Initializes an MLANN index object.
         :param data: Input data either as a NxDim numpy ndarray or as a filepath to a binary file containing the data.
-        :param shape: Shape of the data as a tuple (N, dim). Needs to be specified only if loading the data from a file.
         :return:
         """
         if isinstance(data, np.ndarray):
@@ -28,7 +25,7 @@ class MLANNIndex(object):
             raise ValueError("Data must be an ndarray")
 
         if data is not None:
-            self.index = mlannlib.MLANNIndex(data, n_samples, dim)
+            self.index = mlannlib.MLANNIndex(data, n_samples, dim, index_type)
             self.dim = dim
 
         self.built = False
@@ -42,7 +39,7 @@ class MLANNIndex(object):
             raise ValueError("Density should be in (0, 1]")
         return density
 
-    def build(self, train, knn, depth, n_trees, density="auto"):
+    def build(self, train, knn, n_trees, depth, density="auto"):
         """
         Builds a normal MLANN index.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
@@ -54,7 +51,17 @@ class MLANNIndex(object):
             raise RuntimeError("The index has already been built")
 
         density = self._compute_density(density)
-        self.index.build(train, train.shape[0], train.shape[1], knn, knn.shape[0], knn.shape[1], n_trees, depth, density)
+        self.index.build(
+            train,
+            train.shape[0],
+            train.shape[1],
+            knn,
+            knn.shape[0],
+            knn.shape[1],
+            n_trees,
+            depth,
+            density,
+        )
         self.built = True
 
     def ann(self, q, k, votes_required, return_distances=False):
