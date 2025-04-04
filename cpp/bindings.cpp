@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <Eigen/Dense>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -11,25 +12,16 @@
 #include <vector>
 
 #include "Python.h"
-
-#ifndef _WIN32
-#include <sys/mman.h>
-#endif
-
-#include <Eigen/Dense>
-
 #include "numpy/arrayobject.h"
 #include "rf-class-depth.h"
 
-using Eigen::MatrixXf;
-using Eigen::VectorXf;
-using Eigen::VectorXi;
+typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
+typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
 
 typedef struct {
   PyObject_HEAD MLANN *index;
-  PyObject *py_data;
+  PyArrayObject *py_data;
   float *data;
-  bool mmap;
   int n;
   int dim;
   int k;
@@ -47,117 +39,41 @@ static PyObject *MLANN_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
   return reinterpret_cast<PyObject *>(self);
 }
 
-float *read_memory(char *file, int n, int dim) {
-  FILE *fd;
-  if ((fd = fopen(file, "rb")) == NULL) {
-    return NULL;
-  }
-
-  float *data = new float[n * dim];
-
-  if (data == NULL) {
-    fclose(fd);
-    return NULL;
-  }
-
-  int read = fread(data, sizeof(float), n * dim, fd);
-  fclose(fd);
-
-  if (read != n * dim) {
-    delete[] data;
-    return NULL;
-  }
-
-  return data;
-}
-
-#ifndef _WIN32
-float *read_mmap(char *file, int n, int dim) {
-  FILE *fd;
-  if ((fd = fopen(file, "rb")) == NULL) return NULL;
-
-  float *data;
-
-  if ((data = reinterpret_cast<float *>(
-#ifdef MAP_POPULATE
-           mmap(0, n * dim * sizeof(float), PROT_READ, MAP_SHARED | MAP_POPULATE, fileno(fd),
-                0))) == MAP_FAILED) {
-#else
-           mmap(0, n * dim * sizeof(float), PROT_READ, MAP_SHARED, fileno(fd), 0))) == MAP_FAILED) {
-#endif
-    return NULL;
-  }
-
-  fclose(fd);
-  return data;
-}
-#endif
-
 static int MLANN_init(mlannIndex *self, PyObject *args) {
-  PyObject *py_data;
-  int n, dim, mmap;
+  PyArrayObject *py_data;
+  int n, dim;
 
-  if (!PyArg_ParseTuple(args, "Oiii", &py_data, &n, &dim, &mmap)) return -1;
+  if (!PyArg_ParseTuple(args, "O!ii", &PyArray_Type, &py_data, &n, &dim)) return -1;
 
-  float *data;
-  if (PyUnicode_Check(py_data)) {
-    char *file = PyBytes_AsString(py_data);
-
-    struct stat sb;
-    if (stat(file, &sb) != 0) {
-      PyErr_SetString(PyExc_IOError, strerror(errno));
-      return -1;
-    }
-
-    if (sb.st_size != static_cast<unsigned>(sizeof(float) * dim * n)) {
-      PyErr_SetString(PyExc_ValueError, "Size of the input is not N x dim");
-      return -1;
-    }
-
-#ifndef _WIN32
-    data = mmap ? read_mmap(file, n, dim) : read_memory(file, n, dim);
-#else
-    data = read_memory(file, n, dim);
-#endif
-
-    if (data == NULL) {
-      PyErr_SetString(PyExc_IOError, "Unable to read data from file or allocate memory for it");
-      return -1;
-    }
-
-    self->mmap = mmap;
-    self->data = data;
-  } else {
-    data = reinterpret_cast<float *>(PyArray_DATA((PyArrayObject *)py_data));
-    self->py_data = py_data;
-    Py_XINCREF(self->py_data);
-  }
+  float *data = reinterpret_cast<float *>(PyArray_DATA(py_data));
+  self->py_data = py_data;
+  Py_XINCREF(self->py_data);
 
   self->n = n;
   self->dim = dim;
-  self->index = new MLANN(data, dim, n);
+  self->index = new MLANN(data, n, dim);
 
   return 0;
 }
 
 static PyObject *build(mlannIndex *self, PyObject *args) {
-  PyObject *train_data;
+  PyArrayObject *train_data;
   int n_train, dim_train;
 
-  PyObject *knn_data;
+  PyArrayObject *knn_data;
   int n_knn, dim_knn;
 
   int n_trees, depth;
   float density;
 
-  if (!PyArg_ParseTuple(args, "OiiOiiiif", &train_data, &n_train, &dim_train, &knn_data, &n_knn,
-                        &dim_knn, &n_trees, &depth, &density))
+  if (!PyArg_ParseTuple(args, "O!iiO!iiiif", &PyArray_Type, &train_data, &n_train, &dim_train,
+                        &PyArray_Type, &knn_data, &n_knn, &dim_knn, &n_trees, &depth, &density))
     return NULL;
 
-  Eigen::Map<const Eigen::MatrixXi> knn(
-      reinterpret_cast<int *>(PyArray_DATA((PyArrayObject *)knn_data)), n_knn, dim_knn);
-  Eigen::Map<const Eigen::MatrixXf> train(
-      reinterpret_cast<float *>(PyArray_DATA((PyArrayObject *)train_data)), n_train, dim_train);
+  Eigen::Map<const IntRowMatrix> knn(reinterpret_cast<int *>(PyArray_DATA(knn_data)), n_knn,
+                                     dim_knn);
+  Eigen::Map<const RowMatrix> train(reinterpret_cast<float *>(PyArray_DATA(train_data)), n_train,
+                                    dim_train);
 
   try {
     Py_BEGIN_ALLOW_THREADS;
@@ -173,13 +89,7 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
 
 static void mlann_dealloc(mlannIndex *self) {
   if (self->data) {
-#ifndef _WIN32
-    if (self->mmap)
-      munmap(self->data, self->n * self->dim * sizeof(float));
-    else
-#endif
-      delete[] self->data;
-
+    delete[] self->data;
     self->data = NULL;
   }
 
@@ -196,12 +106,13 @@ static void mlann_dealloc(mlannIndex *self) {
 
 static PyObject *ann(mlannIndex *self, PyObject *args) {
   PyArrayObject *v;
-  int k, elect, dim, n, return_distances;
+  int k, dim, n, return_distances;
+  float elect;
 
-  if (!PyArg_ParseTuple(args, "O!iii", &PyArray_Type, &v, &k, &elect, &return_distances))
+  if (!PyArg_ParseTuple(args, "O!ifi", &PyArray_Type, &v, &k, &elect, &return_distances))
     return NULL;
 
-  float *indata = reinterpret_cast<float *>(PyArray_DATA((PyArrayObject *)v));
+  float *indata = reinterpret_cast<float *>(PyArray_DATA(v));
   PyObject *nearest;
 
   if (PyArray_NDIM(v) == 1) {

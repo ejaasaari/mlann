@@ -1,50 +1,24 @@
 #ifndef CPP_MLANN_H_
 #define CPP_MLANN_H_
 
+#include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 
-#include <Eigen/Dense>
 #include "miniselect/pdqselect.h"
+
+typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
+typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
 
 class MLANN {
  public:
-  /** @name Constructors
-   * The constructor does not actually build the index. The building is done
-   * by the function grow() which has to be called before queries can be made.
-   * There are two different versions of the constructor which differ only
-   * by the type of the input data. The first version takes the data set
-   * as `Ref` to `MatrixXf`, which means that the argument
-   * can be either `MatrixXf` or `Map<MatrixXf>` (also certain blocks of `MatrixXf`
-   * may be accepted, see
-   * [Eigen::Ref](https://eigen.tuxfamily.org/dox/TopicFunctionTakingEigenTypes.html) for more
-   * information). The second version takes a float pointer to an array containing the data set, and
-   * the dimension and the sample size of the data. There are also corresponding versions of all the
-   * member functions which take input data. In all cases the data is assumed to be stored in
-   * column-major order such that each data point is stored contiguously in memory. In all cases no
-   * copies are made of the original data matrix. */
-
-  /**
-   * @param corpus_ Eigen ref to the corpus, stored as one data point per column
-   */
-  MLANN(const Eigen::Ref<const Eigen::MatrixXf> &corpus_)
-      : corpus(Eigen::Map<const Eigen::MatrixXf>(corpus_.data(), corpus_.rows(), corpus_.cols())),
-        n_corpus(corpus_.cols()),
-        dim(corpus_.rows()) {}
-
-  MLANN(const float *corpus_, int dim_, int n_corpus_)
-      : corpus(Eigen::Map<const Eigen::MatrixXf>(corpus_, dim_, n_corpus_)),
+  MLANN(const float *corpus_, int n_corpus_, int dim_)
+      : corpus(Eigen::Map<const RowMatrix>(corpus_, n_corpus_, dim_)),
         n_corpus(n_corpus_),
         dim(dim_) {}
-
-  /**@}*/
-
-  /** @name Normal index building.
-   * Build a normal (not autotuned) index.
-   */
 
   /**
    * Build a normal index.
@@ -59,12 +33,11 @@ class MLANN {
    * @param density_ expected proportion of non-zero components in the
    * random vectors; on the interval \f$(0,1]\f$; default value sets density to
    * \f$ 1 / \sqrt{d} \f$, where \f$d\f$ is the dimension of the data
-   * @param seed seed given to a rng when generating random vectors;
    * a default value 0 initializes the rng randomly with std::random_device
    */
-  void grow(int n_trees_, int depth_, const Eigen::Ref<const Eigen::MatrixXi> &knn_,
-            const Eigen::Ref<const Eigen::MatrixXf> &train_, float density_ = -1.0, int b_ = 0,
-            int n_subsample = -1, float tol_ = 0.001, int seed = 0) {
+  void grow(int n_trees_, int depth_, const Eigen::Ref<const IntRowMatrix> &knn_,
+            const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1,
+            int n_subsample = 100, float tol_ = 0.001) {
     if (!empty()) {
       throw std::logic_error("The index has already been grown.");
     }
@@ -73,14 +46,11 @@ class MLANN {
       throw std::out_of_range("The number of trees must be positive.");
     }
 
-    int n_train = train_.cols();
-    // if (depth_ <= 0 || depth_ > std::log2(n_train)) {
-    //   throw std::out_of_range("The depth must belong to the set {1, ... , log2(n_train)}.");
-    // }
-
     if (density_ < -1.0001 || density_ > 1.0001 || (density_ > -0.9999 && density_ < -0.0001)) {
       throw std::out_of_range("The density must be on the interval (0,1].");
     }
+
+    int n_train = train_.rows();
 
     n_trees = n_trees_;
     depth = depth_;
@@ -97,21 +67,16 @@ class MLANN {
       density = density_;
     }
 
-    const Eigen::Map<const Eigen::MatrixXi> knn(knn_.data(), knn_.rows(), knn_.cols());
-    const Eigen::Map<const Eigen::MatrixXf> train(train_.data(), train_.rows(), train_.cols());
+    const Eigen::Map<const IntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
+    const Eigen::Map<const RowMatrix> train(train_.data(), train_.rows(), train_.cols());
 
     split_points = Eigen::MatrixXf(n_array, n_trees);
     split_dimensions = Eigen::MatrixXi(n_array, n_trees);
     labels_all = std::vector<std::vector<std::vector<int>>>(n_trees);
     votes_all = std::vector<std::vector<std::vector<float>>>(n_trees);
 
-    std::mt19937 r;
-    if (seed) {
-      r = std::mt19937(seed);
-    } else {
-      std::random_device gen;
-      r = std::mt19937(gen());
-    }
+    std::random_device gen;
+    std::mt19937 r = std::mt19937(gen());
 
     const auto random_dims_all = generate_random_directions(r);
 
@@ -243,15 +208,15 @@ class MLANN {
   /**
    * @param q_data pointer to an array containing the query point
    * @param X_data pointer to an array containing the data set
-   * @param dim dimension of data
    * @param n_corpus number of points in a data set
+   * @param dim dimension of data
    * @param k number of neighbors searched for
    * @param out output buffer (size = k) for the indices of k nearest neighbors
    * @param out_distances optional output buffer (size = k) for the distances to k nearest neighbors
    */
-  static void exact_knn(const float *q_data, const float *X_data, int dim, int n_corpus, int k,
+  static void exact_knn(const float *q_data, const float *X_data, int n_corpus, int dim, int k,
                         int *out, float *out_distances = nullptr) {
-    const Eigen::Map<const Eigen::MatrixXf> corpus(X_data, dim, n_corpus);
+    const Eigen::Map<const RowMatrix> corpus(X_data, n_corpus, dim);
     const Eigen::Map<const Eigen::VectorXf> q(q_data, dim);
 
     if (k < 1 || k > n_corpus) {
@@ -261,7 +226,7 @@ class MLANN {
 
     Eigen::VectorXf distances(n_corpus);
 
-    for (int i = 0; i < n_corpus; ++i) distances(i) = (corpus.col(i) - q).squaredNorm();
+    for (int i = 0; i < n_corpus; ++i) distances(i) = (corpus.row(i) - q).squaredNorm();
 
     if (k == 1) {
       Eigen::MatrixXf::Index index;
@@ -294,7 +259,7 @@ class MLANN {
    * @param out_distances optional output buffer (size = k) for the distances to k nearest neighbors
    */
   static void exact_knn(const Eigen::Ref<const Eigen::VectorXf> &q,
-                        const Eigen::Ref<const Eigen::MatrixXf> &corpus, int k, int *out,
+                        const Eigen::Ref<const RowMatrix> &corpus, int k, int *out,
                         float *out_distances = nullptr) {
     MLANN::exact_knn(q.data(), corpus.data(), corpus.rows(), corpus.cols(), k, out, out_distances);
   }
@@ -306,7 +271,7 @@ class MLANN {
    * @param out_distances optional output buffer (size = k) for the distances to k nearest neighbors
    */
   void exact_knn(const float *q, int k, int *out, float *out_distances = nullptr) const {
-    MLANN::exact_knn(q, corpus.data(), dim, n_corpus, k, out, out_distances);
+    MLANN::exact_knn(q, corpus.data(), n_corpus, dim, k, out, out_distances);
   }
 
   /**
@@ -317,14 +282,15 @@ class MLANN {
    */
   void exact_knn(const Eigen::Ref<const Eigen::VectorXf> &q, int k, int *out,
                  float *out_distances = nullptr) const {
-    MLANN::exact_knn(q.data(), corpus.data(), dim, n_corpus, k, out, out_distances);
+    MLANN::exact_knn(q.data(), corpus.data(), n_corpus, dim, k, out, out_distances);
   }
 
   static Eigen::MatrixXi exact_all_pairs(const float *corpus, size_t n_corpus, size_t dim, size_t k,
                                          const float *training_data, size_t n_train) {
     Eigen::MatrixXi true_knn(k, n_train);
-    for (size_t i = 0; i < n_train; ++i)
-      MLANN::exact_knn(training_data + i * dim, corpus, dim, n_corpus, k, true_knn.data() + i * k);
+    for (size_t i = 0; i < n_train; ++i) {
+      MLANN::exact_knn(training_data + i * dim, corpus, n_corpus, dim, k, true_knn.data() + i * k);
+    }
     return true_knn;
   }
   /**@}*/
@@ -345,10 +311,9 @@ class MLANN {
   static std::tuple<int, float, float> split(const std::vector<int>::iterator &begin,
                                              const std::vector<int>::iterator &end,
                                              const std::vector<int> &random_dims,
-                                             const Eigen::Ref<const Eigen::MatrixXf> &train,
-                                             const Eigen::Ref<const Eigen::MatrixXi> &knn,
-                                             float tol, int n_corpus, std::mt19937 &r,
-                                             int n_subsample = -1) {
+                                             const Eigen::Ref<const RowMatrix> &train,
+                                             const Eigen::Ref<const IntRowMatrix> &knn, float tol,
+                                             int n_corpus, std::mt19937 &r, int n_subsample) {
     int n = end - begin;
     int max_dim = -1;
     float max_gain = 0, max_split = 0;
@@ -369,12 +334,12 @@ class MLANN {
 
     Eigen::VectorXf left_entropies(n), right_entropies(n);
     const float *data = train.data();
-    const int rows = train.rows();
-    const int k_build = knn.rows();
+    const int cols = train.cols();
+    const int k_build = knn.cols();
 
     for (const auto &d : random_dims) {
-      std::sort(indices.begin(), indices.end(), [data, rows, d, begin](int i1, int i2) {
-        return data[*(begin + i1) * rows + d] < data[*(begin + i2) * rows + d];
+      std::sort(indices.begin(), indices.end(), [data, cols, d, begin](int i1, int i2) {
+        return data[*(begin + i1) * cols + d] < data[*(begin + i2) * cols + d];
       });
 
       // std::unordered_map<int, int> votes;
@@ -383,7 +348,7 @@ class MLANN {
       float entropy = 0;
       for (int ii = 0; ii < n; ++ii) {
         const int i = indices[ii];
-        const Eigen::VectorXi knn_crnt = knn.col(*(begin + i));
+        const Eigen::VectorXi knn_crnt = knn.row(*(begin + i));
         for (int j = 0; j < k_build; ++j) {
           int v = ++votes[knn_crnt(j)];
           if (v > 1) entropy -= (v - 1) * log2(v - 1);
@@ -394,7 +359,7 @@ class MLANN {
 
       for (int ii = 0; ii < n - 1; ++ii) {
         const int i = indices[ii];
-        const Eigen::VectorXi knn_crnt = knn.col(*(begin + i));
+        const Eigen::VectorXi knn_crnt = knn.row(*(begin + i));
         for (int j = 0; j < k_build; ++j) {
           int v = --votes[knn_crnt(j)];
           entropy -= (v + 1) * log2(v + 1);
@@ -406,14 +371,14 @@ class MLANN {
 
       for (int ii = 0; ii < n - 1; ++ii) {
         const int i = indices[ii];
-        if (train(d, *(begin + i)) == train(d, *(begin + indices[ii + 1]))) continue;
+        if (train(*(begin + i), d) == train(*(begin + indices[ii + 1]), d)) continue;
         float left = static_cast<float>(ii + 1) / n * left_entropies[ii];
         float right = static_cast<float>(n - ii - 1) / n * right_entropies[ii];
         float gain = left_entropies[n - 1] - (left + right);
         if (gain > max_gain + tol) {
           max_gain = gain;
           max_dim = d;
-          max_split = (train(d, *(begin + i)) + train(d, *(begin + indices[ii + 1]))) / 2.0;
+          max_split = (train(*(begin + i), d) + train(*(begin + indices[ii + 1]), d)) / 2.0;
         }
       }
     }
@@ -436,11 +401,11 @@ class MLANN {
 
   std::pair<std::vector<int>, std::vector<float>> count_votes(
       std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
-      const Eigen::Ref<const Eigen::MatrixXi> &knn) {
-    int k_build = knn.rows();
+      const Eigen::Ref<const IntRowMatrix> &knn) {
+    int k_build = knn.cols();
     std::unordered_map<int, int> votes;
     for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const Eigen::VectorXi knn_crnt = knn.col(*it);
+      const Eigen::VectorXi knn_crnt = knn.row(*it);
       for (int j = 0; j < k_build; ++j) ++votes[knn_crnt(j)];
     }
 
@@ -467,8 +432,8 @@ class MLANN {
   void grow_subtree(std::vector<int>::iterator begin, std::vector<int>::iterator end,
                     int tree_level, int i, int n_tree, std::vector<std::vector<int>> &labels_tree,
                     std::vector<std::vector<float>> &votes_tree,
-                    const Eigen::Ref<const Eigen::MatrixXf> &train,
-                    const Eigen::Ref<const Eigen::MatrixXi> &knn,
+                    const Eigen::Ref<const RowMatrix> &train,
+                    const Eigen::Ref<const IntRowMatrix> &knn,
                     const std::vector<std::vector<int>> &random_dims, std::mt19937 &r,
                     int n_subsample) {
     if (tree_level == depth) {
@@ -495,9 +460,9 @@ class MLANN {
     }
 
     const float *data = train.data();
-    const int rows = train.rows();
-    auto mid = std::partition(begin, end, [data, rows, max_dim, max_split](const int em) {
-      return data[em * rows + max_dim] <= max_split;
+    const int cols = train.cols();
+    auto mid = std::partition(begin, end, [data, cols, max_dim, max_split](const int em) {
+      return data[em * cols + max_dim] <= max_split;
     });
 
     split_points(i, n_tree) = max_split;
@@ -527,7 +492,7 @@ class MLANN {
     int n_elected = indices.size();
     Eigen::VectorXf distances(n_elected);
 
-    for (int i = 0; i < n_elected; ++i) distances(i) = (corpus.col(indices[i]) - q).squaredNorm();
+    for (int i = 0; i < n_elected; ++i) distances(i) = (corpus.row(indices[i]) - q).squaredNorm();
 
     if (k == 1) {
       Eigen::MatrixXf::Index index;
@@ -554,10 +519,9 @@ class MLANN {
     }
   }
 
-  const Eigen::Map<const Eigen::MatrixXf>
-      corpus;                        // corpus from which nearest neighbors are searched
-  Eigen::MatrixXf split_points;      // all split points in all the trees
-  Eigen::MatrixXi split_dimensions;  // all split dimensions in all the trees
+  const Eigen::Map<const RowMatrix> corpus;  // corpus from which nearest neighbors are searched
+  Eigen::MatrixXf split_points;              // all split points in all the trees
+  Eigen::MatrixXi split_dimensions;          // all split dimensions in all the trees
   std::vector<std::vector<std::vector<int>>> labels_all;
   std::vector<std::vector<std::vector<float>>> votes_all;
 

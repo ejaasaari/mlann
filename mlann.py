@@ -9,12 +9,11 @@ class MLANNIndex(object):
     An MLANN index object
     """
 
-    def __init__(self, data, shape=None, mmap=False):
+    def __init__(self, data, shape=None):
         """
         Initializes an MLANN index object.
         :param data: Input data either as a NxDim numpy ndarray or as a filepath to a binary file containing the data.
         :param shape: Shape of the data as a tuple (N, dim). Needs to be specified only if loading the data from a file.
-        :param mmap: If true, the data is mapped into memory. Has effect only if the data is loaded from a file.
         :return:
         """
         if isinstance(data, np.ndarray):
@@ -25,21 +24,11 @@ class MLANNIndex(object):
             if not data.flags["C_CONTIGUOUS"] or not data.flags["ALIGNED"]:
                 raise ValueError("The data matrix has to be C_CONTIGUOUS and ALIGNED")
             n_samples, dim = data.shape
-        elif isinstance(data, str):
-            if not isinstance(shape, tuple) or len(shape) != 2:
-                raise ValueError(
-                    "You must specify the shape of the data as a tuple (N, dim) "
-                    "when loading data from a binary file"
-                )
-            n_samples, dim = shape
         elif data is not None:
-            raise ValueError("Data must be either an ndarray or a filepath")
-
-        if mmap and os_name == "nt":
-            raise ValueError("Memory mapping is not available on Windows")
+            raise ValueError("Data must be an ndarray")
 
         if data is not None:
-            self.index = mlannlib.MLANNIndex(data, n_samples, dim, mmap)
+            self.index = mlannlib.MLANNIndex(data, n_samples, dim)
             self.dim = dim
 
         self.built = False
@@ -65,7 +54,7 @@ class MLANNIndex(object):
             raise RuntimeError("The index has already been built")
 
         density = self._compute_density(density)
-        self.index.build(train, knn, n_trees, depth, density)
+        self.index.build(train, train.shape[0], train.shape[1], knn, knn.shape[0], knn.shape[1], n_trees, depth, density)
         self.built = True
 
     def ann(self, q, k, votes_required, return_distances=False):
