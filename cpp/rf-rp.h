@@ -135,7 +135,8 @@ class RFRP : public MLANN {
 
     if (out_n_elected) *out_n_elected = elected.size();
 
-    exact_knn(q.transpose(), k, elected, out, out_distances);
+    const Eigen::Map<const Eigen::RowVectorXf> qT(data, dim);
+    exact_knn(qT, k, elected, out, out_distances);
   }
 
  private:
