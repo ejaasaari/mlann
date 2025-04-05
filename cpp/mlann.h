@@ -3,6 +3,7 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "miniselect/pdqselect.h"
 

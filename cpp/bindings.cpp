@@ -6,10 +6,6 @@
 #include <Eigen/Dense>
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
-#include <numeric>
-#include <string>
-#include <vector>
 
 #include "Python.h"
 #include "numpy/arrayobject.h"
