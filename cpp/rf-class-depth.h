@@ -9,14 +9,11 @@
 
 #include "mlann.h"
 
-typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
-typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
-
 class RFClass : public MLANN {
  public:
   RFClass(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
-  void grow(int n_trees_, int depth_, const Eigen::Ref<const IntRowMatrix> &knn_,
+  void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
             const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {
     if (!empty()) {
       throw std::logic_error("The index has already been grown.");
@@ -46,7 +43,7 @@ class RFClass : public MLANN {
       density = density_;
     }
 
-    const Eigen::Map<const IntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
+    const Eigen::Map<const UIntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
     const Eigen::Map<const RowMatrix> train(train_.data(), train_.rows(), train_.cols());
 
     split_points = Eigen::MatrixXf(n_array, n_trees);
@@ -133,7 +130,7 @@ class RFClass : public MLANN {
                                              const std::vector<int>::iterator &end,
                                              const std::vector<int> &random_dims,
                                              const Eigen::Ref<const RowMatrix> &train,
-                                             const Eigen::Ref<const IntRowMatrix> &knn, float tol,
+                                             const Eigen::Ref<const UIntRowMatrix> &knn, float tol,
                                              int n_corpus, std::mt19937 &r, int n_subsample) {
     int n = end - begin;
     int max_dim = -1;
@@ -168,7 +165,7 @@ class RFClass : public MLANN {
       float entropy = 0;
       for (int ii = 0; ii < n; ++ii) {
         const int i = indices[ii];
-        const Eigen::VectorXi knn_crnt = knn.row(*(begin + i));
+        const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*(begin + i));
         for (int j = 0; j < k_build; ++j) {
           int v = ++votes[knn_crnt(j)];
           if (v > 1) entropy -= (v - 1) * log2(v - 1);
@@ -179,7 +176,7 @@ class RFClass : public MLANN {
 
       for (int ii = 0; ii < n - 1; ++ii) {
         const int i = indices[ii];
-        const Eigen::VectorXi knn_crnt = knn.row(*(begin + i));
+        const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*(begin + i));
         for (int j = 0; j < k_build; ++j) {
           int v = --votes[knn_crnt(j)];
           entropy -= (v + 1) * log2(v + 1);
@@ -221,11 +218,11 @@ class RFClass : public MLANN {
 
   std::pair<std::vector<int>, std::vector<float>> count_votes(
       std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
-      const Eigen::Ref<const IntRowMatrix> &knn) {
+      const Eigen::Ref<const UIntRowMatrix> &knn) {
     int k_build = knn.cols();
     std::unordered_map<int, int> votes;
     for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const Eigen::VectorXi knn_crnt = knn.row(*it);
+      const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*it);
       for (int j = 0; j < k_build; ++j) ++votes[knn_crnt(j)];
     }
 
@@ -249,7 +246,7 @@ class RFClass : public MLANN {
                     int tree_level, int i, int n_tree, std::vector<std::vector<int>> &labels_tree,
                     std::vector<std::vector<float>> &votes_tree,
                     const Eigen::Ref<const RowMatrix> &train,
-                    const Eigen::Ref<const IntRowMatrix> &knn,
+                    const Eigen::Ref<const UIntRowMatrix> &knn,
                     const std::vector<std::vector<int>> &random_dims, std::mt19937 &r,
                     int n_subsample) {
     if (tree_level == depth) {

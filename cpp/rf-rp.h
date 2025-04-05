@@ -12,14 +12,11 @@
 
 #include "mlann.h"
 
-typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
-typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
-
 class RFRP : public MLANN {
  public:
   RFRP(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
-  void grow(int n_trees_, int depth_, const Eigen::Ref<const IntRowMatrix> &knn_,
+  void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
             const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {
     if (!empty()) {
       throw std::logic_error("The index has already been grown.");
@@ -52,7 +49,7 @@ class RFRP : public MLANN {
       density = density_;
     }
 
-    const Eigen::Map<const IntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
+    const Eigen::Map<const UIntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
     const Eigen::Map<const RowMatrix> train(train_.data(), train_.rows(), train_.cols());
 
     density < 1 ? build_sparse_random_matrix(sparse_random_matrix, n_pool, dim, density)
@@ -144,11 +141,11 @@ class RFRP : public MLANN {
  private:
   std::pair<std::vector<int>, std::vector<float>> count_votes(std::vector<int>::iterator leaf_begin,
                                                               std::vector<int>::iterator leaf_end,
-                                                              const IntRowMatrix &knn) {
+                                                              const UIntRowMatrix &knn) {
     int k_build = knn.cols();
     std::unordered_map<int, float> votes;
     for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const Eigen::VectorXi knn_crnt = knn.row(*it);
+      const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*it);
       for (int j = 0; j < k_build; ++j) votes[knn_crnt(j)] += 1.0;
     }
 
@@ -172,7 +169,7 @@ class RFRP : public MLANN {
                     int tree_level, int i, int n_tree, const Eigen::MatrixXf &tree_projections,
                     std::vector<std::vector<int>> &labels_tree,
                     std::vector<std::vector<float>> &votes_tree,
-                    const Eigen::Map<const IntRowMatrix> &knn) {
+                    const Eigen::Map<const UIntRowMatrix> &knn) {
     int n = end - begin;
     int idx_left = 2 * i + 1;
     int idx_right = idx_left + 1;

@@ -2,13 +2,14 @@
 
 #include <Eigen/Dense>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <unordered_map>
 
 #include "miniselect/pdqselect.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
-typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
+typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> UIntRowMatrix;
 
 class MLANN {
  public:
@@ -19,7 +20,7 @@ class MLANN {
 
   virtual ~MLANN() = default;
 
-  virtual void grow(int n_trees_, int depth_, const Eigen::Ref<const IntRowMatrix> &knn_,
+  virtual void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
                     const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {}
 
   virtual void query(const float *data, int k, float vote_threshold, int *out,
@@ -87,11 +88,11 @@ class MLANN {
  protected:
   std::pair<std::vector<int>, std::vector<float>> count_votes(
       std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
-      const Eigen::Ref<const IntRowMatrix> &knn) {
+      const Eigen::Ref<const UIntRowMatrix> &knn) {
     int k_build = knn.cols();
     std::unordered_map<int, int> votes;
     for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const Eigen::VectorXi knn_crnt = knn.row(*it);
+      const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*it);
       for (int j = 0; j < k_build; ++j) ++votes[knn_crnt(j)];
     }
 

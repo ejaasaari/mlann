@@ -11,9 +11,6 @@
 
 #include "mlann.h"
 
-typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
-typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
-
 class RFPCA : public MLANN {
  public:
   RFPCA(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
@@ -32,7 +29,7 @@ class RFPCA : public MLANN {
    * random vectors; on the interval \f$(0,1]\f$; default value sets density to
    * \f$ 1 / \sqrt{d} \f$, where \f$d\f$ is the dimension of the data
    */
-  void grow(int n_trees_, int depth_, const Eigen::Ref<const IntRowMatrix> &knn_,
+  void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
             const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {
     if (!empty()) {
       throw std::logic_error("The index has already been grown.");
@@ -65,7 +62,7 @@ class RFPCA : public MLANN {
       density = density_;
     }
 
-    const Eigen::Map<const IntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
+    const Eigen::Map<const UIntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
     const Eigen::Map<const RowMatrix> train(train_.data(), train_.rows(), train_.cols());
 
     split_points = Eigen::MatrixXf(n_array, n_trees);
@@ -107,8 +104,8 @@ class RFPCA : public MLANN {
     }
   }
 
-  void query(const float *data, int k, float vote_threshold, int *out, float *out_distances = nullptr,
-             int *out_n_elected = nullptr) const {
+  void query(const float *data, int k, float vote_threshold, int *out,
+             float *out_distances = nullptr, int *out_n_elected = nullptr) const {
     if (k <= 0 || k > n_corpus) {
       throw std::out_of_range("k must belong to the set {1, ..., n_corpus}.");
     }
@@ -165,12 +162,12 @@ class RFPCA : public MLANN {
 
  private:
   std::pair<std::vector<int>, std::vector<float>> count_votes(std::vector<int>::iterator leaf_begin,
-                                                            std::vector<int>::iterator leaf_end,
-                                                            const IntRowMatrix &knn) {
+                                                              std::vector<int>::iterator leaf_end,
+                                                              const UIntRowMatrix &knn) {
     int k_build = knn.cols();
     std::unordered_map<int, float> votes;
     for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const Eigen::VectorXi knn_crnt = knn.row(*it);
+      const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*it);
       for (int j = 0; j < k_build; ++j) votes[knn_crnt(j)] += 1.0;
     }
 
@@ -192,7 +189,7 @@ class RFPCA : public MLANN {
    */
   void grow_subtree(std::vector<int>::iterator begin, std::vector<int>::iterator end,
                     int tree_level, int i, int n_tree, std::vector<std::vector<int>> &labels_tree,
-                    std::vector<std::vector<float>> &votes_tree, const IntRowMatrix &knn,
+                    std::vector<std::vector<float>> &votes_tree, const UIntRowMatrix &knn,
                     const RowMatrix &train) {
     int n = end - begin;
     int idx_left = 2 * i + 1;

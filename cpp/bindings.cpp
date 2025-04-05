@@ -4,6 +4,7 @@
 #include <sys/types.h>
 
 #include <Eigen/Dense>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -14,7 +15,7 @@
 #include "rf-rp.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
-typedef Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IntRowMatrix;
+typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> UIntRowMatrix;
 
 typedef struct {
   PyObject_HEAD MLANN *index;
@@ -75,8 +76,8 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
                         &PyArray_Type, &knn_data, &n_knn, &dim_knn, &n_trees, &depth, &density))
     return NULL;
 
-  Eigen::Map<const IntRowMatrix> knn(reinterpret_cast<int *>(PyArray_DATA(knn_data)), n_knn,
-                                     dim_knn);
+  Eigen::Map<const UIntRowMatrix> knn(reinterpret_cast<uint32_t *>(PyArray_DATA(knn_data)), n_knn,
+                                      dim_knn);
   Eigen::Map<const RowMatrix> train(reinterpret_cast<float *>(PyArray_DATA(train_data)), n_train,
                                     dim_train);
 
