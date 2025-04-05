@@ -135,7 +135,7 @@ class RFRP : public MLANN {
 
     if (out_n_elected) *out_n_elected = elected.size();
 
-    exact_knn(q, k, elected, out, out_distances);
+    exact_knn(q.transpose(), k, elected, out, out_distances);
   }
 
  private:

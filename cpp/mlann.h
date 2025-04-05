@@ -26,7 +26,7 @@ class MLANN {
   virtual void query(const float *data, int k, float vote_threshold, int *out,
                      float *out_distances = nullptr, int *out_n_elected = nullptr) const {}
 
-  void query(const Eigen::Ref<const Eigen::VectorXf> &q, int k, float vote_threshold, int *out,
+  void query(const Eigen::Ref<const Eigen::RowVectorXf> &q, int k, float vote_threshold, int *out,
              float *out_distances = nullptr, int *out_n_elected = nullptr) const {
     query(q.data(), k, vote_threshold, out, out_distances, out_n_elected);
   }
@@ -34,7 +34,7 @@ class MLANN {
   static void exact_knn(const float *q_data, const float *X_data, int n_corpus, int dim, int k,
                         int *out, float *out_distances = nullptr) {
     const Eigen::Map<const RowMatrix> corpus(X_data, n_corpus, dim);
-    const Eigen::Map<const Eigen::VectorXf> q(q_data, dim);
+    const Eigen::Map<const Eigen::RowVectorXf> q(q_data, dim);
 
     if (k < 1 || k > n_corpus) {
       throw std::out_of_range(
@@ -68,7 +68,7 @@ class MLANN {
     }
   }
 
-  static void exact_knn(const Eigen::Ref<const Eigen::VectorXf> &q,
+  static void exact_knn(const Eigen::Ref<const Eigen::RowVectorXf> &q,
                         const Eigen::Ref<const RowMatrix> &corpus, int k, int *out,
                         float *out_distances = nullptr) {
     MLANN::exact_knn(q.data(), corpus.data(), corpus.rows(), corpus.cols(), k, out, out_distances);
@@ -78,7 +78,7 @@ class MLANN {
     MLANN::exact_knn(q, corpus.data(), n_corpus, dim, k, out, out_distances);
   }
 
-  void exact_knn(const Eigen::Ref<const Eigen::VectorXf> &q, int k, int *out,
+  void exact_knn(const Eigen::Ref<const Eigen::RowVectorXf> &q, int k, int *out,
                  float *out_distances = nullptr) const {
     MLANN::exact_knn(q.data(), corpus.data(), n_corpus, dim, k, out, out_distances);
   }
@@ -112,8 +112,8 @@ class MLANN {
     return {out_labels, out_votes};
   }
 
-  void exact_knn(const Eigen::Map<const Eigen::VectorXf> &q, int k, const std::vector<int> &indices,
-                 int *out, float *out_distances = nullptr) const {
+  void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
+                 const std::vector<int> &indices, int *out, float *out_distances = nullptr) const {
     if (indices.empty()) {
       for (int i = 0; i < k; ++i) out[i] = -1;
       if (out_distances) {

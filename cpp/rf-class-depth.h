@@ -80,7 +80,7 @@ class RFClass : public MLANN {
       throw std::logic_error("The index must be built before making queries.");
     }
 
-    const Eigen::Map<const Eigen::VectorXf> q(data, dim);
+    const Eigen::Map<const Eigen::RowVectorXf> q(data, dim);
 
     std::vector<int> found_leaves(n_trees);
     for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
