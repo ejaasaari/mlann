@@ -78,20 +78,8 @@ class RFRP : public MLANN {
     }
   }
 
-  void query(const float *data, int k, float vote_threshold, int *out,
+  void query(const float *data, int k, float vote_threshold, int *out, Distance dist = L2,
              float *out_distances = nullptr, int *out_n_elected = nullptr) const {
-    if (k <= 0 || k > n_corpus) {
-      throw std::out_of_range("k must belong to the set {1, ..., n_corpus}.");
-    }
-
-    if (vote_threshold <= 0) {
-      throw std::out_of_range("vote_threshold must be positive");
-    }
-
-    if (empty()) {
-      throw std::logic_error("The index must be built before making queries.");
-    }
-
     const Eigen::Map<const Eigen::VectorXf> q(data, dim);
 
     Eigen::VectorXf projected_query(n_pool);
@@ -128,7 +116,7 @@ class RFRP : public MLANN {
       for (int i = 0; i < n_labels; ++i) {
         if ((votes_total(labels[i]) += votes[i]) >= vote_threshold) {
           elected.push_back(labels[i]);
-          votes_total(labels[i]) = -100000.;
+          votes_total(labels[i]) = -9999999;
         }
       }
     }
@@ -136,7 +124,7 @@ class RFRP : public MLANN {
     if (out_n_elected) *out_n_elected = elected.size();
 
     const Eigen::Map<const Eigen::RowVectorXf> qT(data, dim);
-    exact_knn(qT, k, elected, out, out_distances);
+    exact_knn(qT, k, elected, out, dist, out_distances);
   }
 
  private:

@@ -1,6 +1,9 @@
 import numpy as np
 import mlannlib
 
+IP = mlannlib.IP
+L2 = mlannlib.L2
+
 
 class MLANNIndex(object):
     """
@@ -64,7 +67,7 @@ class MLANNIndex(object):
         )
         self.built = True
 
-    def ann(self, q, k, votes_required, return_distances=False):
+    def ann(self, q, k, votes_required, dist=mlannlib.L2, return_distances=False):
         """
         Performs an approximate nearest neighbor query for a single query vector or multiple query vectors
         in parallel. The queries are given as a numpy vector or a numpy matrix where each row contains a query.
@@ -82,9 +85,9 @@ class MLANNIndex(object):
         if q.dtype != np.float32:
             raise ValueError("The query matrix should have type float32")
 
-        return self.index.ann(q, k, votes_required, return_distances)
+        return self.index.ann(q, k, votes_required, dist, return_distances)
 
-    def exact_search(self, q, k, return_distances=False):
+    def exact_search(self, q, k, dist=mlannlib.L2, return_distances=False):
         """
         Performs an exact nearest neighbor query for a single query several queries in parallel. The queries are
         given as a numpy matrix where each row contains a query. Useful for measuring accuracy.
@@ -102,4 +105,4 @@ class MLANNIndex(object):
         if k < 1:
             raise ValueError("k must be positive")
 
-        return self.index.exact_search(q, k, return_distances)
+        return self.index.exact_search(q, k, dist, return_distances)

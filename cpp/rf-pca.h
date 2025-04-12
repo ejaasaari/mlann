@@ -104,20 +104,8 @@ class RFPCA : public MLANN {
     }
   }
 
-  void query(const float *data, int k, float vote_threshold, int *out,
+  void query(const float *data, int k, float vote_threshold, int *out, Distance dist = L2,
              float *out_distances = nullptr, int *out_n_elected = nullptr) const {
-    if (k <= 0 || k > n_corpus) {
-      throw std::out_of_range("k must belong to the set {1, ..., n_corpus}.");
-    }
-
-    if (vote_threshold <= 0) {
-      throw std::out_of_range("vote_threshold must be positive");
-    }
-
-    if (empty()) {
-      throw std::logic_error("The index must be built before making queries.");
-    }
-
     const Eigen::Map<const Eigen::RowVectorXf> q(data, dim);
 
     std::vector<int> found_leaves(n_trees);
@@ -140,7 +128,7 @@ class RFPCA : public MLANN {
     }
 
     std::vector<int> elected;
-    Eigen::VectorXi votes_total = Eigen::VectorXi::Zero(n_corpus);
+    Eigen::VectorXf votes_total = Eigen::VectorXf::Zero(n_corpus);
 
     for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
       int leaf_idx = found_leaves[n_tree];
@@ -150,14 +138,14 @@ class RFPCA : public MLANN {
       for (int i = 0; i < n_labels; ++i) {
         if ((votes_total(labels[i]) += votes[i]) >= vote_threshold) {
           elected.push_back(labels[i]);
-          votes_total(labels[i]) = std::numeric_limits<int>::min();
+          votes_total(labels[i]) = -9999999;
         }
       }
     }
 
     if (out_n_elected) *out_n_elected = elected.size();
 
-    exact_knn(q, k, elected, out, out_distances);
+    exact_knn(q, k, elected, out, dist, out_distances);
   }
 
  private:

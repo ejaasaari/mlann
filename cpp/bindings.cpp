@@ -113,9 +113,10 @@ static void mlann_dealloc(mlannIndex *self) {
 static PyObject *ann(mlannIndex *self, PyObject *args) {
   PyArrayObject *v;
   int k, dim, n, return_distances;
+  Distance dist;
   float elect;
 
-  if (!PyArg_ParseTuple(args, "O!ifi", &PyArray_Type, &v, &k, &elect, &return_distances))
+  if (!PyArg_ParseTuple(args, "O!ifii", &PyArray_Type, &v, &k, &elect, &dist, &return_distances))
     return NULL;
 
   float *indata = reinterpret_cast<float *>(PyArray_DATA(v));
@@ -132,7 +133,7 @@ static PyObject *ann(mlannIndex *self, PyObject *args) {
       PyObject *distances = PyArray_SimpleNew(1, dims, NPY_FLOAT32);
       float *out_distances = reinterpret_cast<float *>(PyArray_DATA((PyArrayObject *)distances));
       Py_BEGIN_ALLOW_THREADS;
-      self->index->query(indata, k, elect, outdata, out_distances);
+      self->index->query(indata, k, elect, outdata, dist, out_distances);
       Py_END_ALLOW_THREADS;
 
       PyObject *out_tuple = PyTuple_New(2);
@@ -141,7 +142,7 @@ static PyObject *ann(mlannIndex *self, PyObject *args) {
       return out_tuple;
     } else {
       Py_BEGIN_ALLOW_THREADS;
-      self->index->query(indata, k, elect, outdata);
+      self->index->query(indata, k, elect, outdata, dist);
       Py_END_ALLOW_THREADS;
       return nearest;
     }
@@ -163,7 +164,7 @@ static PyObject *ann(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->query(indata + i * dim, k, elect, outdata + i * k, distances_out + i * k);
+        self->index->query(indata + i * dim, k, elect, outdata + i * k, dist, distances_out + i * k);
       }
       Py_END_ALLOW_THREADS;
 
@@ -177,7 +178,7 @@ static PyObject *ann(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->query(indata + i * dim, k, elect, outdata + i * k);
+        self->index->query(indata + i * dim, k, elect, outdata + i * k, dist);
       }
       Py_END_ALLOW_THREADS;
       return nearest;
@@ -188,8 +189,9 @@ static PyObject *ann(mlannIndex *self, PyObject *args) {
 static PyObject *exact_search(mlannIndex *self, PyObject *args) {
   PyArrayObject *v;
   int k, n, dim, return_distances;
+  Distance dist;
 
-  if (!PyArg_ParseTuple(args, "O!ii", &PyArray_Type, &v, &k, &return_distances)) return NULL;
+  if (!PyArg_ParseTuple(args, "O!iii", &PyArray_Type, &v, &k, &dist, &return_distances)) return NULL;
 
   float *indata = reinterpret_cast<float *>(PyArray_DATA((PyArrayObject *)v));
   PyObject *nearest;
@@ -205,7 +207,7 @@ static PyObject *exact_search(mlannIndex *self, PyObject *args) {
       PyObject *distances = PyArray_SimpleNew(1, dims, NPY_FLOAT32);
       float *out_distances = reinterpret_cast<float *>(PyArray_DATA((PyArrayObject *)distances));
       Py_BEGIN_ALLOW_THREADS;
-      self->index->exact_knn(indata, k, outdata, out_distances);
+      self->index->exact_knn(indata, k, outdata, dist, out_distances);
       Py_END_ALLOW_THREADS;
 
       PyObject *out_tuple = PyTuple_New(2);
@@ -214,7 +216,7 @@ static PyObject *exact_search(mlannIndex *self, PyObject *args) {
       return out_tuple;
     } else {
       Py_BEGIN_ALLOW_THREADS;
-      self->index->exact_knn(indata, k, outdata);
+      self->index->exact_knn(indata, k, outdata, dist);
       Py_END_ALLOW_THREADS;
       return nearest;
     }
@@ -236,7 +238,7 @@ static PyObject *exact_search(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->exact_knn(indata + i * dim, k, outdata + i * k, distances_out + i * k);
+        self->index->exact_knn(indata + i * dim, k, outdata + i * k, dist, distances_out + i * k);
       }
       Py_END_ALLOW_THREADS;
 
@@ -250,7 +252,7 @@ static PyObject *exact_search(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->exact_knn(indata + i * dim, k, outdata + i * k);
+        self->index->exact_knn(indata + i * dim, k, outdata + i * k, dist);
       }
       Py_END_ALLOW_THREADS;
       return nearest;
@@ -333,6 +335,9 @@ PyMODINIT_FUNC PyInit_mlannlib(void) {
 
   Py_INCREF(&MLANNIndexType);
   PyModule_AddObject(m, "MLANNIndex", reinterpret_cast<PyObject *>(&MLANNIndexType));
+
+  PyModule_AddIntConstant(m, "IP", IP);
+  PyModule_AddIntConstant(m, "L2", L2);
 
   return m;
 }

@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "distance.h"
 #include "miniselect/pdqselect.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
@@ -23,64 +24,86 @@ class MLANN {
   virtual void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
                     const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {}
 
-  virtual void query(const float *data, int k, float vote_threshold, int *out,
+  virtual void query(const float *data, int k, float vote_threshold, int *out, Distance dist = L2,
                      float *out_distances = nullptr, int *out_n_elected = nullptr) const {}
 
   void query(const Eigen::Ref<const Eigen::RowVectorXf> &q, int k, float vote_threshold, int *out,
-             float *out_distances = nullptr, int *out_n_elected = nullptr) const {
-    query(q.data(), k, vote_threshold, out, out_distances, out_n_elected);
+             Distance dist = L2, float *out_distances = nullptr,
+             int *out_n_elected = nullptr) const {
+    query(q.data(), k, vote_threshold, out, dist, out_distances, out_n_elected);
   }
 
   static void exact_knn(const float *q_data, const float *X_data, int n_corpus, int dim, int k,
-                        int *out, float *out_distances = nullptr) {
+                        int *out, Distance dist = L2, float *out_distances = nullptr) {
     const Eigen::Map<const RowMatrix> corpus(X_data, n_corpus, dim);
     const Eigen::Map<const Eigen::RowVectorXf> q(q_data, dim);
 
-    if (k < 1 || k > n_corpus) {
-      throw std::out_of_range(
-          "k must be positive and no greater than the sample size of data corpus.");
-    }
-
     Eigen::VectorXf distances(n_corpus);
-
-    for (int i = 0; i < n_corpus; ++i) distances(i) = (corpus.row(i) - q).squaredNorm();
+    if (dist == L2) {
+      for (int i = 0; i < n_corpus; ++i) {
+        distances(i) = squared_euclidean(corpus.row(i).data(), q.data(), dim);
+      }
+    } else {
+      for (int i = 0; i < n_corpus; ++i) {
+        distances(i) = dot_product(corpus.row(i).data(), q.data(), dim);
+      }
+    }
 
     if (k == 1) {
       Eigen::MatrixXf::Index index;
-      distances.minCoeff(&index);
-      out[0] = index;
 
-      if (out_distances) out_distances[0] = std::sqrt(distances(index));
+      if (dist == L2) {
+        distances.minCoeff(&index);
+        out[0] = index;
+        if (out_distances) out_distances[0] = std::sqrt(distances(index));
+      } else {
+        distances.maxCoeff(&index);
+        out[0] = index;
+        if (out_distances) out_distances[0] = distances(index);
+      }
 
       return;
     }
 
     Eigen::VectorXi idx(n_corpus);
     std::iota(idx.data(), idx.data() + n_corpus, 0);
-    miniselect::pdqpartial_sort_branchless(
-        idx.data(), idx.data() + k, idx.data() + n_corpus,
-        [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
+
+    if (dist == L2) {
+      miniselect::pdqpartial_sort_branchless(
+          idx.data(), idx.data() + k, idx.data() + n_corpus,
+          [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
+    } else {
+      miniselect::pdqpartial_sort_branchless(
+          idx.data(), idx.data() + k, idx.data() + n_corpus,
+          [&distances](int i1, int i2) { return distances(i1) > distances(i2); });
+    }
 
     for (int i = 0; i < k; ++i) out[i] = idx(i);
 
     if (out_distances) {
-      for (int i = 0; i < k; ++i) out_distances[i] = std::sqrt(distances(idx(i)));
+      if (dist == L2) {
+        for (int i = 0; i < k; ++i) out_distances[i] = std::sqrt(distances(idx(i)));
+      } else {
+        for (int i = 0; i < k; ++i) out_distances[i] = distances(idx(i));
+      }
     }
   }
 
   static void exact_knn(const Eigen::Ref<const Eigen::RowVectorXf> &q,
                         const Eigen::Ref<const RowMatrix> &corpus, int k, int *out,
-                        float *out_distances = nullptr) {
-    MLANN::exact_knn(q.data(), corpus.data(), corpus.rows(), corpus.cols(), k, out, out_distances);
+                        Distance dist = L2, float *out_distances = nullptr) {
+    MLANN::exact_knn(q.data(), corpus.data(), corpus.rows(), corpus.cols(), k, out, dist,
+                     out_distances);
   }
 
-  void exact_knn(const float *q, int k, int *out, float *out_distances = nullptr) const {
-    MLANN::exact_knn(q, corpus.data(), n_corpus, dim, k, out, out_distances);
-  }
-
-  void exact_knn(const Eigen::Ref<const Eigen::RowVectorXf> &q, int k, int *out,
+  void exact_knn(const float *q, int k, int *out, Distance dist = L2,
                  float *out_distances = nullptr) const {
-    MLANN::exact_knn(q.data(), corpus.data(), n_corpus, dim, k, out, out_distances);
+    MLANN::exact_knn(q, corpus.data(), n_corpus, dim, k, out, dist, out_distances);
+  }
+
+  void exact_knn(const Eigen::Ref<const Eigen::RowVectorXf> &q, int k, int *out, Distance dist = L2,
+                 float *out_distances = nullptr) const {
+    MLANN::exact_knn(q.data(), corpus.data(), n_corpus, dim, k, out, dist, out_distances);
   }
 
   bool empty() const { return n_trees == 0; }
@@ -113,7 +136,8 @@ class MLANN {
   }
 
   void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
-                 const std::vector<int> &indices, int *out, float *out_distances = nullptr) const {
+                 const std::vector<int> &indices, int *out, Distance dist = L2,
+                 float *out_distances = nullptr) const {
     if (indices.empty()) {
       for (int i = 0; i < k; ++i) out[i] = -1;
       if (out_distances) {
@@ -125,14 +149,28 @@ class MLANN {
     int n_elected = indices.size();
     Eigen::VectorXf distances(n_elected);
 
-    for (int i = 0; i < n_elected; ++i) distances(i) = (corpus.row(indices[i]) - q).squaredNorm();
+    if (dist == L2) {
+      for (int i = 0; i < n_elected; ++i) {
+        distances(i) = squared_euclidean(corpus.row(indices[i]).data(), q.data(), dim);
+      }
+    } else {
+      for (int i = 0; i < n_elected; ++i) {
+        distances(i) = dot_product(corpus.row(indices[i]).data(), q.data(), dim);
+      }
+    }
 
     if (k == 1) {
       Eigen::MatrixXf::Index index;
-      distances.minCoeff(&index);
-      out[0] = n_elected ? indices[index] : -1;
 
-      if (out_distances) out_distances[0] = n_elected ? std::sqrt(distances(index)) : -1;
+      if (dist == L2) {
+        distances.minCoeff(&index);
+        out[0] = indices[index];
+        if (out_distances) out_distances[0] = std::sqrt(distances(index));
+      } else {
+        distances.maxCoeff(&index);
+        out[0] = indices[index];
+        if (out_distances) out_distances[0] = distances(index);
+      }
 
       return;
     }
@@ -140,15 +178,29 @@ class MLANN {
     int n_to_sort = n_elected > k ? k : n_elected;
     Eigen::VectorXi idx(n_elected);
     std::iota(idx.data(), idx.data() + n_elected, 0);
-    miniselect::pdqpartial_sort_branchless(
-        idx.data(), idx.data() + n_to_sort, idx.data() + n_elected,
-        [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
+
+    if (dist == L2) {
+      miniselect::pdqpartial_sort_branchless(
+          idx.data(), idx.data() + n_to_sort, idx.data() + n_elected,
+          [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
+    } else {
+      miniselect::pdqpartial_sort_branchless(
+          idx.data(), idx.data() + n_to_sort, idx.data() + n_elected,
+          [&distances](int i1, int i2) { return distances(i1) > distances(i2); });
+    }
 
     for (int i = 0; i < k; ++i) out[i] = i < n_elected ? indices[idx(i)] : -1;
 
     if (out_distances) {
-      for (int i = 0; i < k; ++i)
-        out_distances[i] = i < n_elected ? std::sqrt(distances(idx(i))) : -1;
+      if (dist == L2) {
+        for (int i = 0; i < k; ++i) {
+          out_distances[i] = i < n_elected ? std::sqrt(distances(idx(i))) : -1;
+        }
+      } else {
+        for (int i = 0; i < k; ++i) {
+          out_distances[i] = i < n_elected ? distances(idx(i)) : -1;
+        }
+      }
     }
   }
 
