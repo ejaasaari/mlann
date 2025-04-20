@@ -23,7 +23,6 @@ typedef struct {
   float *data;
   int n;
   int dim;
-  int k;
 } mlannIndex;
 
 static PyObject *MLANN_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {

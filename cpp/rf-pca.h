@@ -15,20 +15,6 @@ class RFPCA : public MLANN {
  public:
   RFPCA(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
-  /**
-   * Build a normal index.
-   *
-   * @param n_trees_ number of trees to be grown
-   * @param depth_ depth of the trees; in the set
-   * \f$\{1,2, \dots ,\lfloor \log_2 (n) \rfloor \}\f$, where \f$n \f$ is the number
-   * of data points
-   * @param knn_ Eigen ref to the knn matrix of training set; a column is a training set point,
-   * and a row is k:th neighbor
-   * @param train_ Eigen ref to the training set; a column is a training set point
-   * @param density_ expected proportion of non-zero components in the
-   * random vectors; on the interval \f$(0,1]\f$; default value sets density to
-   * \f$ 1 / \sqrt{d} \f$, where \f$d\f$ is the dimension of the data
-   */
   void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
             const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {
     if (!empty()) {
@@ -42,10 +28,6 @@ class RFPCA : public MLANN {
     int n_train = train_.rows();
     if (depth_ <= 0 || depth_ > std::log2(n_train)) {
       throw std::out_of_range("The depth must belong to the set {1, ... , log2(n_train)}.");
-    }
-
-    if (density_ < -1.0001 || density_ > 1.0001 || (density_ > -0.9999 && density_ < -0.0001)) {
-      throw std::out_of_range("The density must be on the interval (0,1].");
     }
 
     n_trees = n_trees_;
@@ -171,10 +153,6 @@ class RFPCA : public MLANN {
     return {out_labels, out_votes};
   }
 
-  /**
-   * Builds a single random projection tree. The tree is constructed by recursively
-   * projecting the data on a random vector and splitting into two by the median.
-   */
   void grow_subtree(std::vector<int>::iterator begin, std::vector<int>::iterator end,
                     int tree_level, int i, int n_tree, std::vector<std::vector<int>> &labels_tree,
                     std::vector<std::vector<float>> &votes_tree, const UIntRowMatrix &knn,
@@ -182,6 +160,7 @@ class RFPCA : public MLANN {
     int n = end - begin;
     int idx_left = 2 * i + 1;
     int idx_right = idx_left + 1;
+    auto mid = end - n / 2;
 
     if (tree_level == depth) {
       int index_leaf = i - n_inner_nodes;
@@ -190,6 +169,8 @@ class RFPCA : public MLANN {
       votes_tree[index_leaf] = ret.second;
       return;
     }
+
+    {
 
     Eigen::VectorXi dims = _random_dims[n_tree * ((1 << depth) - 1) + i];
     Eigen::VectorXf rv = _random_vectors[n_tree * ((1 << depth) - 1) + i];
@@ -221,8 +202,6 @@ class RFPCA : public MLANN {
                                        return data[inv_idx[i1]] < data[inv_idx[i2]];
                                      });
 
-    auto mid = end - n / 2;
-
     if (n % 2) {
       split_points(i, n_tree) = data[inv_idx[*(mid - 1)]];
     } else {
@@ -230,6 +209,8 @@ class RFPCA : public MLANN {
         return data[inv_idx[i1]] < data[inv_idx[i2]];
       });
       split_points(i, n_tree) = (data[inv_idx[*mid]] + data[inv_idx[*left_it]]) / 2.0;
+    }
+
     }
 
     grow_subtree(begin, mid, tree_level + 1, idx_left, n_tree, labels_tree, votes_tree, knn, train);

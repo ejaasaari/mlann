@@ -31,10 +31,6 @@ class RFRP : public MLANN {
       throw std::out_of_range("The depth must belong to the set {1, ... , log2(n_train)}.");
     }
 
-    if (density_ < -1.0001 || density_ > 1.0001 || (density_ > -0.9999 && density_ < -0.0001)) {
-      throw std::out_of_range("The density must be on the interval (0,1].");
-    }
-
     n_trees = n_trees_;
     depth = depth_;
     n_inner_nodes = (1 << depth_) - 1;
@@ -243,7 +239,7 @@ class RFRP : public MLANN {
   }
 
   Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
-      dense_random_matrix;  // random vectors needed for all the RP-trees
+      dense_random_matrix;
   Eigen::SparseMatrix<float, Eigen::RowMajor>
-      sparse_random_matrix;  // random vectors needed for all the RP-trees
+      sparse_random_matrix;
 };

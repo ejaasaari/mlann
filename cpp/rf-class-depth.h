@@ -23,10 +23,6 @@ class RFClass : public MLANN {
       throw std::out_of_range("The number of trees must be positive.");
     }
 
-    if (density_ < -1.0001 || density_ > 1.0001 || (density_ > -0.9999 && density_ < -0.0001)) {
-      throw std::out_of_range("The density must be on the interval (0,1].");
-    }
-
     int n_train = train_.rows();
 
     n_trees = n_trees_;
