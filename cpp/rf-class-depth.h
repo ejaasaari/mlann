@@ -9,6 +9,25 @@
 
 #include "mlann.h"
 
+std::vector<int> sample_unique(int n, int k) {
+  std::random_device rd;
+  std::minstd_rand generator(rd());
+
+  std::vector<int> reservoir(k);
+  std::iota(reservoir.begin(), reservoir.end(), 0);
+
+  for (int i = k; i < n; ++i) {
+    std::uniform_int_distribution<int> distribution(0, i);
+    int j = distribution(generator);
+
+    if (j < k) {
+      reservoir[j] = i;
+    }
+  }
+
+  return reservoir;
+}
+
 class RFClass : public MLANN {
  public:
   RFClass(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
@@ -48,7 +67,7 @@ class RFClass : public MLANN {
     votes_all = std::vector<std::vector<std::vector<float>>>(n_trees);
 
     std::random_device gen;
-    std::mt19937 r = std::mt19937(gen());
+    std::minstd_rand r = std::minstd_rand(gen());
 
     const auto random_dims_all = generate_random_directions(r);
 
@@ -58,7 +77,7 @@ class RFClass : public MLANN {
       votes_all[n_tree] = std::vector<std::vector<float>>(n_leaves);
 
       std::random_device gen;
-      std::mt19937 rand_gen(gen());
+      std::minstd_rand rand_gen(gen());
       std::vector<int> indices(n_train);
       std::iota(indices.begin(), indices.end(), 0);
       grow_subtree(indices.begin(), indices.end(), 0, 0, n_tree, labels_all[n_tree],
@@ -119,7 +138,7 @@ class RFClass : public MLANN {
                                              const std::vector<int> &random_dims,
                                              const Eigen::Ref<const RowMatrix> &train,
                                              const Eigen::Ref<const UIntRowMatrix> &knn, float tol,
-                                             int n_corpus, std::mt19937 &r, int n_subsample) {
+                                             int n_corpus, std::minstd_rand &r, int n_subsample) {
     int n = end - begin;
     int max_dim = -1;
     float max_gain = 0, max_split = 0;
@@ -128,11 +147,8 @@ class RFClass : public MLANN {
 
     std::vector<int> indices;
     if (n_subsample > 0 && n_subsample < n) {
-      std::vector<int> indices_org(n);
+      indices = sample_unique(n, n_subsample);
       n = n_subsample;
-      std::iota(indices_org.begin(), indices_org.end(), 0);
-      std::shuffle(indices_org.begin(), indices_org.end(), r);
-      indices = std::vector<int>(indices_org.begin(), indices_org.begin() + n_subsample);
     } else {
       indices = std::vector<int>(n);
       std::iota(indices.begin(), indices.end(), 0);
@@ -191,15 +207,13 @@ class RFClass : public MLANN {
     return std::make_tuple(max_dim, max_split, max_gain);
   }
 
-  std::vector<std::vector<std::vector<int>>> generate_random_directions(std::mt19937 &r) {
+  std::vector<std::vector<std::vector<int>>> generate_random_directions(std::minstd_rand &r) {
     const int n_random_dim = density * dim;
     std::vector<std::vector<std::vector<int>>> dims_all(n_trees);
     for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
       for (int tree_level = 0; tree_level < depth; ++tree_level) {
-        std::vector<int> dims(dim);
-        std::iota(dims.begin(), dims.end(), 0);
-        std::shuffle(dims.begin(), dims.end(), r);
-        dims_all[n_tree].push_back(std::vector<int>(dims.begin(), dims.begin() + n_random_dim));
+        std::vector<int> dims = sample_unique(dim, n_random_dim);
+        dims_all[n_tree].push_back(dims);
       }
     }
     return dims_all;
@@ -236,7 +250,7 @@ class RFClass : public MLANN {
                     std::vector<std::vector<float>> &votes_tree,
                     const Eigen::Ref<const RowMatrix> &train,
                     const Eigen::Ref<const UIntRowMatrix> &knn,
-                    const std::vector<std::vector<int>> &random_dims, std::mt19937 &r,
+                    const std::vector<std::vector<int>> &random_dims, std::minstd_rand &r,
                     int n_subsample) {
     if (tree_level == depth) {
       const int index_leaf = i - n_inner_nodes;

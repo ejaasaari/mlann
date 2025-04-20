@@ -204,7 +204,7 @@ class RFRP : public MLANN {
     sparse_random_matrix = Eigen::SparseMatrix<float, Eigen::RowMajor>(n_row, n_col);
 
     std::random_device rd;
-    std::mt19937 gen(rd());
+    std::minstd_rand gen(rd());
     std::uniform_real_distribution<float> uni_dist(0, 1);
     std::normal_distribution<float> norm_dist(0, 1);
 
@@ -231,15 +231,13 @@ class RFRP : public MLANN {
         Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(n_row, n_col);
 
     std::random_device rd;
-    std::mt19937 gen(rd());
+    std::minstd_rand gen(rd());
     std::normal_distribution<float> normal_dist(0, 1);
 
     std::generate(dense_random_matrix.data(), dense_random_matrix.data() + n_row * n_col,
                   [&normal_dist, &gen] { return normal_dist(gen); });
   }
 
-  Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
-      dense_random_matrix;
-  Eigen::SparseMatrix<float, Eigen::RowMajor>
-      sparse_random_matrix;
+  Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> dense_random_matrix;
+  Eigen::SparseMatrix<float, Eigen::RowMajor> sparse_random_matrix;
 };

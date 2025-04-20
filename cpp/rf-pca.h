@@ -70,7 +70,7 @@ class RFPCA : public MLANN {
       std::iota(indices.begin(), indices.end(), 0);
 
       std::random_device rd;
-      std::mt19937 gen(rd());
+      std::minstd_rand gen(rd());
       std::uniform_int_distribution<int> uni_dist(0, dim - 1);
       std::normal_distribution<float> norm_dist(0, 1);
 
@@ -171,46 +171,44 @@ class RFPCA : public MLANN {
     }
 
     {
-
-    Eigen::VectorXi dims = _random_dims[n_tree * ((1 << depth) - 1) + i];
-    Eigen::VectorXf rv = _random_vectors[n_tree * ((1 << depth) - 1) + i];
-    rv /= rv.norm();
-
-    Eigen::MatrixXf tmp = train(Eigen::Map<Eigen::VectorXi>(&*begin, n), dims).transpose();
-    float isz = 1. / (n - 1);
-    Eigen::MatrixXf centered = tmp.colwise() - tmp.rowwise().mean();
-    Eigen::MatrixXf cov = 2 * 0.01 * isz * (centered * centered.transpose());
-
-    rv /= rv.norm();
-    for (int i = 0; i < 20; ++i) {
-      Eigen::VectorXf last = rv;
-      rv += cov * rv;
+      Eigen::VectorXi dims = _random_dims[n_tree * ((1 << depth) - 1) + i];
+      Eigen::VectorXf rv = _random_vectors[n_tree * ((1 << depth) - 1) + i];
       rv /= rv.norm();
-      if ((rv - last).cwiseAbs().mean() < 0.01) break;
-    }
 
-    Eigen::VectorXf data = rv.transpose() * tmp;
-    _random_vectors[n_tree * ((1 << depth) - 1) + i] = rv;
+      Eigen::MatrixXf tmp = train(Eigen::Map<Eigen::VectorXi>(&*begin, n), dims).transpose();
+      float isz = 1. / (n - 1);
+      Eigen::MatrixXf centered = tmp.colwise() - tmp.rowwise().mean();
+      Eigen::MatrixXf cov = 2 * 0.01 * isz * (centered * centered.transpose());
 
-    std::unordered_map<int, int> inv_idx;
-    for (int i = 0; i < n; ++i) {
-      inv_idx[*(begin + i)] = i;
-    }
+      rv /= rv.norm();
+      for (int i = 0; i < 20; ++i) {
+        Eigen::VectorXf last = rv;
+        rv += cov * rv;
+        rv /= rv.norm();
+        if ((rv - last).cwiseAbs().mean() < 0.01) break;
+      }
 
-    miniselect::pdqselect_branchless(begin, begin + n / 2, end,
-                                     [&data, &inv_idx](const int i1, const int i2) {
-                                       return data[inv_idx[i1]] < data[inv_idx[i2]];
-                                     });
+      Eigen::VectorXf data = rv.transpose() * tmp;
+      _random_vectors[n_tree * ((1 << depth) - 1) + i] = rv;
 
-    if (n % 2) {
-      split_points(i, n_tree) = data[inv_idx[*(mid - 1)]];
-    } else {
-      auto left_it = std::max_element(begin, mid, [&data, &inv_idx](const int i1, const int i2) {
-        return data[inv_idx[i1]] < data[inv_idx[i2]];
-      });
-      split_points(i, n_tree) = (data[inv_idx[*mid]] + data[inv_idx[*left_it]]) / 2.0;
-    }
+      std::unordered_map<int, int> inv_idx;
+      for (int i = 0; i < n; ++i) {
+        inv_idx[*(begin + i)] = i;
+      }
 
+      miniselect::pdqselect_branchless(begin, begin + n / 2, end,
+                                       [&data, &inv_idx](const int i1, const int i2) {
+                                         return data[inv_idx[i1]] < data[inv_idx[i2]];
+                                       });
+
+      if (n % 2) {
+        split_points(i, n_tree) = data[inv_idx[*(mid - 1)]];
+      } else {
+        auto left_it = std::max_element(begin, mid, [&data, &inv_idx](const int i1, const int i2) {
+          return data[inv_idx[i1]] < data[inv_idx[i2]];
+        });
+        split_points(i, n_tree) = (data[inv_idx[*mid]] + data[inv_idx[*left_it]]) / 2.0;
+      }
     }
 
     grow_subtree(begin, mid, tree_level + 1, idx_left, n_tree, labels_tree, votes_tree, knn, train);

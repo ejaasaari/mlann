@@ -35,12 +35,12 @@ def has_flag(compiler, flagname):
 class BuildExt(build_ext):
     """A custom build extension for adding compiler-specific options.
 
-    Assume that C++14 is available.
+    Assume that C++17 is available.
     """
 
     c_opts = {
         "unix": [
-            "-std=c++14",
+            "-std=c++17",
             "-O3",
             "-fPIC",
             "-DNDEBUG",
@@ -48,7 +48,7 @@ class BuildExt(build_ext):
             "-Wl,--no-undefined",
         ],
         "msvc": [
-            "/std:c++14",
+            "/std:c++17",
             "/O2",
             "/EHsc",
             "/DNDEBUG",
