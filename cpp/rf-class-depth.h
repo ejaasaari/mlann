@@ -144,9 +144,10 @@ class RFClass : public MLANN {
     const int k_build = knn.cols();
 
     for (const auto &d : random_dims) {
-      std::sort(indices.begin(), indices.end(), [data, cols, d, begin](int i1, int i2) {
-        return data[*(begin + i1) * cols + d] < data[*(begin + i2) * cols + d];
-      });
+      miniselect::pdqsort_branchless(
+          indices.begin(), indices.end(), [data, cols, d, begin](int i1, int i2) {
+            return data[*(begin + i1) * cols + d] < data[*(begin + i2) * cols + d];
+          });
 
       std::vector<int> votes(n_corpus, 0);
 
