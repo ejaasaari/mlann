@@ -90,4 +90,4 @@ If you use the library in an academic context, please consider citing the follow
 
 ## License
 
-MLANN is available under the MIT License (see [LICENSE](LICENSE)). Note that third-party libraries in the [lorann](lorann) folder may be distributed under other open source licenses (see [licenses](licenses)).
+MLANN is available under the MIT License (see [LICENSE](LICENSE)). Note that third-party libraries in the [cpp/lib](cpp/lib) folder may be distributed under other open source licenses (see [licenses](licenses)).
