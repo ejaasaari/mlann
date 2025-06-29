@@ -59,6 +59,16 @@ The following index types are available:
 
 On most datasets, `RF` will likely provide the best performance but can be slower to build.
 
+Building an MLANN index requires a training set of queries and their k nearest neighbors. If no separate training set is available, the database vectors can be used also as the training set. The k nearest neighbors can be computed e.g. using
+
+```index.exact_search(training_data, training_k, dist=dist)```
+
+If this is too slow, the following can be tried:
+
+1. Sample a smaller training set
+2. Use a different approximate nearest neighbor library to search for approximate nearest neighbors instead
+3. If available, use a GPU to compute the nearest neighbors (with e.g. [cuVS](https://docs.rapids.ai/api/cuvs/nightly/python_api/neighbors_brute_force/)
+
 ## Citation
 
 If you use the library in an academic context, please consider citing the following paper:
