@@ -17,10 +17,7 @@
 #endif
 #endif
 
-enum Distance {
-    IP,
-    L2
-};
+enum Distance { IP, L2 };
 
 #if defined(__AVX512F__)
 static inline float dot_product(const float *x1, const float *x2, size_t length) {

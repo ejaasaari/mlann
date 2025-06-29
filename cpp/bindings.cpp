@@ -163,7 +163,8 @@ static PyObject *ann(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->query(indata + i * dim, k, elect, outdata + i * k, dist, distances_out + i * k);
+        self->index->query(indata + i * dim, k, elect, outdata + i * k, dist,
+                           distances_out + i * k);
       }
       Py_END_ALLOW_THREADS;
 
@@ -190,7 +191,8 @@ static PyObject *exact_search(mlannIndex *self, PyObject *args) {
   int k, n, dim, return_distances;
   Distance dist;
 
-  if (!PyArg_ParseTuple(args, "O!iii", &PyArray_Type, &v, &k, &dist, &return_distances)) return NULL;
+  if (!PyArg_ParseTuple(args, "O!iii", &PyArray_Type, &v, &k, &dist, &return_distances))
+    return NULL;
 
   float *indata = reinterpret_cast<float *>(PyArray_DATA((PyArrayObject *)v));
   PyObject *nearest;
