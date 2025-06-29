@@ -1,0 +1,8 @@
+@article{hyvonen2022multilabel,
+  title={A Multilabel Classification Framework for Approximate Nearest Neighbor Search},
+  author={Hyv{\"o}nen, Ville and J{\"a}{\"a}saari, Elias and Roos, Teemu},
+  journal={Advances in Neural Information Processing Systems},
+  volume={35},
+  pages={35741--35754},
+  year={2022}
+}
