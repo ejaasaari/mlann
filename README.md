@@ -2,6 +2,8 @@
 
 Approximate nearest neighbor search library implementing the [Multilabel Classification Framework](https://proceedings.neurips.cc/paper_files/paper/2022/file/e8752f3e51f33a2e06daf044c40ce412-Paper-Conference.pdf) (NeurIPS '22). This is a research library and will not offer state-of-the-art performance in most scenarios. However, it can be useful in extreme out-of-distribution (OOD) settings or in maximum inner product search (MIPS) where a small portion of queries have the highest inner products with most queries.
 
+An [extended version](https://www.jmlr.org/papers/volume25/23-0286/23-0286.pdf) of the paper was published in JMLR.
+
 The original code used in the paper is available [here](https://github.com/vioshyvo/a-multilabel-classification-framework).
 
 ## Getting started
@@ -67,7 +69,7 @@ If this is too slow, the following can be tried:
 
 1. Sample a smaller training set
 2. Use a different approximate nearest neighbor library to search for approximate nearest neighbors instead
-3. If available, use a GPU to compute the nearest neighbors (with e.g. [cuVS](https://docs.rapids.ai/api/cuvs/nightly/python_api/neighbors_brute_force/)
+3. If available, use a GPU to compute the nearest neighbors (with e.g. [cuVS](https://docs.rapids.ai/api/cuvs/nightly/python_api/neighbors_brute_force/))
 
 ## Citation
 
