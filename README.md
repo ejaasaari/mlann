@@ -11,11 +11,11 @@ The original code used in the paper is available [here](https://github.com/viosh
 Install the Python module with `pip install git+https://github.com/ejaasaari/mlann`
 
 > [!TIP]
-> On macOS, it is highly recommended to use the Homebrew version of Clang as the compiler:
+> On macOS, it is recommended to use the Homebrew version of Clang as the compiler:
 
 ```shell script
 brew install llvm libomp
-CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ LDFLAGS=-L/opt/homebrew/opt/llvm/lib pip install git+https://github.com/ejaasaari/mlann
+CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ pip install git+https://github.com/ejaasaari/mlann
 ```
 
 An example for indexing and querying a dataset using MLANN is provided below:
@@ -26,7 +26,7 @@ import numpy as np
 from sklearn.datasets import fetch_openml  # scikit-learn is used only for loading the data
 
 k = 10
-training_k = 50
+training_k = 50  # should be equal or larger to k
 n_trees = 10  # increase for higher recall, slower search
 depth = 6  # increase for lower recall, faster search
 voting_threshold = 5  # increase for lower recall, faster search
