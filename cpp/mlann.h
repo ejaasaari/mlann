@@ -123,14 +123,17 @@ class MLANN {
     std::vector<float> out_votes;
 
     int n_votes = 0;
-    for (const auto &v : votes)
+    for (const auto &v : votes) {
       if (v.second >= b) {
         out_labels.push_back(v.first);
         out_votes.push_back(v.second);
         n_votes += v.second;
       }
+    }
 
-    for (int i = 0; i < out_votes.size(); ++i) out_votes[i] /= (n_votes * n_trees);
+    for (size_t i = 0; i < out_votes.size(); ++i) {
+      out_votes[i] /= (n_votes * n_trees);
+    }
 
     return {out_labels, out_votes};
   }
