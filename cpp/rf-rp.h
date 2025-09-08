@@ -36,7 +36,7 @@ class RFRP : public MLANN {
     n_inner_nodes = (1 << depth_) - 1;
     n_leaves = 1 << depth_;
     b = b_;
-    n_pool = n_inner_nodes * n_trees;
+    n_pool = n_trees_ * depth_;
     n_array = 1 << (depth_ + 1);
 
     if (density_ < 0) {
@@ -62,9 +62,9 @@ class RFRP : public MLANN {
       Eigen::MatrixXf tree_projections;
 
       if (density < 1)
-        tree_projections.noalias() = sparse_random_matrix.middleRows(n_tree * depth, depth) * train;
+        tree_projections.noalias() = sparse_random_matrix.middleRows(n_tree * depth, depth) * train.transpose();
       else
-        tree_projections.noalias() = dense_random_matrix.middleRows(n_tree * depth, depth) * train;
+        tree_projections.noalias() = dense_random_matrix.middleRows(n_tree * depth, depth) * train.transpose();
 
       std::vector<int> indices(n_train);
       std::iota(indices.begin(), indices.end(), 0);
@@ -124,26 +124,40 @@ class RFRP : public MLANN {
   }
 
  private:
-  std::pair<std::vector<int>, std::vector<float>> count_votes(std::vector<int>::iterator leaf_begin,
-                                                              std::vector<int>::iterator leaf_end,
-                                                              const UIntRowMatrix &knn) {
-    int k_build = knn.cols();
-    std::unordered_map<int, float> votes;
+  std::pair<std::vector<int>, std::vector<float>> count_votes(
+      std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
+      const Eigen::Ref<const UIntRowMatrix> &knn) {
+    const int k_build = knn.cols();
+    const size_t L = static_cast<size_t>(leaf_end - leaf_begin);
+    const size_t M = L * static_cast<size_t>(k_build);
+
+    std::unordered_map<uint32_t, int> votes;
+    votes.reserve(M);
+
     for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*it);
-      for (int j = 0; j < k_build; ++j) votes[knn_crnt(j)] += 1.0;
+      const int col_idx = *it;
+      auto col = knn.row(col_idx);
+      for (int j = 0; j < k_build; ++j) {
+        const uint32_t id = col(j);
+        auto [p, inserted] = votes.try_emplace(id, 0);
+        ++p->second;
+      }
     }
 
     std::vector<int> out_labels;
     std::vector<float> out_votes;
+    out_labels.reserve(votes.size());
+    out_votes.reserve(votes.size());
 
-    for (const auto &v : votes)
-      if (v.second >= b) {
-        out_labels.push_back(v.first);
-        out_votes.push_back(v.second);
+    for (const auto &kv : votes) {
+      const int cnt = kv.second;
+      if (cnt >= b) {
+        out_labels.push_back(static_cast<int>(kv.first));
+        out_votes.push_back(static_cast<float>(cnt));
       }
+    }
 
-    return {out_labels, out_votes};
+    return {std::move(out_labels), std::move(out_votes)};
   }
 
   /**

@@ -71,6 +71,14 @@ class RFClass : public MLANN {
 
     const auto random_dims_all = generate_random_directions(r);
 
+    const int n = knn.rows();
+    log2_tbl = std::vector<float>(n + 1);
+    t_tbl = std::vector<float>(n + 1);
+
+    log2_tbl[0] = 0.f;
+    for (int i = 1; i <= n; ++i) log2_tbl[i] = std::log2(float(i));
+    for (int i = 0; i <= n; ++i) t_tbl[i] = i * log2_tbl[i];
+
 #pragma omp parallel for
     for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
       labels_all[n_tree] = std::vector<std::vector<int>>(n_leaves);
@@ -133,77 +141,101 @@ class RFClass : public MLANN {
   }
 
  private:
-  static std::tuple<int, float, float> split(const std::vector<int>::iterator &begin,
-                                             const std::vector<int>::iterator &end,
-                                             const std::vector<int> &random_dims,
-                                             const Eigen::Ref<const RowMatrix> &train,
-                                             const Eigen::Ref<const UIntRowMatrix> &knn, float tol,
-                                             int n_corpus, std::minstd_rand &r, int n_subsample) {
-    int n = end - begin;
-    int max_dim = -1;
-    float max_gain = 0, max_split = 0;
+  std::vector<float> log2_tbl;
+  std::vector<float> t_tbl;
 
+  std::tuple<int, float, float> split(const std::vector<int>::iterator &begin,
+                                      const std::vector<int>::iterator &end,
+                                      const std::vector<int> &random_dims,
+                                      const Eigen::Ref<const RowMatrix> &train,
+                                      const Eigen::Ref<const UIntRowMatrix> &knn, float tol,
+                                      int n_corpus, std::minstd_rand &r, int n_subsample) {
+    int n = int(end - begin);
+    int max_dim = -1;
+    float max_gain = 0.f, max_split = 0.f;
     if (n <= 1) return std::make_tuple(max_dim, max_split, max_gain);
 
-    std::vector<int> indices;
+    std::vector<int> local;
     if (n_subsample > 0 && n_subsample < n) {
-      indices = sample_unique(n, n_subsample);
+      local = sample_unique(n, n_subsample);
       n = n_subsample;
     } else {
-      indices = std::vector<int>(n);
-      std::iota(indices.begin(), indices.end(), 0);
+      local.resize(n);
+      std::iota(local.begin(), local.end(), 0);
     }
 
-    Eigen::VectorXf left_entropies(n), right_entropies(n);
-    const float *data = train.data();
-    const int cols = train.cols();
+    std::vector<int> ids(n);
+    for (int i = 0; i < n; ++i) ids[i] = *(begin + local[i]);
+
+    std::vector<float> left_ent(n), right_ent(n), keys(n);
+    std::vector<int> order(n);
+    std::iota(order.begin(), order.end(), 0);
+
+    std::vector<int> stamp(n_corpus, -1);
+    std::vector<int> votes(n_corpus);
+    int epoch = 0;
+
+    const float *train_data = train.data();
+    const int ncols = train.cols();
     const int k_build = knn.cols();
 
-    for (const auto &d : random_dims) {
-      miniselect::pdqsort_branchless(
-          indices.begin(), indices.end(), [data, cols, d, begin](int i1, int i2) {
-            return data[*(begin + i1) * cols + d] < data[*(begin + i2) * cols + d];
-          });
+    for (int d : random_dims) {
+      for (int i = 0; i < n; ++i) keys[i] = train_data[ids[i] * ncols + d];
 
-      std::vector<int> votes(n_corpus, 0);
+      miniselect::pdqsort_branchless(order.begin(), order.end(),
+                                     [&](int a, int b) { return keys[a] < keys[b]; });
 
-      float entropy = 0;
-      for (int ii = 0; ii < n; ++ii) {
-        const int i = indices[ii];
-        const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*(begin + i));
+      ++epoch;
+
+      float entropy = 0.f;
+      for (int pos = 0; pos < n; ++pos) {
+        const int row = ids[order[pos]];
+        const uint32_t *knn_ptr = knn.row(row).data();
         for (int j = 0; j < k_build; ++j) {
-          int v = ++votes[knn_crnt(j)];
-          if (v > 1) entropy -= (v - 1) * log2(v - 1);
-          entropy += v * log2(v);
+          const int gid = int(knn_ptr[j]);
+          if (stamp[gid] != epoch) {
+            stamp[gid] = epoch;
+            votes[gid] = 0;
+          }
+          const int v = ++votes[gid];
+          // entropy += v*log2(v) - (v-1)*log2(v-1)
+          entropy += t_tbl[v] - t_tbl[v - 1];
         }
-        left_entropies[ii] = k_build * log2(ii + 1) - entropy / (ii + 1);
+        left_ent[pos] = k_build * log2_tbl[pos + 1] - entropy / float(pos + 1);
       }
 
-      for (int ii = 0; ii < n - 1; ++ii) {
-        const int i = indices[ii];
-        const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*(begin + i));
+      for (int pos = 0; pos < n - 1; ++pos) {
+        const int row = ids[order[pos]];
+        const uint32_t *knn_ptr = knn.row(row).data();
         for (int j = 0; j < k_build; ++j) {
-          int v = --votes[knn_crnt(j)];
-          entropy -= (v + 1) * log2(v + 1);
-          if (v) entropy += v * log2(v);
+          const int gid = int(knn_ptr[j]);
+          const int v = --votes[gid];
+          // entropy += v*log2(v) - (v+1)*log2(v+1)
+          entropy += t_tbl[v] - t_tbl[v + 1];
         }
-        right_entropies[ii] = k_build * log2(n - ii - 1) - entropy / (n - ii - 1);
+        const int remain = n - pos - 1;
+        right_ent[pos] = k_build * log2_tbl[remain] - entropy / float(remain);
       }
-      right_entropies[n - 1] = 0;
+      right_ent[n - 1] = 0.f;
 
-      for (int ii = 0; ii < n - 1; ++ii) {
-        const int i = indices[ii];
-        if (train(*(begin + i), d) == train(*(begin + indices[ii + 1]), d)) continue;
-        float left = static_cast<float>(ii + 1) / n * left_entropies[ii];
-        float right = static_cast<float>(n - ii - 1) / n * right_entropies[ii];
-        float gain = left_entropies[n - 1] - (left + right);
+      const float base = left_ent[n - 1];
+      for (int pos = 0; pos < n - 1; ++pos) {
+        const float v1 = keys[order[pos]];
+        const float v2 = keys[order[pos + 1]];
+        if (v1 == v2) continue;
+
+        const float left_w = (pos + 1) * (1.f / n) * left_ent[pos];
+        const float right_w = (n - pos - 1) * (1.f / n) * right_ent[pos];
+        const float gain = base - (left_w + right_w);
+
         if (gain > max_gain + tol) {
           max_gain = gain;
           max_dim = d;
-          max_split = (train(*(begin + i), d) + train(*(begin + indices[ii + 1]), d)) / 2.0;
+          max_split = 0.5f * (v1 + v2);
         }
       }
     }
+
     return std::make_tuple(max_dim, max_split, max_gain);
   }
 
@@ -222,30 +254,44 @@ class RFClass : public MLANN {
   std::pair<std::vector<int>, std::vector<float>> count_votes(
       std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
       const Eigen::Ref<const UIntRowMatrix> &knn) {
-    int k_build = knn.cols();
-    std::unordered_map<int, int> votes;
+    const int k_build = knn.cols();
+    const size_t L = static_cast<size_t>(leaf_end - leaf_begin);
+    const size_t M = L * static_cast<size_t>(k_build);
+
+    std::unordered_map<uint32_t, int> votes;
+    votes.reserve(M);
+
     for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*it);
-      for (int j = 0; j < k_build; ++j) ++votes[knn_crnt(j)];
+      const int col_idx = *it;
+      auto col = knn.row(col_idx);
+      for (int j = 0; j < k_build; ++j) {
+        const uint32_t id = col(j);
+        auto [p, inserted] = votes.try_emplace(id, 0);
+        ++p->second;
+      }
     }
 
     std::vector<int> out_labels;
     std::vector<float> out_votes;
+    out_labels.reserve(votes.size());
+    out_votes.reserve(votes.size());
 
     int n_votes = 0;
-    for (const auto &v : votes) {
-      if (v.second >= b) {
-        out_labels.push_back(v.first);
-        out_votes.push_back(v.second);
-        n_votes += v.second;
+    for (const auto &kv : votes) {
+      const int cnt = kv.second;
+      if (cnt >= b) {
+        out_labels.push_back(static_cast<int>(kv.first));
+        out_votes.push_back(static_cast<float>(cnt));
+        n_votes += cnt;
       }
     }
 
-    for (size_t i = 0; i < out_votes.size(); ++i) {
-      out_votes[i] /= (n_votes * n_trees);
+    if (!out_votes.empty()) {
+      const float inv = 1.0f / (static_cast<float>(n_votes) * static_cast<float>(n_trees));
+      for (float &v : out_votes) v *= inv;
     }
 
-    return {out_labels, out_votes};
+    return {std::move(out_labels), std::move(out_votes)};
   }
 
   void grow_subtree(std::vector<int>::iterator begin, std::vector<int>::iterator end,
