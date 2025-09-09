@@ -52,19 +52,21 @@ class RFRP : public MLANN {
                 : build_dense_random_matrix(dense_random_matrix, n_pool, dim);
 
     split_points = Eigen::MatrixXf(n_array, n_trees);
-    labels_all = std::vector<std::vector<std::vector<int>>>(n_trees);
+    labels_all = std::vector<std::vector<std::vector<uint32_t>>>(n_trees);
     votes_all = std::vector<std::vector<std::vector<float>>>(n_trees);
 
 #pragma omp parallel for
     for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
-      labels_all[n_tree] = std::vector<std::vector<int>>(n_leaves);
+      labels_all[n_tree] = std::vector<std::vector<uint32_t>>(n_leaves);
       votes_all[n_tree] = std::vector<std::vector<float>>(n_leaves);
       Eigen::MatrixXf tree_projections;
 
       if (density < 1)
-        tree_projections.noalias() = sparse_random_matrix.middleRows(n_tree * depth, depth) * train.transpose();
+        tree_projections.noalias() =
+            sparse_random_matrix.middleRows(n_tree * depth, depth) * train.transpose();
       else
-        tree_projections.noalias() = dense_random_matrix.middleRows(n_tree * depth, depth) * train.transpose();
+        tree_projections.noalias() =
+            dense_random_matrix.middleRows(n_tree * depth, depth) * train.transpose();
 
       std::vector<int> indices(n_train);
       std::iota(indices.begin(), indices.end(), 0);
@@ -101,12 +103,12 @@ class RFRP : public MLANN {
       found_leaves[n_tree] = idx_tree - n_inner_nodes;
     }
 
-    std::vector<int> elected;
+    std::vector<uint32_t> elected;
     Eigen::VectorXf votes_total = Eigen::VectorXf::Zero(n_corpus);
 
     for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
       int leaf_idx = found_leaves[n_tree];
-      const std::vector<int> &labels = labels_all[n_tree][leaf_idx];
+      const std::vector<uint32_t> &labels = labels_all[n_tree][leaf_idx];
       const std::vector<float> &votes = votes_all[n_tree][leaf_idx];
       int n_labels = labels.size();
       for (int i = 0; i < n_labels; ++i) {
@@ -124,7 +126,7 @@ class RFRP : public MLANN {
   }
 
  private:
-  std::pair<std::vector<int>, std::vector<float>> count_votes(
+  std::pair<std::vector<uint32_t>, std::vector<float>> count_votes(
       std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
       const Eigen::Ref<const UIntRowMatrix> &knn) {
     const int k_build = knn.cols();
@@ -144,7 +146,7 @@ class RFRP : public MLANN {
       }
     }
 
-    std::vector<int> out_labels;
+    std::vector<uint32_t> out_labels;
     std::vector<float> out_votes;
     out_labels.reserve(votes.size());
     out_votes.reserve(votes.size());
@@ -152,7 +154,7 @@ class RFRP : public MLANN {
     for (const auto &kv : votes) {
       const int cnt = kv.second;
       if (cnt >= b) {
-        out_labels.push_back(static_cast<int>(kv.first));
+        out_labels.push_back(kv.first);
         out_votes.push_back(static_cast<float>(cnt));
       }
     }
@@ -166,7 +168,7 @@ class RFRP : public MLANN {
    */
   void grow_subtree(std::vector<int>::iterator begin, std::vector<int>::iterator end,
                     int tree_level, int i, int n_tree, const Eigen::MatrixXf &tree_projections,
-                    std::vector<std::vector<int>> &labels_tree,
+                    std::vector<std::vector<uint32_t>> &labels_tree,
                     std::vector<std::vector<float>> &votes_tree,
                     const Eigen::Map<const UIntRowMatrix> &knn) {
     int n = end - begin;

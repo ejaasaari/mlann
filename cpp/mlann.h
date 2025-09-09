@@ -109,37 +109,8 @@ class MLANN {
   bool empty() const { return n_trees == 0; }
 
  protected:
-  std::pair<std::vector<int>, std::vector<float>> count_votes(
-      std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
-      const Eigen::Ref<const UIntRowMatrix> &knn) {
-    int k_build = knn.cols();
-    std::unordered_map<int, int> votes;
-    for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const Eigen::Matrix<uint32_t, 1, Eigen::Dynamic> knn_crnt = knn.row(*it);
-      for (int j = 0; j < k_build; ++j) ++votes[knn_crnt(j)];
-    }
-
-    std::vector<int> out_labels;
-    std::vector<float> out_votes;
-
-    int n_votes = 0;
-    for (const auto &v : votes) {
-      if (v.second >= b) {
-        out_labels.push_back(v.first);
-        out_votes.push_back(v.second);
-        n_votes += v.second;
-      }
-    }
-
-    for (size_t i = 0; i < out_votes.size(); ++i) {
-      out_votes[i] /= (n_votes * n_trees);
-    }
-
-    return {out_labels, out_votes};
-  }
-
   void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
-                 const std::vector<int> &indices, int *out, Distance dist = L2,
+                 const std::vector<uint32_t> &indices, int *out, Distance dist = L2,
                  float *out_distances = nullptr) const {
     if (indices.empty()) {
       for (int i = 0; i < k; ++i) out[i] = -1;
@@ -209,8 +180,9 @@ class MLANN {
 
   const Eigen::Map<const RowMatrix> corpus;  // corpus from which nearest neighbors are searched
   Eigen::MatrixXf split_points;              // all split points in all the trees
-  Eigen::MatrixXi split_dimensions;          // all split dimensions in all the trees
-  std::vector<std::vector<std::vector<int>>> labels_all;
+  Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+      split_dimensions;  // all split dimensions in all the trees
+  std::vector<std::vector<std::vector<uint32_t>>> labels_all;
   std::vector<std::vector<std::vector<float>>> votes_all;
 
   const int n_corpus;    // size of corpus
