@@ -68,11 +68,11 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
   PyArrayObject *knn_data;
   int n_knn, dim_knn;
 
-  int n_trees, depth;
+  int n_trees, depth, b;
   float density;
 
-  if (!PyArg_ParseTuple(args, "O!iiO!iiiif", &PyArray_Type, &train_data, &n_train, &dim_train,
-                        &PyArray_Type, &knn_data, &n_knn, &dim_knn, &n_trees, &depth, &density))
+  if (!PyArg_ParseTuple(args, "O!iiO!iiiifi", &PyArray_Type, &train_data, &n_train, &dim_train,
+                        &PyArray_Type, &knn_data, &n_knn, &dim_knn, &n_trees, &depth, &density, &b))
     return NULL;
 
   Eigen::Map<const UIntRowMatrix> knn(reinterpret_cast<uint32_t *>(PyArray_DATA(knn_data)), n_knn,
@@ -82,7 +82,7 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
 
   try {
     Py_BEGIN_ALLOW_THREADS;
-    self->index->grow(n_trees, depth, knn, train, density);
+    self->index->grow(n_trees, depth, knn, train, density, b);
     Py_END_ALLOW_THREADS;
 
   } catch (const std::exception &e) {

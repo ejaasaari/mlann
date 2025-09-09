@@ -42,12 +42,13 @@ class MLANNIndex(object):
             raise ValueError("Density should be in (0, 1]")
         return density
 
-    def build(self, train, knn, n_trees, depth, density="auto"):
+    def build(self, train, knn, n_trees, depth, density="auto", b=1):
         """
         Builds a normal MLANN index.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
         :param projection_sparsity: Expected ratio of non-zero components in a projection matrix.
+        :param b: Minimum vote threshold for candidates to be included in the linear search phase.
         :return:
         """
         if self.built:
@@ -64,6 +65,7 @@ class MLANNIndex(object):
             n_trees,
             depth,
             density,
+            b,
         )
         self.built = True
 
