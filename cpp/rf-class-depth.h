@@ -1,7 +1,6 @@
 #pragma once
 
 #include <Eigen/Dense>
-#include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <random>
@@ -27,6 +26,31 @@ std::vector<uint32_t> sample_unique(int n, int k) {
 
   return reservoir;
 }
+
+struct SplitScratch {
+  std::vector<int> stamp;
+  std::vector<int> votes;
+  std::vector<int> ids;
+  std::vector<int> order;
+  std::vector<float> left_ent, right_ent, keys;
+  int epoch = 0;
+  void ensure_corpus(std::size_t n_corpus) {
+    if (stamp.size() != n_corpus) {
+      stamp.assign(n_corpus, -1);
+      votes.assign(n_corpus, 0);
+      epoch = 0;
+    }
+  }
+  void ensure_n(int n) {
+    if ((int)ids.size() < n) {
+      ids.resize(n);
+      order.resize(n);
+      left_ent.resize(n);
+      right_ent.resize(n);
+      keys.resize(n);
+    }
+  }
+};
 
 class RFClass : public MLANN {
  public:
@@ -61,9 +85,9 @@ class RFClass : public MLANN {
     const Eigen::Map<const UIntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
     const Eigen::Map<const RowMatrix> train(train_.data(), train_.rows(), train_.cols());
 
-    split_points = Eigen::MatrixXf(n_array, n_trees);
-    split_dimensions =
-        Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(n_array, n_trees);
+    split_points = Eigen::MatrixXf(n_inner_nodes, n_trees);
+    split_dimensions = Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(
+        n_inner_nodes, n_trees);
     labels_all = std::vector<std::vector<std::vector<uint32_t>>>(n_trees);
     votes_all = std::vector<std::vector<std::vector<float>>>(n_trees);
 
@@ -84,8 +108,12 @@ class RFClass : public MLANN {
 
       std::vector<int> indices(n_train);
       std::iota(indices.begin(), indices.end(), 0);
+
+      SplitScratch scratch;
+      scratch.ensure_corpus(n_corpus);
+
       grow_subtree(indices.begin(), indices.end(), 0, 0, n_tree, labels_all[n_tree],
-                   votes_all[n_tree], train, knn, random_dims_all[n_tree], n_subsample);
+                   votes_all[n_tree], train, knn, random_dims_all[n_tree], n_subsample, scratch);
     }
   }
 
@@ -102,7 +130,7 @@ class RFClass : public MLANN {
         const int idx_right = idx_left + 1;
         const float split_point = split_points(idx_tree, n_tree);
         const uint32_t split_dimension = split_dimensions(idx_tree, n_tree);
-        if (split_dimension == UINT32_MAX) {  // if branch stops before maximum depth
+        if (split_dimension == UINT32_MAX) {
           break;
         }
         if (q(split_dimension) <= split_point) {
@@ -145,7 +173,7 @@ class RFClass : public MLANN {
                                       const std::vector<uint32_t> &random_dims,
                                       const Eigen::Ref<const RowMatrix> &train,
                                       const Eigen::Ref<const UIntRowMatrix> &knn, float tol,
-                                      int n_corpus, int n_subsample) {
+                                      int n_corpus, int n_subsample, SplitScratch &scratch) {
     int n = int(end - begin);
     int max_dim = -1;
     float max_gain = 0.f, max_split = 0.f;
@@ -160,16 +188,19 @@ class RFClass : public MLANN {
       std::iota(local.begin(), local.end(), 0);
     }
 
-    std::vector<int> ids(n);
+    scratch.ensure_corpus(n_corpus);
+    scratch.ensure_n(n);
+
+    auto &ids = scratch.ids;
+    auto &order = scratch.order;
+    auto &left_ent = scratch.left_ent;
+    auto &right_ent = scratch.right_ent;
+    auto &keys = scratch.keys;
+    auto &stamp = scratch.stamp;
+    auto &votes = scratch.votes;
+
     for (int i = 0; i < n; ++i) ids[i] = *(begin + local[i]);
-
-    std::vector<float> left_ent(n), right_ent(n), keys(n);
-    std::vector<int> order(n);
-    std::iota(order.begin(), order.end(), 0);
-
-    std::vector<int> stamp(n_corpus, -1);
-    std::vector<int> votes(n_corpus);
-    int epoch = 0;
+    std::iota(order.begin(), order.begin() + n, 0);
 
     const float *train_data = train.data();
     const int ncols = train.cols();
@@ -178,10 +209,10 @@ class RFClass : public MLANN {
     for (uint32_t d : random_dims) {
       for (int i = 0; i < n; ++i) keys[i] = train_data[ids[i] * ncols + d];
 
-      miniselect::pdqsort_branchless(order.begin(), order.end(),
+      miniselect::pdqsort_branchless(order.begin(), order.begin() + n,
                                      [&](int a, int b) { return keys[a] < keys[b]; });
 
-      ++epoch;
+      ++scratch.epoch;
 
       float entropy = 0.f;
       for (int pos = 0; pos < n; ++pos) {
@@ -189,12 +220,11 @@ class RFClass : public MLANN {
         const uint32_t *knn_ptr = knn.row(row).data();
         for (int j = 0; j < k_build; ++j) {
           const int gid = int(knn_ptr[j]);
-          if (stamp[gid] != epoch) {
-            stamp[gid] = epoch;
+          if (stamp[gid] != scratch.epoch) {
+            stamp[gid] = scratch.epoch;
             votes[gid] = 0;
           }
           const int v = ++votes[gid];
-          // entropy += v*log2(v) - (v-1)*log2(v-1)
           entropy += t_tbl[v] - t_tbl[v - 1];
         }
         left_ent[pos] = k_build * log2_tbl[pos + 1] - entropy / float(pos + 1);
@@ -206,7 +236,6 @@ class RFClass : public MLANN {
         for (int j = 0; j < k_build; ++j) {
           const int gid = int(knn_ptr[j]);
           const int v = --votes[gid];
-          // entropy += v*log2(v) - (v+1)*log2(v+1)
           entropy += t_tbl[v] - t_tbl[v + 1];
         }
         const int remain = n - pos - 1;
@@ -296,7 +325,8 @@ class RFClass : public MLANN {
                     std::vector<std::vector<float>> &votes_tree,
                     const Eigen::Ref<const RowMatrix> &train,
                     const Eigen::Ref<const UIntRowMatrix> &knn,
-                    const std::vector<std::vector<uint32_t>> &random_dims, int n_subsample) {
+                    const std::vector<std::vector<uint32_t>> &random_dims, int n_subsample,
+                    SplitScratch &scratch) {
     if (tree_level == depth) {
       const int index_leaf = i - n_inner_nodes;
       const auto ret = count_votes(begin, end, knn);
@@ -306,7 +336,7 @@ class RFClass : public MLANN {
     }
 
     const auto s =
-        split(begin, end, random_dims[tree_level], train, knn, tol, n_corpus, n_subsample);
+        split(begin, end, random_dims[tree_level], train, knn, tol, n_corpus, n_subsample, scratch);
     const int max_dim = std::get<0>(s);
     const float max_split = std::get<1>(s);
 
@@ -332,9 +362,9 @@ class RFClass : public MLANN {
     const int idx_left = 2 * i + 1;
     const int idx_right = idx_left + 1;
     grow_subtree(begin, mid, tree_level + 1, idx_left, n_tree, labels_tree, votes_tree, train, knn,
-                 random_dims, n_subsample);
+                 random_dims, n_subsample, scratch);
     grow_subtree(mid, end, tree_level + 1, idx_right, n_tree, labels_tree, votes_tree, train, knn,
-                 random_dims, n_subsample);
+                 random_dims, n_subsample, scratch);
   }
 
   int n_subsample = 100;
