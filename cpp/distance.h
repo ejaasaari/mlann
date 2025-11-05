@@ -199,29 +199,6 @@ static inline float squared_euclidean(const float *x1, const float *x2, size_t l
 
   return result;
 }
-#elif defined(__ARM_FEATURE_SVE)
-static inline float dot_product(const float *x1, const float *x2, size_t length) {
-  int64_t i = 0;
-  svfloat32_t sum = svdup_n_f32(0);
-  while (i + svcntw() <= length) {
-    svfloat32_t in1 = svld1_f32(svptrue_b32(), x1 + i);
-    svfloat32_t in2 = svld1_f32(svptrue_b32(), x2 + i);
-    svfloat32_t diff = svsub_f32_m(svptrue_b32(), in1, in2);
-    sum = svmla_f32_m(svptrue_b32(), sum, diff, diff);
-    i += svcntw();
-  }
-  svbool_t while_mask = svwhilelt_b32(i, length);
-  do {
-    svfloat32_t in1 = svld1_f32(while_mask, x1 + i);
-    svfloat32_t in2 = svld1_f32(while_mask, x2 + i);
-    svfloat32_t diff = svsub_f32_m(while_mask, in1, in2);
-    sum = svmla_f32_m(while_mask, sum, diff, diff);
-    i += svcntw();
-    while_mask = svwhilelt_b32(i, length);
-  } while (svptest_any(svptrue_b32(), while_mask));
-
-  return svaddv_f32(svptrue_b32(), sum);
-}
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
 static inline float squared_euclidean(const float *x1, const float *x2, size_t length) {
   float32x4_t diff_sum = vdupq_n_f32(0);
