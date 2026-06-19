@@ -27,8 +27,9 @@ class RFRP : public MLANN {
     }
 
     int n_train = train_.rows();
-    if (depth_ <= 0 || depth_ > std::log2(n_train)) {
-      throw std::out_of_range("The depth must belong to the set {1, ... , log2(n_train)}.");
+    if (depth_ <= 0 || depth_ > std::log2(n_train) || depth_ > 29) {
+      throw std::out_of_range(
+          "The depth must belong to the set {1, ... , min(log2(n_train), 29)}.");
     }
 
     n_trees = n_trees_;
@@ -250,7 +251,8 @@ class RFRP : public MLANN {
     std::minstd_rand gen(rd());
     std::normal_distribution<float> normal_dist(0, 1);
 
-    std::generate(dense_random_matrix.data(), dense_random_matrix.data() + n_row * n_col,
+    std::generate(dense_random_matrix.data(),
+                  dense_random_matrix.data() + dense_random_matrix.size(),
                   [&normal_dist, &gen] { return normal_dist(gen); });
   }
 

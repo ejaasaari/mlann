@@ -67,6 +67,10 @@ class RFClass : public MLANN {
     }
 
     int n_train = train_.rows();
+    if (depth_ <= 0 || depth_ > std::log2(n_train) || depth_ > 29) {
+      throw std::out_of_range(
+          "The depth must belong to the set {1, ... , min(log2(n_train), 29)}.");
+    }
 
     n_trees = n_trees_;
     depth = depth_;
@@ -207,7 +211,11 @@ class RFClass : public MLANN {
     const int k_build = knn.cols();
 
     for (uint32_t d : random_dims) {
-      for (int i = 0; i < n; ++i) keys[i] = train_data[ids[i] * ncols + d];
+      for (int i = 0; i < n; ++i) {
+        const size_t offset =
+            static_cast<size_t>(ids[i]) * static_cast<size_t>(ncols) + static_cast<size_t>(d);
+        keys[i] = train_data[offset];
+      }
 
       miniselect::pdqsort_branchless(order.begin(), order.begin() + n,
                                      [&](int a, int b) { return keys[a] < keys[b]; });
@@ -353,7 +361,9 @@ class RFClass : public MLANN {
     const float *data = train.data();
     const int cols = train.cols();
     auto mid = std::partition(begin, end, [data, cols, max_dim, max_split](const int em) {
-      return data[em * cols + max_dim] <= max_split;
+      const size_t offset =
+          static_cast<size_t>(em) * static_cast<size_t>(cols) + static_cast<size_t>(max_dim);
+      return data[offset] <= max_split;
     });
 
     split_points(i, n_tree) = max_split;

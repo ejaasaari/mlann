@@ -80,13 +80,14 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
   Eigen::Map<const RowMatrix> train(reinterpret_cast<float *>(PyArray_DATA(train_data)), n_train,
                                     dim_train);
 
+  PyThreadState *_save = PyEval_SaveThread();
   try {
-    Py_BEGIN_ALLOW_THREADS;
     self->index->grow(n_trees, depth, knn, train, density, b);
-    Py_END_ALLOW_THREADS;
-
+    PyEval_RestoreThread(_save);
   } catch (const std::exception &e) {
+    PyEval_RestoreThread(_save);
     PyErr_SetString(PyExc_RuntimeError, e.what());
+    return NULL;
   }
 
   Py_RETURN_NONE;
@@ -163,8 +164,10 @@ static PyObject *ann(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->query(indata + i * dim, k, elect, outdata + i * k, dist,
-                           distances_out + i * k);
+        const size_t query_offset = static_cast<size_t>(i) * static_cast<size_t>(dim);
+        const size_t output_offset = static_cast<size_t>(i) * static_cast<size_t>(k);
+        self->index->query(indata + query_offset, k, elect, outdata + output_offset, dist,
+                           distances_out + output_offset);
       }
       Py_END_ALLOW_THREADS;
 
@@ -178,7 +181,9 @@ static PyObject *ann(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->query(indata + i * dim, k, elect, outdata + i * k, dist);
+        const size_t query_offset = static_cast<size_t>(i) * static_cast<size_t>(dim);
+        const size_t output_offset = static_cast<size_t>(i) * static_cast<size_t>(k);
+        self->index->query(indata + query_offset, k, elect, outdata + output_offset, dist);
       }
       Py_END_ALLOW_THREADS;
       return nearest;
@@ -239,7 +244,10 @@ static PyObject *exact_search(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->exact_knn(indata + i * dim, k, outdata + i * k, dist, distances_out + i * k);
+        const size_t query_offset = static_cast<size_t>(i) * static_cast<size_t>(dim);
+        const size_t output_offset = static_cast<size_t>(i) * static_cast<size_t>(k);
+        self->index->exact_knn(indata + query_offset, k, outdata + output_offset, dist,
+                               distances_out + output_offset);
       }
       Py_END_ALLOW_THREADS;
 
@@ -253,7 +261,9 @@ static PyObject *exact_search(mlannIndex *self, PyObject *args) {
 #pragma omp parallel for
 #endif
       for (int i = 0; i < n; ++i) {
-        self->index->exact_knn(indata + i * dim, k, outdata + i * k, dist);
+        const size_t query_offset = static_cast<size_t>(i) * static_cast<size_t>(dim);
+        const size_t output_offset = static_cast<size_t>(i) * static_cast<size_t>(k);
+        self->index->exact_knn(indata + query_offset, k, outdata + output_offset, dist);
       }
       Py_END_ALLOW_THREADS;
       return nearest;
