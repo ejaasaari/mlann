@@ -1,10 +1,13 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <utility>
 
 #include "mlann.h"
 
@@ -33,7 +36,9 @@ struct SplitScratch {
   std::vector<int> ids;
   std::vector<int> order;
   std::vector<float> left_ent, right_ent, keys;
+  std::vector<uint32_t> touched_ids;
   int epoch = 0;
+
   void ensure_corpus(std::size_t n_corpus) {
     if (stamp.size() != n_corpus) {
       stamp.assign(n_corpus, -1);
@@ -49,6 +54,14 @@ struct SplitScratch {
       right_ent.resize(n);
       keys.resize(n);
     }
+  }
+
+  void next_epoch() {
+    if (epoch == std::numeric_limits<int>::max()) {
+      std::fill(stamp.begin(), stamp.end(), -1);
+      epoch = 0;
+    }
+    ++epoch;
   }
 };
 
@@ -220,7 +233,7 @@ class RFClass : public MLANN {
       miniselect::pdqsort_branchless(order.begin(), order.begin() + n,
                                      [&](int a, int b) { return keys[a] < keys[b]; });
 
-      ++scratch.epoch;
+      scratch.next_epoch();
 
       float entropy = 0.f;
       for (int pos = 0; pos < n; ++pos) {
@@ -286,34 +299,43 @@ class RFClass : public MLANN {
 
   std::pair<std::vector<uint32_t>, std::vector<float>> count_votes(
       std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
-      const Eigen::Ref<const UIntRowMatrix> &knn) {
+      const Eigen::Ref<const UIntRowMatrix> &knn, SplitScratch &scratch) {
     const int k_build = knn.cols();
     const size_t L = static_cast<size_t>(leaf_end - leaf_begin);
     const size_t M = L * static_cast<size_t>(k_build);
 
-    std::unordered_map<uint32_t, int> votes;
-    votes.reserve(M);
+    scratch.next_epoch();
+    scratch.touched_ids.clear();
+    scratch.touched_ids.reserve(std::min(M, static_cast<size_t>(n_corpus)));
+
+    auto &stamp = scratch.stamp;
+    auto &votes = scratch.votes;
+    auto &touched_ids = scratch.touched_ids;
 
     for (auto it = leaf_begin; it != leaf_end; ++it) {
       const int col_idx = *it;
-      auto col = knn.row(col_idx);
+      const uint32_t *knn_ptr = knn.row(col_idx).data();
       for (int j = 0; j < k_build; ++j) {
-        const uint32_t id = col(j);
-        auto [p, inserted] = votes.try_emplace(id, 0);
-        ++p->second;
+        const uint32_t id = knn_ptr[j];
+        if (stamp[id] != scratch.epoch) {
+          stamp[id] = scratch.epoch;
+          votes[id] = 0;
+          touched_ids.push_back(id);
+        }
+        ++votes[id];
       }
     }
 
     std::vector<uint32_t> out_labels;
     std::vector<float> out_votes;
-    out_labels.reserve(votes.size());
-    out_votes.reserve(votes.size());
+    out_labels.reserve(touched_ids.size());
+    out_votes.reserve(touched_ids.size());
 
     int n_votes = 0;
-    for (const auto &kv : votes) {
-      const int cnt = kv.second;
+    for (const uint32_t id : touched_ids) {
+      const int cnt = votes[id];
       if (cnt >= b) {
-        out_labels.push_back(kv.first);
+        out_labels.push_back(id);
         out_votes.push_back(static_cast<float>(cnt));
         n_votes += cnt;
       }
@@ -337,9 +359,9 @@ class RFClass : public MLANN {
                     SplitScratch &scratch) {
     if (tree_level == depth) {
       const int index_leaf = i - n_inner_nodes;
-      const auto ret = count_votes(begin, end, knn);
-      labels_tree[index_leaf] = ret.first;
-      votes_tree[index_leaf] = ret.second;
+      auto ret = count_votes(begin, end, knn, scratch);
+      labels_tree[index_leaf] = std::move(ret.first);
+      votes_tree[index_leaf] = std::move(ret.second);
       return;
     }
 
@@ -352,9 +374,9 @@ class RFClass : public MLANN {
       split_dimensions(i, n_tree) = UINT32_MAX;
       const int levels2leaf = depth - tree_level;
       const int index_leaf = (1 << levels2leaf) * (i + 1) - 1 - n_inner_nodes;
-      const auto ret = count_votes(begin, end, knn);
-      labels_tree[index_leaf] = ret.first;
-      votes_tree[index_leaf] = ret.second;
+      auto ret = count_votes(begin, end, knn, scratch);
+      labels_tree[index_leaf] = std::move(ret.first);
+      votes_tree[index_leaf] = std::move(ret.second);
       return;
     }
 
