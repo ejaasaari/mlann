@@ -89,7 +89,7 @@ static inline float dot_product(const float *x1, const float *x2, size_t length)
 }
 #elif defined(__ARM_FEATURE_SVE)
 static inline float dot_product(const float *x1, const float *x2, size_t length) {
-  int64_t i = 0;
+  size_t i = 0;
   svfloat32_t sum = svdup_n_f32(0);
   while (i + svcntw() <= length) {
     svfloat32_t in1 = svld1_f32(svptrue_b32(), x1 + i);
