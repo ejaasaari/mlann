@@ -30,38 +30,30 @@ std::vector<uint32_t> sample_unique(int n, int k) {
   return reservoir;
 }
 
+struct SplitEntry {
+  float key;
+  int index;
+};
+
 struct SplitScratch {
-  std::vector<int> stamp;
   std::vector<int> votes;
+  std::vector<int> compact_votes;
+  std::vector<uint16_t> compact_votes_16;
   std::vector<int> ids;
-  std::vector<int> order;
-  std::vector<float> left_ent, right_ent, keys;
+  std::vector<SplitEntry> order;
+  std::vector<float> left_ent;
+  std::vector<uint32_t> sampled_labels;
   std::vector<uint32_t> touched_ids;
-  int epoch = 0;
 
   void ensure_corpus(std::size_t n_corpus) {
-    if (stamp.size() != n_corpus) {
-      stamp.assign(n_corpus, -1);
-      votes.assign(n_corpus, 0);
-      epoch = 0;
-    }
+    if (votes.size() != n_corpus) votes.assign(n_corpus, 0);
   }
   void ensure_n(int n) {
     if ((int)ids.size() < n) {
       ids.resize(n);
       order.resize(n);
       left_ent.resize(n);
-      right_ent.resize(n);
-      keys.resize(n);
     }
-  }
-
-  void next_epoch() {
-    if (epoch == std::numeric_limits<int>::max()) {
-      std::fill(stamp.begin(), stamp.end(), -1);
-      epoch = 0;
-    }
-    ++epoch;
   }
 };
 
@@ -117,20 +109,24 @@ class RFClass : public MLANN {
     log2_tbl[0] = 0.f;
     for (int i = 1; i <= n; ++i) log2_tbl[i] = std::log2(float(i));
     for (int i = 0; i <= n; ++i) t_tbl[i] = i * log2_tbl[i];
+    for (int i = n; i > 0; --i) t_tbl[i] -= t_tbl[i - 1];
 
-#pragma omp parallel for
-    for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
-      labels_all[n_tree] = std::vector<std::vector<uint32_t>>(n_leaves);
-      votes_all[n_tree] = std::vector<std::vector<float>>(n_leaves);
-
-      std::vector<int> indices(n_train);
-      std::iota(indices.begin(), indices.end(), 0);
-
+#pragma omp parallel
+    {
       SplitScratch scratch;
       scratch.ensure_corpus(n_corpus);
+      std::vector<int> indices(n_train);
 
-      grow_subtree(indices.begin(), indices.end(), 0, 0, n_tree, labels_all[n_tree],
-                   votes_all[n_tree], train, knn, random_dims_all[n_tree], n_subsample, scratch);
+#pragma omp for schedule(dynamic, 1)
+      for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
+        labels_all[n_tree] = std::vector<std::vector<uint32_t>>(n_leaves);
+        votes_all[n_tree] = std::vector<std::vector<float>>(n_leaves);
+
+        std::iota(indices.begin(), indices.end(), 0);
+
+        grow_subtree(indices.begin(), indices.end(), 0, 0, n_tree, labels_all[n_tree],
+                     votes_all[n_tree], train, knn, random_dims_all[n_tree], n_subsample, scratch);
+      }
     }
   }
 
@@ -211,75 +207,105 @@ class RFClass : public MLANN {
     auto &ids = scratch.ids;
     auto &order = scratch.order;
     auto &left_ent = scratch.left_ent;
-    auto &right_ent = scratch.right_ent;
-    auto &keys = scratch.keys;
-    auto &stamp = scratch.stamp;
     auto &votes = scratch.votes;
 
-    for (int i = 0; i < n; ++i) ids[i] = *(begin + local[i]);
-    std::iota(order.begin(), order.begin() + n, 0);
+    for (int i = 0; i < n; ++i) {
+      ids[i] = *(begin + local[i]);
+      order[i].index = i;
+    }
 
     const float *train_data = train.data();
     const int ncols = train.cols();
     const int k_build = knn.cols();
+    const size_t n_sampled_labels = static_cast<size_t>(n) * static_cast<size_t>(k_build);
 
-    for (uint32_t d : random_dims) {
-      for (int i = 0; i < n; ++i) {
-        const size_t offset =
-            static_cast<size_t>(ids[i]) * static_cast<size_t>(ncols) + static_cast<size_t>(d);
-        keys[i] = train_data[offset];
+    scratch.sampled_labels.resize(n_sampled_labels);
+    scratch.touched_ids.clear();
+    scratch.touched_ids.reserve(std::min(n_sampled_labels, static_cast<size_t>(n_corpus)));
+
+    auto &sampled_labels = scratch.sampled_labels;
+    auto &touched_ids = scratch.touched_ids;
+
+    int n_labels = 0;
+    for (int i = 0; i < n; ++i) {
+      const uint32_t *knn_ptr = knn.row(ids[i]).data();
+      uint32_t *sampled_ptr = sampled_labels.data() + static_cast<size_t>(i) * k_build;
+      for (int j = 0; j < k_build; ++j) {
+        const uint32_t id = knn_ptr[j];
+        int &dense_id = votes[id];
+        if (dense_id == 0) {
+          dense_id = ++n_labels;
+          touched_ids.push_back(id);
+        }
+        sampled_ptr[j] = static_cast<uint32_t>(dense_id - 1);
       }
+    }
+    for (const uint32_t id : touched_ids) votes[id] = 0;
 
-      miniselect::pdqsort_branchless(order.begin(), order.begin() + n,
-                                     [&](int a, int b) { return keys[a] < keys[b]; });
+    const auto evaluate_dimensions = [&](auto &compact_votes) {
+      for (uint32_t d : random_dims) {
+        for (int i = 0; i < n; ++i) {
+          SplitEntry &entry = order[i];
+          const size_t offset = static_cast<size_t>(ids[entry.index]) * static_cast<size_t>(ncols) +
+                                static_cast<size_t>(d);
+          entry.key = train_data[offset];
+        }
 
-      scratch.next_epoch();
+        miniselect::pdqsort_branchless(
+            order.begin(), order.begin() + n,
+            [](const SplitEntry &a, const SplitEntry &b) { return a.key < b.key; });
 
-      float entropy = 0.f;
-      for (int pos = 0; pos < n; ++pos) {
-        const int row = ids[order[pos]];
-        const uint32_t *knn_ptr = knn.row(row).data();
-        for (int j = 0; j < k_build; ++j) {
-          const int gid = int(knn_ptr[j]);
-          if (stamp[gid] != scratch.epoch) {
-            stamp[gid] = scratch.epoch;
-            votes[gid] = 0;
+        float entropy = 0.f;
+        for (int pos = 0; pos < n; ++pos) {
+          const uint32_t *knn_ptr =
+              sampled_labels.data() + static_cast<size_t>(order[pos].index) * k_build;
+          for (int j = 0; j < k_build; ++j) {
+            const int gid = int(knn_ptr[j]);
+            const int v = ++compact_votes[gid];
+            entropy += t_tbl[v];
           }
-          const int v = ++votes[gid];
-          entropy += t_tbl[v] - t_tbl[v - 1];
+          left_ent[pos] = k_build * log2_tbl[pos + 1] - entropy / float(pos + 1);
         }
-        left_ent[pos] = k_build * log2_tbl[pos + 1] - entropy / float(pos + 1);
-      }
 
-      for (int pos = 0; pos < n - 1; ++pos) {
-        const int row = ids[order[pos]];
-        const uint32_t *knn_ptr = knn.row(row).data();
-        for (int j = 0; j < k_build; ++j) {
-          const int gid = int(knn_ptr[j]);
-          const int v = --votes[gid];
-          entropy += t_tbl[v] - t_tbl[v + 1];
+        const float base = left_ent[n - 1];
+        for (int pos = 0; pos < n - 1; ++pos) {
+          const uint32_t *knn_ptr =
+              sampled_labels.data() + static_cast<size_t>(order[pos].index) * k_build;
+          for (int j = 0; j < k_build; ++j) {
+            const int gid = int(knn_ptr[j]);
+            const int v = --compact_votes[gid];
+            entropy -= t_tbl[v + 1];
+          }
+          const int remain = n - pos - 1;
+          const float right_ent = k_build * log2_tbl[remain] - entropy / float(remain);
+          const float v1 = order[pos].key;
+          const float v2 = order[pos + 1].key;
+          if (v1 == v2) continue;
+
+          const float left_w = (pos + 1) * (1.f / n) * left_ent[pos];
+          const float right_w = remain * (1.f / n) * right_ent;
+          const float gain = base - (left_w + right_w);
+
+          if (gain > max_gain + tol) {
+            max_gain = gain;
+            max_dim = d;
+            max_split = 0.5f * (v1 + v2);
+          }
         }
-        const int remain = n - pos - 1;
-        right_ent[pos] = k_build * log2_tbl[remain] - entropy / float(remain);
+
+        // Restore the compact vote counters for the next dimension.
+        const uint32_t *last_knn_ptr =
+            sampled_labels.data() + static_cast<size_t>(order[n - 1].index) * k_build;
+        for (int j = 0; j < k_build; ++j) --compact_votes[last_knn_ptr[j]];
       }
-      right_ent[n - 1] = 0.f;
+    };
 
-      const float base = left_ent[n - 1];
-      for (int pos = 0; pos < n - 1; ++pos) {
-        const float v1 = keys[order[pos]];
-        const float v2 = keys[order[pos + 1]];
-        if (v1 == v2) continue;
-
-        const float left_w = (pos + 1) * (1.f / n) * left_ent[pos];
-        const float right_w = (n - pos - 1) * (1.f / n) * right_ent[pos];
-        const float gain = base - (left_w + right_w);
-
-        if (gain > max_gain + tol) {
-          max_gain = gain;
-          max_dim = d;
-          max_split = 0.5f * (v1 + v2);
-        }
-      }
+    if (n_sampled_labels <= std::numeric_limits<uint16_t>::max()) {
+      scratch.compact_votes_16.resize(n_sampled_labels);
+      evaluate_dimensions(scratch.compact_votes_16);
+    } else {
+      scratch.compact_votes.resize(n_sampled_labels);
+      evaluate_dimensions(scratch.compact_votes);
     }
 
     return std::make_tuple(max_dim, max_split, max_gain);
@@ -304,11 +330,9 @@ class RFClass : public MLANN {
     const size_t L = static_cast<size_t>(leaf_end - leaf_begin);
     const size_t M = L * static_cast<size_t>(k_build);
 
-    scratch.next_epoch();
     scratch.touched_ids.clear();
     scratch.touched_ids.reserve(std::min(M, static_cast<size_t>(n_corpus)));
 
-    auto &stamp = scratch.stamp;
     auto &votes = scratch.votes;
     auto &touched_ids = scratch.touched_ids;
 
@@ -317,12 +341,8 @@ class RFClass : public MLANN {
       const uint32_t *knn_ptr = knn.row(col_idx).data();
       for (int j = 0; j < k_build; ++j) {
         const uint32_t id = knn_ptr[j];
-        if (stamp[id] != scratch.epoch) {
-          stamp[id] = scratch.epoch;
-          votes[id] = 0;
-          touched_ids.push_back(id);
-        }
-        ++votes[id];
+        // split() and the previous leaf leave every shared counter at zero.
+        if (votes[id]++ == 0) touched_ids.push_back(id);
       }
     }
 
@@ -334,6 +354,7 @@ class RFClass : public MLANN {
     int n_votes = 0;
     for (const uint32_t id : touched_ids) {
       const int cnt = votes[id];
+      votes[id] = 0;
       if (cnt >= b) {
         out_labels.push_back(id);
         out_votes.push_back(static_cast<float>(cnt));
