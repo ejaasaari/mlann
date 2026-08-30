@@ -8,6 +8,7 @@
 
 #include "distance.h"
 #include "miniselect/pdqselect.h"
+#include "one-to-many.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
 typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> UIntRowMatrix;
@@ -123,15 +124,11 @@ class MLANN {
     int n_elected = indices.size();
     Eigen::VectorXf distances(n_elected);
 
-    if (dist == L2) {
-      for (int i = 0; i < n_elected; ++i) {
-        distances(i) = squared_euclidean(corpus.row(indices[i]).data(), q.data(), dim);
-      }
-    } else {
-      for (int i = 0; i < n_elected; ++i) {
-        distances(i) = dot_product(corpus.row(indices[i]).data(), q.data(), dim);
-      }
-    }
+    const auto metric =
+        dist == L2 ? mlann_detail::OneToManyMetric::L2 : mlann_detail::OneToManyMetric::IP;
+    mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
+                                      indices.data(), static_cast<std::size_t>(n_elected), metric,
+                                      distances.data());
 
     if (k == 1) {
       Eigen::MatrixXf::Index index;
