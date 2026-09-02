@@ -110,6 +110,11 @@ class MLANN {
   bool empty() const { return n_trees == 0; }
 
  protected:
+  struct ScoredCandidate {
+    float score;
+    uint32_t label;
+  };
+
   void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
                  const std::vector<uint32_t> &indices, int *out, Distance dist = L2,
                  float *out_distances = nullptr) const {
@@ -121,16 +126,16 @@ class MLANN {
       return;
     }
 
-    int n_elected = indices.size();
-    Eigen::VectorXf distances(n_elected);
-
+    const int n_elected = static_cast<int>(indices.size());
     const auto metric =
         dist == L2 ? mlann_detail::OneToManyMetric::L2 : mlann_detail::OneToManyMetric::IP;
-    mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
-                                      indices.data(), static_cast<std::size_t>(n_elected), metric,
-                                      distances.data());
 
     if (k == 1) {
+      static thread_local Eigen::VectorXf distances;
+      distances.resize(n_elected);
+      mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
+                                        indices.data(), static_cast<std::size_t>(n_elected), metric,
+                                        distances.data());
       Eigen::MatrixXf::Index index;
 
       if (dist == L2) {
@@ -147,29 +152,41 @@ class MLANN {
     }
 
     int n_to_sort = n_elected > k ? k : n_elected;
-    Eigen::VectorXi idx(n_elected);
-    std::iota(idx.data(), idx.data() + n_elected, 0);
+    static thread_local std::vector<ScoredCandidate> scored;
+    scored.resize(n_elected);
+    for (int i = 0; i < n_elected; ++i) scored[i].label = indices[i];
+    const mlann_detail::StridedFloatOutput scores{reinterpret_cast<unsigned char *>(scored.data()),
+                                                  sizeof(ScoredCandidate)};
+    mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
+                                      indices.data(), static_cast<std::size_t>(n_elected), metric,
+                                      scores);
 
     if (dist == L2) {
       miniselect::pdqpartial_sort_branchless(
-          idx.data(), idx.data() + n_to_sort, idx.data() + n_elected,
-          [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
+          scored.data(), scored.data() + n_to_sort, scored.data() + n_elected,
+          [](const ScoredCandidate &left, const ScoredCandidate &right) {
+            return left.score < right.score;
+          });
     } else {
       miniselect::pdqpartial_sort_branchless(
-          idx.data(), idx.data() + n_to_sort, idx.data() + n_elected,
-          [&distances](int i1, int i2) { return distances(i1) > distances(i2); });
+          scored.data(), scored.data() + n_to_sort, scored.data() + n_elected,
+          [](const ScoredCandidate &left, const ScoredCandidate &right) {
+            return left.score > right.score;
+          });
     }
 
-    for (int i = 0; i < k; ++i) out[i] = i < n_elected ? indices[idx(i)] : -1;
+    for (int i = 0; i < k; ++i) {
+      out[i] = i < n_elected ? static_cast<int>(scored[i].label) : -1;
+    }
 
     if (out_distances) {
       if (dist == L2) {
         for (int i = 0; i < k; ++i) {
-          out_distances[i] = i < n_elected ? std::sqrt(distances(idx(i))) : -1;
+          out_distances[i] = i < n_elected ? std::sqrt(scored[i].score) : -1;
         }
       } else {
         for (int i = 0; i < k; ++i) {
-          out_distances[i] = i < n_elected ? distances(idx(i)) : -1;
+          out_distances[i] = i < n_elected ? scored[i].score : -1;
         }
       }
     }

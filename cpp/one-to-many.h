@@ -32,6 +32,15 @@ namespace mlann_detail {
 
 enum class OneToManyMetric { IP, L2 };
 
+struct StridedFloatOutput {
+  unsigned char *data;
+  std::size_t stride;
+
+  MLANN_OTM_ALWAYS_INLINE float &operator[](const std::size_t index) const {
+    return *reinterpret_cast<float *>(data + index * stride);
+  }
+};
+
 struct FallbackOneToMany {};
 struct NeonOneToMany {};
 struct SveOneToMany {};
@@ -46,7 +55,7 @@ struct OneToManyKernel<FallbackOneToMany> {
   template <OneToManyMetric metric, typename Output>
   static MLANN_OTM_ALWAYS_INLINE void run(const float *query, const float *data,
                                           const std::size_t dim, const std::uint32_t *indices,
-                                          const std::size_t count, Output *output) {
+                                          const std::size_t count, Output output) {
     std::size_t candidate = 0;
     for (; count - candidate >= 4; candidate += 4) {
 #define MLANN_OTM_FALLBACK_ROW(i) \
@@ -67,7 +76,7 @@ struct OneToManyKernel<FallbackOneToMany> {
           MLANN_OTM_REPEAT_4(MLANN_OTM_FALLBACK_L2)
 #undef MLANN_OTM_FALLBACK_L2
         }
-#define MLANN_OTM_FALLBACK_STORE_L2(i) output[candidate + i] = static_cast<Output>(sum##i);
+#define MLANN_OTM_FALLBACK_STORE_L2(i) output[candidate + i] = sum##i;
         MLANN_OTM_REPEAT_4(MLANN_OTM_FALLBACK_STORE_L2)
 #undef MLANN_OTM_FALLBACK_STORE_L2
       } else {
@@ -77,7 +86,7 @@ struct OneToManyKernel<FallbackOneToMany> {
           MLANN_OTM_REPEAT_4(MLANN_OTM_FALLBACK_IP)
 #undef MLANN_OTM_FALLBACK_IP
         }
-#define MLANN_OTM_FALLBACK_STORE_IP(i) output[candidate + i] = static_cast<Output>(sum##i);
+#define MLANN_OTM_FALLBACK_STORE_IP(i) output[candidate + i] = sum##i;
         MLANN_OTM_REPEAT_4(MLANN_OTM_FALLBACK_STORE_IP)
 #undef MLANN_OTM_FALLBACK_STORE_IP
       }
@@ -92,10 +101,10 @@ struct OneToManyKernel<FallbackOneToMany> {
           const float diff = query[j] - row[j];
           sum += diff * diff;
         }
-        output[candidate] = static_cast<Output>(sum);
+        output[candidate] = sum;
       } else {
         for (std::size_t j = 0; j < dim; ++j) sum += query[j] * row[j];
-        output[candidate] = static_cast<Output>(sum);
+        output[candidate] = sum;
       }
     }
   }
@@ -134,7 +143,7 @@ struct OneToManyKernel<SveOneToMany> {
   template <OneToManyMetric metric, typename Output>
   static MLANN_OTM_ALWAYS_INLINE void run(const float *query, const float *data,
                                           const std::size_t dim, const std::uint32_t *indices,
-                                          const std::size_t count, Output *output) {
+                                          const std::size_t count, Output output) {
     std::size_t candidate = 0;
     for (; count - candidate >= 16; candidate += 16) {
 #define MLANN_OTM_SVE_ROW(i) \
@@ -171,11 +180,11 @@ struct OneToManyKernel<SveOneToMany> {
 #undef MLANN_OTM_SVE_REDUCE
 
       if constexpr (metric == OneToManyMetric::L2) {
-#define MLANN_OTM_SVE_STORE_L2(i) output[candidate + i] = static_cast<Output>(scalar##i);
+#define MLANN_OTM_SVE_STORE_L2(i) output[candidate + i] = scalar##i;
         MLANN_OTM_REPEAT_16(MLANN_OTM_SVE_STORE_L2)
 #undef MLANN_OTM_SVE_STORE_L2
       } else {
-#define MLANN_OTM_SVE_STORE_IP(i) output[candidate + i] = static_cast<Output>(scalar##i);
+#define MLANN_OTM_SVE_STORE_IP(i) output[candidate + i] = scalar##i;
         MLANN_OTM_REPEAT_16(MLANN_OTM_SVE_STORE_IP)
 #undef MLANN_OTM_SVE_STORE_IP
       }
@@ -183,7 +192,7 @@ struct OneToManyKernel<SveOneToMany> {
 
     for (; candidate < count; ++candidate) {
       const float *const row = data + static_cast<std::size_t>(indices[candidate]) * dim;
-      output[candidate] = static_cast<Output>(run_one<metric>(query, row, dim));
+      output[candidate] = run_one<metric>(query, row, dim);
     }
   }
 };
@@ -246,7 +255,7 @@ struct OneToManyKernel<NeonOneToMany> {
   template <OneToManyMetric metric, typename Output>
   static MLANN_OTM_ALWAYS_INLINE void run(const float *query, const float *data,
                                           const std::size_t dim, const std::uint32_t *indices,
-                                          const std::size_t count, Output *output) {
+                                          const std::size_t count, Output output) {
     std::size_t candidate = 0;
 #if defined(__aarch64__) || defined(_M_ARM64)
     for (; count - candidate >= 16; candidate += 16) {
@@ -291,7 +300,7 @@ struct OneToManyKernel<NeonOneToMany> {
           MLANN_OTM_REPEAT_16(MLANN_OTM_NEON_TAIL_L2)
 #undef MLANN_OTM_NEON_TAIL_L2
         }
-#define MLANN_OTM_NEON_STORE_L2(i) output[candidate + i] = static_cast<Output>(scalar##i);
+#define MLANN_OTM_NEON_STORE_L2(i) output[candidate + i] = scalar##i;
         MLANN_OTM_REPEAT_16(MLANN_OTM_NEON_STORE_L2)
 #undef MLANN_OTM_NEON_STORE_L2
       } else {
@@ -301,7 +310,7 @@ struct OneToManyKernel<NeonOneToMany> {
           MLANN_OTM_REPEAT_16(MLANN_OTM_NEON_TAIL_IP)
 #undef MLANN_OTM_NEON_TAIL_IP
         }
-#define MLANN_OTM_NEON_STORE_IP(i) output[candidate + i] = static_cast<Output>(scalar##i);
+#define MLANN_OTM_NEON_STORE_IP(i) output[candidate + i] = scalar##i;
         MLANN_OTM_REPEAT_16(MLANN_OTM_NEON_STORE_IP)
 #undef MLANN_OTM_NEON_STORE_IP
       }
@@ -310,7 +319,7 @@ struct OneToManyKernel<NeonOneToMany> {
 
     for (; candidate < count; ++candidate) {
       const float *const row = data + static_cast<std::size_t>(indices[candidate]) * dim;
-      output[candidate] = static_cast<Output>(run_one<metric>(query, row, dim));
+      output[candidate] = run_one<metric>(query, row, dim);
     }
   }
 };
@@ -362,7 +371,7 @@ struct OneToManyKernel<Avx512OneToMany> {
   template <OneToManyMetric metric, typename Output>
   static MLANN_OTM_ALWAYS_INLINE void run(const float *query, const float *data,
                                           const std::size_t dim, const std::uint32_t *indices,
-                                          const std::size_t count, Output *output) {
+                                          const std::size_t count, Output output) {
     std::size_t candidate = 0;
     for (; count - candidate >= 16; candidate += 16) {
 #define MLANN_OTM_AVX512_ROW(i) \
@@ -407,7 +416,7 @@ struct OneToManyKernel<Avx512OneToMany> {
           MLANN_OTM_REPEAT_16(MLANN_OTM_AVX512_TAIL_L2)
 #undef MLANN_OTM_AVX512_TAIL_L2
         }
-#define MLANN_OTM_AVX512_STORE_L2(i) output[candidate + i] = static_cast<Output>(scalar##i);
+#define MLANN_OTM_AVX512_STORE_L2(i) output[candidate + i] = scalar##i;
         MLANN_OTM_REPEAT_16(MLANN_OTM_AVX512_STORE_L2)
 #undef MLANN_OTM_AVX512_STORE_L2
       } else {
@@ -417,7 +426,7 @@ struct OneToManyKernel<Avx512OneToMany> {
           MLANN_OTM_REPEAT_16(MLANN_OTM_AVX512_TAIL_IP)
 #undef MLANN_OTM_AVX512_TAIL_IP
         }
-#define MLANN_OTM_AVX512_STORE_IP(i) output[candidate + i] = static_cast<Output>(scalar##i);
+#define MLANN_OTM_AVX512_STORE_IP(i) output[candidate + i] = scalar##i;
         MLANN_OTM_REPEAT_16(MLANN_OTM_AVX512_STORE_IP)
 #undef MLANN_OTM_AVX512_STORE_IP
       }
@@ -425,7 +434,7 @@ struct OneToManyKernel<Avx512OneToMany> {
 
     for (; candidate < count; ++candidate) {
       const float *const row = data + static_cast<std::size_t>(indices[candidate]) * dim;
-      output[candidate] = static_cast<Output>(run_one<metric>(query, row, dim));
+      output[candidate] = run_one<metric>(query, row, dim);
     }
   }
 };
@@ -484,7 +493,7 @@ struct OneToManyKernel<Avx2OneToMany> {
   template <OneToManyMetric metric, typename Output>
   static MLANN_OTM_ALWAYS_INLINE void run(const float *query, const float *data,
                                           const std::size_t dim, const std::uint32_t *indices,
-                                          const std::size_t count, Output *output) {
+                                          const std::size_t count, Output output) {
     std::size_t candidate = 0;
     for (; count - candidate >= 8; candidate += 8) {
 #define MLANN_OTM_AVX2_ROW(i) \
@@ -529,7 +538,7 @@ struct OneToManyKernel<Avx2OneToMany> {
           MLANN_OTM_REPEAT_8(MLANN_OTM_AVX2_TAIL_L2)
 #undef MLANN_OTM_AVX2_TAIL_L2
         }
-#define MLANN_OTM_AVX2_STORE_L2(i) output[candidate + i] = static_cast<Output>(scalar##i);
+#define MLANN_OTM_AVX2_STORE_L2(i) output[candidate + i] = scalar##i;
         MLANN_OTM_REPEAT_8(MLANN_OTM_AVX2_STORE_L2)
 #undef MLANN_OTM_AVX2_STORE_L2
       } else {
@@ -539,7 +548,7 @@ struct OneToManyKernel<Avx2OneToMany> {
           MLANN_OTM_REPEAT_8(MLANN_OTM_AVX2_TAIL_IP)
 #undef MLANN_OTM_AVX2_TAIL_IP
         }
-#define MLANN_OTM_AVX2_STORE_IP(i) output[candidate + i] = static_cast<Output>(scalar##i);
+#define MLANN_OTM_AVX2_STORE_IP(i) output[candidate + i] = scalar##i;
         MLANN_OTM_REPEAT_8(MLANN_OTM_AVX2_STORE_IP)
 #undef MLANN_OTM_AVX2_STORE_IP
       }
@@ -547,7 +556,7 @@ struct OneToManyKernel<Avx2OneToMany> {
 
     for (; candidate < count; ++candidate) {
       const float *const row = data + static_cast<std::size_t>(indices[candidate]) * dim;
-      output[candidate] = static_cast<Output>(run_one<metric>(query, row, dim));
+      output[candidate] = run_one<metric>(query, row, dim);
     }
   }
 };
@@ -571,9 +580,9 @@ MLANN_OTM_ALWAYS_INLINE void compute_one_to_many(const float *query, const float
                                                  const std::size_t dim,
                                                  const std::uint32_t *indices,
                                                  const std::size_t count,
-                                                 const OneToManyMetric metric, Output *output) {
-  static_assert(std::is_floating_point<Output>::value,
-                "one-to-many distance outputs must be floating point");
+                                                 const OneToManyMetric metric, Output output) {
+  static_assert(std::is_assignable<decltype(output[0]), float>::value,
+                "one-to-many outputs must accept floating-point scores");
   if (count == 0) return;
   if (metric == OneToManyMetric::L2) {
     OneToManyKernel<NativeOneToMany>::template run<OneToManyMetric::L2>(query, data, dim, indices,
