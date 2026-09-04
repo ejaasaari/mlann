@@ -420,6 +420,6 @@ class RFClass : public MLANN {
                  random_dims, n_subsample, scratch);
   }
 
-  int n_subsample = 100;
+  int n_subsample = 200;
   float tol = 0.001;
 };
