@@ -13,12 +13,14 @@
 #include "rf-class-depth.h"
 #include "rf-pca.h"
 #include "rf-rp.h"
+#include "rf-sparse-oblique.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
 typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> UIntRowMatrix;
 
 typedef struct {
   PyObject_HEAD MLANN *index;
+  SparseObliqueRF *sparse_oblique_index;
   PyArrayObject *py_data;
   float *data;
   int n;
@@ -30,6 +32,7 @@ static PyObject *MLANN_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
 
   if (self != NULL) {
     self->index = NULL;
+    self->sparse_oblique_index = NULL;
     self->data = NULL;
     self->py_data = NULL;
   }
@@ -55,7 +58,10 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
     self->index = new RFRP(data, n, dim);
   else if (strcmp(index_type, "PCA") == 0)
     self->index = new RFPCA(data, n, dim);
-  else
+  else if (strcmp(index_type, "SORF") == 0) {
+    self->sparse_oblique_index = new SparseObliqueRF(data, n, dim);
+    self->index = self->sparse_oblique_index;
+  } else
     self->index = new RFClass(data, n, dim);
 
   return 0;
@@ -69,10 +75,14 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
   int n_knn, dim_knn;
 
   int n_trees, depth, b;
+  int sketch_dim = 16;
+  int oblique_candidates = 3;
+  int oblique_sparsity = 4;
   float density;
 
-  if (!PyArg_ParseTuple(args, "O!iiO!iiiifi", &PyArray_Type, &train_data, &n_train, &dim_train,
-                        &PyArray_Type, &knn_data, &n_knn, &dim_knn, &n_trees, &depth, &density, &b))
+  if (!PyArg_ParseTuple(args, "O!iiO!iiiifi|iii", &PyArray_Type, &train_data, &n_train,
+                        &dim_train, &PyArray_Type, &knn_data, &n_knn, &dim_knn, &n_trees, &depth,
+                        &density, &b, &sketch_dim, &oblique_candidates, &oblique_sparsity))
     return NULL;
 
   Eigen::Map<const UIntRowMatrix> knn(reinterpret_cast<uint32_t *>(PyArray_DATA(knn_data)), n_knn,
@@ -82,6 +92,9 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
 
   PyThreadState *_save = PyEval_SaveThread();
   try {
+    if (self->sparse_oblique_index != NULL) {
+      self->sparse_oblique_index->configure(sketch_dim, oblique_candidates, oblique_sparsity);
+    }
     self->index->grow(n_trees, depth, knn, train, density, b);
     PyEval_RestoreThread(_save);
   } catch (const std::exception &e) {
@@ -102,12 +115,23 @@ static void mlann_dealloc(mlannIndex *self) {
   if (self->index) {
     delete self->index;
     self->index = NULL;
+    self->sparse_oblique_index = NULL;
   }
 
   Py_XDECREF(self->py_data);
   self->py_data = NULL;
 
   Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
+}
+
+static PyObject *split_counts(mlannIndex *self, PyObject *Py_UNUSED(ignored)) {
+  if (self->sparse_oblique_index == NULL) {
+    PyErr_SetString(PyExc_TypeError, "split_counts is only available for a SORF index");
+    return NULL;
+  }
+  const auto [axis, oblique] = self->sparse_oblique_index->split_counts();
+  return Py_BuildValue("(KK)", static_cast<unsigned long long>(axis),
+                       static_cast<unsigned long long>(oblique));
 }
 
 static PyObject *ann(mlannIndex *self, PyObject *args) {
@@ -275,6 +299,8 @@ static PyMethodDef MLANNMethods[] = {
     {"ann", (PyCFunction)ann, METH_VARARGS, "Return approximate nearest neighbors"},
     {"exact_search", (PyCFunction)exact_search, METH_VARARGS, "Return exact nearest neighbors"},
     {"build", (PyCFunction)build, METH_VARARGS, "Build the index"},
+    {"split_counts", (PyCFunction)split_counts, METH_NOARGS,
+     "Return the selected (axis, oblique) split counts for SORF"},
     {NULL, NULL, 0, NULL} /* Sentinel */
 };
 

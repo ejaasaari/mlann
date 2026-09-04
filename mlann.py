@@ -30,6 +30,7 @@ class MLANNIndex(object):
         if data is not None:
             self.index = mlannlib.MLANNIndex(data, n_samples, dim, index_type)
             self.dim = dim
+            self.index_type = index_type
 
         self.built = False
 
@@ -42,13 +43,28 @@ class MLANNIndex(object):
             raise ValueError("Density should be in (0, 1]")
         return density
 
-    def build(self, train, knn, n_trees, depth, density="auto", b=1):
+    def build(
+        self,
+        train,
+        knn,
+        n_trees,
+        depth,
+        density="auto",
+        b=1,
+        sketch_dim=16,
+        oblique_candidates=3,
+        oblique_sparsity=4,
+    ):
         """
-        Builds a normal MLANN index.
+        Builds an MLANN index.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
-        :param projection_sparsity: Expected ratio of non-zero components in a projection matrix.
+        :param density: Fraction of input features considered at each split.
         :param b: Minimum vote threshold for candidates to be included in the linear search phase.
+        :param sketch_dim: Label-sketch width used by SORF; 16--32 is usually sufficient.
+        :param oblique_candidates: Number of supervised oblique directions proposed at each
+                                   SORF node.
+        :param oblique_sparsity: Maximum nonzero coefficients in each SORF direction; must be 2--4.
         :return:
         """
         if self.built:
@@ -66,8 +82,19 @@ class MLANNIndex(object):
             depth,
             density,
             b,
+            sketch_dim,
+            oblique_candidates,
+            oblique_sparsity,
         )
         self.built = True
+
+    def split_counts(self):
+        """Returns the numbers of selected axis and oblique splits in a SORF index."""
+        if not self.built:
+            raise RuntimeError("Cannot inspect split counts before building index")
+        if self.index_type != "SORF":
+            raise TypeError("split_counts is only available for a SORF index")
+        return self.index.split_counts()
 
     def ann(self, q, k, votes_required, dist=mlannlib.L2, return_distances=False):
         """
