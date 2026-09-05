@@ -11,6 +11,7 @@
 #include "Python.h"
 #include "numpy/arrayobject.h"
 #include "rf-class-depth.h"
+#include "pls-query.h"
 #include "rf-pca.h"
 #include "rf-rp.h"
 
@@ -55,6 +56,8 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
     self->index = new RFRP(data, n, dim);
   else if (strcmp(index_type, "PCA") == 0)
     self->index = new RFPCA(data, n, dim);
+  else if (strcmp(index_type, "PLSQuery") == 0)
+    self->index = new PLSQuery(data, n, dim);
   else
     self->index = new RFClass(data, n, dim);
 
