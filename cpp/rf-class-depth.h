@@ -177,7 +177,7 @@ class RFClass : public MLANN {
     exact_knn(q, k, elected, out, dist, out_distances);
   }
 
- private:
+ protected:
   std::vector<float> log2_tbl;
   std::vector<float> t_tbl;
 
