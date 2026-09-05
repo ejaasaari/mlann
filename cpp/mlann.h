@@ -3,8 +3,10 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include <cstdint>
+#include <numeric>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 #include "distance.h"
 #include "miniselect/pdqselect.h"
@@ -72,11 +74,15 @@ class MLANN {
     if (dist == L2) {
       miniselect::pdqpartial_sort_branchless(
           idx.data(), idx.data() + k, idx.data() + n_corpus,
-          [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
+          [&distances](int i1, int i2) {
+            return distances(i1) < distances(i2) || (distances(i1) == distances(i2) && i1 < i2);
+          });
     } else {
       miniselect::pdqpartial_sort_branchless(
           idx.data(), idx.data() + k, idx.data() + n_corpus,
-          [&distances](int i1, int i2) { return distances(i1) > distances(i2); });
+          [&distances](int i1, int i2) {
+            return distances(i1) > distances(i2) || (distances(i1) == distances(i2) && i1 < i2);
+          });
     }
 
     for (int i = 0; i < k; ++i) out[i] = idx(i);
@@ -165,13 +171,13 @@ class MLANN {
       miniselect::pdqpartial_sort_branchless(
           scored.data(), scored.data() + n_to_sort, scored.data() + n_elected,
           [](const ScoredCandidate &left, const ScoredCandidate &right) {
-            return left.score < right.score;
+            return left.score < right.score || (left.score == right.score && left.label < right.label);
           });
     } else {
       miniselect::pdqpartial_sort_branchless(
           scored.data(), scored.data() + n_to_sort, scored.data() + n_elected,
           [](const ScoredCandidate &left, const ScoredCandidate &right) {
-            return left.score > right.score;
+            return left.score > right.score || (left.score == right.score && left.label < right.label);
           });
     }
 
