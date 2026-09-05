@@ -16,6 +16,9 @@ class MLANNIndex(object):
         :param data: Input data either as a NxDim numpy ndarray or as a filepath to a binary file containing the data.
         :return:
         """
+        if index_type not in ("PCA", "RP", "RF", "IVF1", "IVF"):
+            raise ValueError("Unknown index type")
+        self.index_type = index_type
         if isinstance(data, np.ndarray):
             if len(data) == 0 or len(data.shape) != 2:
                 raise ValueError("The data matrix should be non-empty and two-dimensional")
@@ -24,6 +27,9 @@ class MLANNIndex(object):
             if not data.flags["C_CONTIGUOUS"] or not data.flags["ALIGNED"]:
                 raise ValueError("The data matrix has to be C_CONTIGUOUS and ALIGNED")
             n_samples, dim = data.shape
+            if dim == 0:
+                raise ValueError("Data dimension must be positive")
+            self.n_samples = n_samples
         elif data is not None:
             raise ValueError("Data must be an ndarray")
 
@@ -42,9 +48,12 @@ class MLANNIndex(object):
             raise ValueError("Density should be in (0, 1]")
         return density
 
-    def build(self, train, knn, n_trees, depth, density="auto", b=1):
+    def build(self, train, knn, n_trees=None, depth=None, density="auto", b=1, *,
+              n_lists=None, iterations=25, samples_per_cluster=256, seed=42):
         """
         Builds a normal MLANN index.
+        For IVF1/IVF, provide n_lists instead of n_trees/depth. The partition
+        uses L2 k-means; iterations, samples_per_cluster, and seed control it.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
         :param projection_sparsity: Expected ratio of non-zero components in a projection matrix.
@@ -53,6 +62,27 @@ class MLANNIndex(object):
         """
         if self.built:
             raise RuntimeError("The index has already been built")
+
+        if self.index_type in ("IVF1", "IVF"):
+            if n_lists is None:
+                raise ValueError("IVF requires n_lists")
+            if n_trees is not None or depth is not None:
+                raise ValueError("Use n_lists for IVF, not tree parameters")
+            if not isinstance(train, np.ndarray) or train.ndim != 2 or train.dtype != np.float32:
+                raise ValueError("Training queries must be a float32 matrix")
+            if not isinstance(knn, np.ndarray) or knn.ndim != 2 or knn.dtype.kind not in "iu":
+                raise ValueError("Training neighbors must be an integer matrix")
+            if np.any(knn < 0) or np.any(knn >= self.n_samples):
+                raise ValueError("Training neighbor ID outside the database")
+            self.index.build_ivf(np.ascontiguousarray(train),
+                                 np.ascontiguousarray(knn, dtype=np.uint32),
+                                 n_lists, iterations, samples_per_cluster, seed)
+            self.n_lists = n_lists
+            self.built = True
+            return
+
+        if n_lists is not None or n_trees is None or depth is None:
+            raise ValueError("Tree indexes require n_trees and depth")
 
         density = self._compute_density(density)
         self.index.build(
@@ -69,10 +99,13 @@ class MLANNIndex(object):
         )
         self.built = True
 
-    def ann(self, q, k, votes_required, dist=mlannlib.L2, return_distances=False):
+    def ann(self, q, k, votes_required=None, dist=mlannlib.L2, return_distances=False, *,
+            candidate_budget=None, nprobe=None):
         """
         Performs an approximate nearest neighbor query for a single query vector or multiple query vectors
         in parallel. The queries are given as a numpy vector or a numpy matrix where each row contains a query.
+        IVF1 accepts candidate_budget or votes_required (strict probability threshold).
+        Ordinary IVF requires nprobe and probes the nearest centroids.
         :param q: The query object. Can be either a single query vector or a matrix with one query vector per row.
         :param k: The number of nearest neighbors to be returned.
         :param votes_required: The number of votes an object has to get to be included in the linear search part of the query.
@@ -86,6 +119,26 @@ class MLANNIndex(object):
             raise RuntimeError("Cannot query before building index")
         if q.dtype != np.float32:
             raise ValueError("The query matrix should have type float32")
+
+        if self.index_type in ("IVF1", "IVF"):
+            if self.index_type == "IVF1":
+                if nprobe is not None:
+                    raise ValueError("IVF1 uses a candidate_budget or probability threshold")
+                if candidate_budget is not None and votes_required is not None:
+                    raise ValueError("Specify either candidate_budget or votes_required")
+                budget = -1 if candidate_budget is None else candidate_budget
+                if candidate_budget is not None and candidate_budget < 0:
+                    raise ValueError("candidate_budget must be non-negative")
+                threshold = 0.0 if votes_required is None else votes_required
+            else:
+                if candidate_budget is not None or votes_required is not None or nprobe is None:
+                    raise ValueError("IVF requires nprobe")
+                budget, threshold = nprobe, 0.0
+            return self.index.ann_ivf(np.ascontiguousarray(q), k, budget, threshold,
+                                      dist, return_distances)
+
+        if votes_required is None or candidate_budget is not None or nprobe is not None:
+            raise ValueError("Tree queries require votes_required")
 
         return self.index.ann(q, k, votes_required, dist, return_distances)
 

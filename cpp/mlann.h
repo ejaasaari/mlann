@@ -118,7 +118,14 @@ class MLANN {
   void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
                  const std::vector<uint32_t> &indices, int *out, Distance dist = L2,
                  float *out_distances = nullptr) const {
-    if (indices.empty()) {
+    exact_knn(q, k, indices.data(), indices.size(), out, dist, out_distances);
+  }
+
+  // Read-only candidate view: callers can scan a posting prefix without copying IDs.
+  void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
+                 const uint32_t *indices, std::size_t count, int *out, Distance dist = L2,
+                 float *out_distances = nullptr) const {
+    if (count == 0) {
       for (int i = 0; i < k; ++i) out[i] = -1;
       if (out_distances) {
         for (int i = 0; i < k; ++i) out_distances[i] = -1;
@@ -126,7 +133,7 @@ class MLANN {
       return;
     }
 
-    const int n_elected = static_cast<int>(indices.size());
+    const int n_elected = static_cast<int>(count);
     const auto metric =
         dist == L2 ? mlann_detail::OneToManyMetric::L2 : mlann_detail::OneToManyMetric::IP;
 
@@ -134,7 +141,7 @@ class MLANN {
       static thread_local Eigen::VectorXf distances;
       distances.resize(n_elected);
       mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
-                                        indices.data(), static_cast<std::size_t>(n_elected), metric,
+                                        indices, static_cast<std::size_t>(n_elected), metric,
                                         distances.data());
       Eigen::MatrixXf::Index index;
 
@@ -158,7 +165,7 @@ class MLANN {
     const mlann_detail::StridedFloatOutput scores{reinterpret_cast<unsigned char *>(scored.data()),
                                                   sizeof(ScoredCandidate)};
     mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
-                                      indices.data(), static_cast<std::size_t>(n_elected), metric,
+                                      indices, static_cast<std::size_t>(n_elected), metric,
                                       scores);
 
     if (dist == L2) {

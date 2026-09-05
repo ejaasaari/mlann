@@ -10,6 +10,7 @@
 
 #include "Python.h"
 #include "numpy/arrayobject.h"
+#include "ivf.h"
 #include "rf-class-depth.h"
 #include "rf-pca.h"
 #include "rf-rp.h"
@@ -55,8 +56,16 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
     self->index = new RFRP(data, n, dim);
   else if (strcmp(index_type, "PCA") == 0)
     self->index = new RFPCA(data, n, dim);
-  else
+  else if (strcmp(index_type, "IVF1") == 0)
+    self->index = new IVF1(data, n, dim);
+  else if (strcmp(index_type, "IVF") == 0)
+    self->index = new IVF(data, n, dim);
+  else if (strcmp(index_type, "RF") == 0)
     self->index = new RFClass(data, n, dim);
+  else {
+    PyErr_SetString(PyExc_ValueError, "Unknown index type");
+    return -1;
+  }
 
   return 0;
 }
@@ -108,6 +117,92 @@ static void mlann_dealloc(mlannIndex *self) {
   self->py_data = NULL;
 
   Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
+}
+
+static PyObject *build_ivf(mlannIndex *self, PyObject *args) {
+  PyArrayObject *train, *knn;
+  int n_lists, iterations, samples;
+  unsigned int seed;
+  if (!PyArg_ParseTuple(args, "O!O!iiiI", &PyArray_Type, &train, &PyArray_Type, &knn,
+                        &n_lists, &iterations, &samples, &seed)) return NULL;
+  auto *index = dynamic_cast<IVF *>(self->index);
+  if (!index || PyArray_NDIM(train) != 2 || PyArray_NDIM(knn) != 2 ||
+      PyArray_TYPE(train) != NPY_FLOAT32 || PyArray_TYPE(knn) != NPY_UINT32 ||
+      !PyArray_ISCARRAY_RO(train) || !PyArray_ISCARRAY_RO(knn)) {
+    PyErr_SetString(PyExc_ValueError, "IVF training requires contiguous float32 queries and uint32 neighbors");
+    return NULL;
+  }
+  Eigen::Map<const RowMatrix> queries(reinterpret_cast<float *>(PyArray_DATA(train)),
+                                      PyArray_DIM(train, 0), PyArray_DIM(train, 1));
+  Eigen::Map<const UIntRowMatrix> labels(reinterpret_cast<uint32_t *>(PyArray_DATA(knn)),
+                                         PyArray_DIM(knn, 0), PyArray_DIM(knn, 1));
+  PyThreadState *state = PyEval_SaveThread();
+  try {
+    index->build(n_lists, labels, queries, iterations, samples, seed);
+  } catch (const std::exception &error) {
+    PyEval_RestoreThread(state);
+    PyErr_SetString(PyExc_ValueError, error.what());
+    return NULL;
+  }
+  PyEval_RestoreThread(state);
+  Py_RETURN_NONE;
+}
+
+static PyObject *ann_ivf(mlannIndex *self, PyObject *args) {
+  PyArrayObject *queries;
+  int k, budget, distance, return_distances;
+  float threshold;
+  if (!PyArg_ParseTuple(args, "O!iifii", &PyArray_Type, &queries, &k, &budget, &threshold,
+                        &distance, &return_distances)) return NULL;
+  auto *index = dynamic_cast<IVF *>(self->index);
+  const int ndim = PyArray_NDIM(queries);
+  if (!index || (ndim != 1 && ndim != 2) || PyArray_TYPE(queries) != NPY_FLOAT32 ||
+      !PyArray_ISCARRAY_RO(queries) || PyArray_DIM(queries, ndim - 1) != self->dim ||
+      k <= 0 || k > self->n) {
+    PyErr_SetString(PyExc_ValueError, "Invalid IVF query array or k");
+    return NULL;
+  }
+  const int n = ndim == 1 ? 1 : PyArray_DIM(queries, 0);
+  const float *data = reinterpret_cast<float *>(PyArray_DATA(queries));
+  if (!Eigen::Map<const RowMatrix>(data, n, self->dim).allFinite()) {
+    PyErr_SetString(PyExc_ValueError, "Queries must be finite");
+    return NULL;
+  }
+  npy_intp shape[2] = {n, k};
+  PyObject *nearest = PyArray_SimpleNew(ndim, ndim == 1 ? shape + 1 : shape, NPY_INT);
+  if (!nearest) return NULL;
+  PyObject *distances = return_distances ?
+      PyArray_SimpleNew(ndim, ndim == 1 ? shape + 1 : shape, NPY_FLOAT32) : NULL;
+  if (return_distances && !distances) { Py_DECREF(nearest); return NULL; }
+  int *out = reinterpret_cast<int *>(PyArray_DATA(reinterpret_cast<PyArrayObject *>(nearest)));
+  float *out_distances = distances ? reinterpret_cast<float *>(
+      PyArray_DATA(reinterpret_cast<PyArrayObject *>(distances))) : nullptr;
+  std::string error_message;
+  PyThreadState *state = PyEval_SaveThread();
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 1)
+#endif
+  for (int i = 0; i < n; ++i) {
+    try {
+      index->search(data + size_t(i) * self->dim, k, budget, threshold,
+                    out + size_t(i) * k, static_cast<Distance>(distance),
+                    out_distances ? out_distances + size_t(i) * k : nullptr);
+    } catch (const std::exception &error) {
+#ifdef _OPENMP
+#pragma omp critical(mlann_ivf_error)
+#endif
+      { error_message = error.what(); }
+    }
+  }
+  PyEval_RestoreThread(state);
+  if (!error_message.empty()) {
+    Py_DECREF(nearest);
+    Py_XDECREF(distances);
+    PyErr_SetString(PyExc_ValueError, error_message.c_str());
+    return NULL;
+  }
+  if (!distances) return nearest;
+  return Py_BuildValue("NN", nearest, distances);
 }
 
 static PyObject *ann(mlannIndex *self, PyObject *args) {
@@ -272,6 +367,8 @@ static PyObject *exact_search(mlannIndex *self, PyObject *args) {
 }
 
 static PyMethodDef MLANNMethods[] = {
+    {"build_ivf", (PyCFunction)build_ivf, METH_VARARGS, "Build a supervised IVF index"},
+    {"ann_ivf", (PyCFunction)ann_ivf, METH_VARARGS, "Query a supervised IVF index"},
     {"ann", (PyCFunction)ann, METH_VARARGS, "Return approximate nearest neighbors"},
     {"exact_search", (PyCFunction)exact_search, METH_VARARGS, "Return exact nearest neighbors"},
     {"build", (PyCFunction)build, METH_VARARGS, "Build the index"},
