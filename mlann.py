@@ -52,8 +52,11 @@ class MLANNIndex(object):
               n_lists=None, iterations=25, samples_per_cluster=256, seed=42):
         """
         Builds a normal MLANN index.
-        For IVF1/IVF, provide n_lists instead of n_trees/depth. The partition
-        uses L2 k-means; iterations, samples_per_cluster, and seed control it.
+        IVF1 uses n_trees independent random-centroid partitions (default 1),
+        each with n_lists centroids sampled from the corpus without replacement.
+        It performs assignment only, with no Lloyd iterations. seed controls sampling.
+        IVF uses one L2 k-means partition with n_lists centroids; iterations,
+        samples_per_cluster, and seed control it. The first two are ignored by IVF1.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
         :param projection_sparsity: Expected ratio of non-zero components in a projection matrix.
@@ -66,8 +69,9 @@ class MLANNIndex(object):
         if self.index_type in ("IVF1", "IVF"):
             if n_lists is None:
                 raise ValueError("IVF requires n_lists")
-            if n_trees is not None or depth is not None:
-                raise ValueError("Use n_lists for IVF, not tree parameters")
+            if depth is not None or (self.index_type == "IVF" and n_trees is not None):
+                raise ValueError("IVF uses n_lists; only IVF1 also accepts n_trees (no depth)")
+            n_clusterings = 1 if n_trees is None else n_trees
             if not isinstance(train, np.ndarray) or train.ndim != 2 or train.dtype != np.float32:
                 raise ValueError("Training queries must be a float32 matrix")
             if not isinstance(knn, np.ndarray) or knn.ndim != 2 or knn.dtype.kind not in "iu":
@@ -76,8 +80,9 @@ class MLANNIndex(object):
                 raise ValueError("Training neighbor ID outside the database")
             self.index.build_ivf(np.ascontiguousarray(train),
                                  np.ascontiguousarray(knn, dtype=np.uint32),
-                                 n_lists, iterations, samples_per_cluster, seed)
+                                 n_lists, iterations, samples_per_cluster, seed, n_clusterings)
             self.n_lists = n_lists
+            self.n_trees = n_clusterings
             self.built = True
             return
 
@@ -104,7 +109,9 @@ class MLANNIndex(object):
         """
         Performs an approximate nearest neighbor query for a single query vector or multiple query vectors
         in parallel. The queries are given as a numpy vector or a numpy matrix where each row contains a query.
-        IVF1 accepts candidate_budget or votes_required (strict probability threshold).
+        IVF1 averages label probabilities across its routed cells, then accepts
+        a global candidate_budget or votes_required (strict probability threshold).
+        An untrained cell contributes a unit vote for each of its corpus members.
         Ordinary IVF requires nprobe and probes the nearest centroids.
         :param q: The query object. Can be either a single query vector or a matrix with one query vector per row.
         :param k: The number of nearest neighbors to be returned.

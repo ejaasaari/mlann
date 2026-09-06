@@ -121,10 +121,10 @@ static void mlann_dealloc(mlannIndex *self) {
 
 static PyObject *build_ivf(mlannIndex *self, PyObject *args) {
   PyArrayObject *train, *knn;
-  int n_lists, iterations, samples;
+  int n_lists, iterations, samples, n_clusterings = 1;
   unsigned int seed;
-  if (!PyArg_ParseTuple(args, "O!O!iiiI", &PyArray_Type, &train, &PyArray_Type, &knn,
-                        &n_lists, &iterations, &samples, &seed)) return NULL;
+  if (!PyArg_ParseTuple(args, "O!O!iiiI|i", &PyArray_Type, &train, &PyArray_Type, &knn,
+                        &n_lists, &iterations, &samples, &seed, &n_clusterings)) return NULL;
   auto *index = dynamic_cast<IVF *>(self->index);
   if (!index || PyArray_NDIM(train) != 2 || PyArray_NDIM(knn) != 2 ||
       PyArray_TYPE(train) != NPY_FLOAT32 || PyArray_TYPE(knn) != NPY_UINT32 ||
@@ -138,7 +138,7 @@ static PyObject *build_ivf(mlannIndex *self, PyObject *args) {
                                          PyArray_DIM(knn, 0), PyArray_DIM(knn, 1));
   PyThreadState *state = PyEval_SaveThread();
   try {
-    index->build(n_lists, labels, queries, iterations, samples, seed);
+    index->build(n_lists, labels, queries, iterations, samples, seed, n_clusterings);
   } catch (const std::exception &error) {
     PyEval_RestoreThread(state);
     PyErr_SetString(PyExc_ValueError, error.what());
