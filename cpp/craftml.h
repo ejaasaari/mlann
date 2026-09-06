@@ -16,9 +16,9 @@
 struct CraftMLOptions {
   int n_trees = 10;
   int max_depth = 20;
-  int branching_factor = 10;
+  int branching_factor = 16;
   int leaf_size = 32;
-  int label_dim = 128;
+  int label_dim = 512;
   int feature_dim = 0;  // Zero means A = I, including for raw L2 data.
   int iterations = 2;
   int node_sample_size = 1000;
@@ -120,8 +120,12 @@ class CraftML : public MLANN {
     accumulate(q, scratch, nullptr);
     std::vector<LabelScore> result;
     result.reserve(scratch.touched.size());
-    for (size_t slot : scratch.touched) result.push_back(scratch.table[slot]);
-    std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) { return a.id < b.id; });
+    for (size_t slot : scratch.touched) {
+      const auto &entry = scratch.table[slot];
+      result.push_back({entry.id, entry.score / n_trees});
+    }
+    miniselect::pdqsort_branchless(result.begin(), result.end(),
+                                 [](const auto &a, const auto &b) { return a.id < b.id; });
     return result;
   }
 
@@ -135,7 +139,6 @@ class CraftML : public MLANN {
   // Too few supported candidates triggers exact full-corpus search, never short output.
   void search(const float *q, int k, int budget, float threshold, int *out, Distance dist = L2,
               float *distances = nullptr, int *elected = nullptr, QueryStats *stats = nullptr) const {
-    check_query(q);
     if (k <= 0 || k > n_corpus || !out) throw std::invalid_argument("k must be in [1, corpus size]");
     if (dist != options_.distance) throw std::invalid_argument("Search metric must match build metric");
     if (budget != -1 && budget < k) throw std::invalid_argument("candidate_budget must be >= k");
@@ -144,30 +147,38 @@ class CraftML : public MLANN {
     static thread_local Scratch scratch;
     if (stats) *stats = {};
     accumulate(q, scratch, stats);
-    scratch.ranked.clear();
-    for (size_t slot : scratch.touched) {
-      const auto &entry = scratch.table[slot];
-      if (budget >= 0 || entry.score > threshold) scratch.ranked.push_back(entry);
+    scratch.candidates.clear();
+    if (budget == -1) {
+      for (size_t slot : scratch.touched) {
+        const auto &entry = scratch.table[slot];
+        if (entry.score / n_trees > threshold) scratch.candidates.push_back(entry.id);
+      }
+    } else {
+      scratch.ranked.clear();
+      for (size_t slot : scratch.touched) {
+        const auto &entry = scratch.table[slot];
+        scratch.ranked.push_back({entry.id, entry.score / n_trees});
+      }
+      if (scratch.ranked.size() > static_cast<size_t>(budget)) {
+        miniselect::pdqselect_branchless(
+            scratch.ranked.begin(), scratch.ranked.begin() + budget, scratch.ranked.end(),
+            [](const auto &a, const auto &b) {
+              return a.score > b.score || (a.score == b.score && a.id < b.id);
+            });
+        scratch.ranked.resize(budget);
+      }
+      for (const auto &entry : scratch.ranked) scratch.candidates.push_back(entry.id);
     }
-    if (budget >= 0 && scratch.ranked.size() > static_cast<size_t>(budget)) {
-      std::nth_element(scratch.ranked.begin(), scratch.ranked.begin() + budget, scratch.ranked.end(),
-                       [](const auto &a, const auto &b) {
-                         return a.score > b.score || (a.score == b.score && a.id < b.id);
-                       });
-      scratch.ranked.resize(budget);
-    }
-    const bool fallback = scratch.ranked.size() < static_cast<size_t>(k);
-    const int count = fallback ? n_corpus : static_cast<int>(scratch.ranked.size());
+    const bool fallback = scratch.candidates.size() < static_cast<size_t>(k);
+    const int count = fallback ? n_corpus : static_cast<int>(scratch.candidates.size());
     if (elected) *elected = count;
     if (stats) { stats->candidates = count; stats->fallback = fallback; }
     if (fallback) {
       MLANN::exact_knn(q, k, out, dist, distances);
       return;
     }
-    scratch.candidates.clear();
-    for (const auto &entry : scratch.ranked) scratch.candidates.push_back(entry.id);
     // Sequential corpus access also makes the k=1 tie break agree with exact search.
-    std::sort(scratch.candidates.begin(), scratch.candidates.end());
+    miniselect::pdqsort_branchless(scratch.candidates.begin(), scratch.candidates.end());
     const Eigen::Map<const Eigen::RowVectorXf> query(q, dim);
     MLANN::exact_knn(query, k, scratch.candidates, out, dist, distances);
   }
@@ -237,7 +248,7 @@ class CraftML : public MLANN {
     std::vector<uint32_t> row(knn.cols());
     for (int i = 0; i < knn.rows(); ++i) {
       std::copy(knn.row(i).data(), knn.row(i).data() + knn.cols(), row.begin());
-      std::sort(row.begin(), row.end());
+      miniselect::pdqsort_branchless(row.begin(), row.end());
       if (row.back() >= static_cast<uint32_t>(n_corpus) ||
           std::adjacent_find(row.begin(), row.end()) != row.end())
         throw std::invalid_argument("Neighbor labels must be distinct valid corpus IDs per query");
@@ -262,6 +273,7 @@ class CraftML : public MLANN {
     return best;
   }
 
+  // Leave raw sums in the table; callers normalize while collecting results.
   void accumulate(const float *q, Scratch &scratch, QueryStats *stats) const {
     scratch.clear();
     for (const Tree &tree : forest_) {
@@ -280,9 +292,6 @@ class CraftML : public MLANN {
       if (stats) stats->visited_labels += labels.size();
       for (const auto &entry : labels) scratch.add(entry.id, entry.score);
     }
-    // Normalize once, after summing. This also makes strict threshold boundaries
-    // identical between predict() and search(), independent of FMA contraction.
-    for (size_t slot : scratch.touched) scratch.table[slot].score /= n_trees;
     if (stats) stats->unique_labels = scratch.touched.size();
   }
 
@@ -292,7 +301,7 @@ class CraftML : public MLANN {
     labels.reserve((end - begin) * knn.cols());
     for (size_t i = begin; i < end; ++i)
       labels.insert(labels.end(), knn.row(ids[i]).data(), knn.row(ids[i]).data() + knn.cols());
-    std::sort(labels.begin(), labels.end());
+    miniselect::pdqsort_branchless(labels.begin(), labels.end());
     for (size_t i = 0; i < labels.size();) {
       size_t j = i + 1;
       while (j < labels.size() && labels[j] == labels[i]) ++j;
