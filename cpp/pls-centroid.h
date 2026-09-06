@@ -1,21 +1,22 @@
 #pragma once
 
 #include "rf-class-depth.h"
+#include <array>
 #include <unordered_set>
 
-// Sparse PLS proposals fitted to projections of neighbor centroids. The
+// Full-support covariance-guided proposals fitted to projected neighbor centroids. The
 // original RF PAL objective selects splits; leaf voting and reranking are shared.
 class PLSCentroid : public RFClass {
  public:
   struct Options {
-    int sample = 200, support = 16, candidates = 14, sketch_dim = 64;
+    int sample = 300, candidates = 6, sketch_dim = 64;
     uint32_t seed = 17;
   };
 
   PLSCentroid(const float *data, int n, int d) : PLSCentroid(data, n, d, Options{}) {}
   PLSCentroid(const float *data, int n, int d, Options options_)
       : RFClass(data, n, d), options(options_) {
-    if (options.sample < 2 || options.support < 1 || options.candidates < 4 ||
+    if (options.sample < 2 || options.candidates < 1 ||
         options.sketch_dim < 8 || options.sketch_dim % 2)
       throw std::invalid_argument("Invalid PLSCentroid options");
   }
@@ -28,8 +29,9 @@ class PLSCentroid : public RFClass {
         knn.maxCoeff() >= uint32_t(n_corpus)) throw std::invalid_argument("Invalid training data");
     n_trees = trees; depth = depth_; b = b_;
     labels_all.resize(trees); votes_all.resize(trees); forest.resize(trees);
+    std::vector<std::vector<float>> tree_projections(trees);
 
-    // Targets never depend on test queries and are released after fitting.
+    // Targets use training neighbors only and are released after fitting.
     RowMatrix targets = make_targets(knn);
     log2_tbl.resize(train.rows() + 1); t_tbl.resize(train.rows() + 1);
     for (int i = 1; i <= train.rows(); ++i) log2_tbl[i] = std::log2(float(i));
@@ -45,26 +47,29 @@ class PLSCentroid : public RFClass {
       forest[tree].reserve(2 * (1 << std::min(depth, 16)) - 1);
       grow_node(rows.begin(), rows.end(), 0, tree, train, knn, targets, scratch);
       forest[tree].shrink_to_fit();
+      tree_projections[tree] = std::move(scratch.projections);
     }
+    targets.resize(0, 0);
+    pack_projections(tree_projections);
   }
 
   void query(const float *data, int k, float threshold, int *out, Distance dist = L2,
              float *distances = nullptr, int *n_elected = nullptr) const override {
     std::vector<uint32_t> elected;
     Eigen::VectorXf votes_total = Eigen::VectorXf::Zero(n_corpus);
-    for (int tree = 0; tree < n_trees; ++tree) {
-      int node = 0;
-      while (forest[tree][node].leaf < 0) {
-        const auto &n = forest[tree][node];
-        node = n.normal.project(data) <= n.normal.threshold ? n.left : n.right;
-      }
-      const int leaf = forest[tree][node].leaf;
-      const auto &labels = labels_all[tree][leaf];
-      const auto &votes = votes_all[tree][leaf];
-      for (size_t i = 0; i < labels.size(); ++i) {
-        if ((votes_total(labels[i]) += votes[i]) >= threshold) {
-          elected.push_back(labels[i]);
-          votes_total(labels[i]) = -9999999;
+    std::array<int, routing_batch_size> leaves;
+    for (int first = 0; first < n_trees; first += routing_batch_size) {
+      const int count = std::min(routing_batch_size, n_trees - first);
+      route_batch(data, first, count, leaves.data());
+      // Preserve tree order when accumulating votes and electing candidates.
+      for (int t = 0; t < count; ++t) {
+        const auto &labels = labels_all[first + t][leaves[t]];
+        const auto &votes = votes_all[first + t][leaves[t]];
+        for (size_t i = 0; i < labels.size(); ++i) {
+          if ((votes_total(labels[i]) += votes[i]) >= threshold) {
+            elected.push_back(labels[i]);
+            votes_total(labels[i]) = -9999999;
+          }
         }
       }
     }
@@ -74,22 +79,72 @@ class PLSCentroid : public RFClass {
 
  protected:
   struct Normal {
-    std::vector<uint32_t> dims;
     Eigen::VectorXf weights;
     float threshold = 0, gain = 0;
     float project(const float *x) const {
-      float value = 0;
-      for (size_t i = 0; i < dims.size(); ++i) value += weights[i] * x[dims[i]];
-      return value;
+      return weights.dot(Eigen::Map<const Eigen::VectorXf>(x, weights.size()));
     }
   };
   struct Node {
-    Normal normal;
+    uint32_t projection = 0;
+    float threshold = 0;
     int left = -1, right = -1, leaf = -1;
   };
-  struct Scratch : SplitScratch { std::minstd_rand generator; };
+  struct Scratch : SplitScratch {
+    std::minstd_rand generator;
+    std::vector<float> projections;
+  };
   Options options;
   std::vector<std::vector<Node>> forest;
+  RowMatrix projections;
+  static constexpr int routing_batch_size = 64;
+
+  void pack_projections(std::vector<std::vector<float>> &tree_projections) {
+    size_t rows = 0;
+    for (const auto &values : tree_projections) rows += values.size() / dim;
+    if (rows > std::numeric_limits<uint32_t>::max())
+      throw std::length_error("Too many PLSCentroid projections");
+    projections.resize(rows, dim);
+    size_t offset = 0;
+    for (int tree = 0; tree < n_trees; ++tree) {
+      auto &values = tree_projections[tree];
+      if (!values.empty()) {
+        std::copy(values.begin(), values.end(), projections.data() + offset * dim);
+        for (auto &node : forest[tree])
+          if (node.leaf < 0) node.projection += static_cast<uint32_t>(offset);
+        offset += values.size() / dim;
+      }
+      std::vector<float>().swap(values);
+    }
+  }
+
+  void route_batch(const float *query, int first, int count, int *leaves) const {
+    std::array<int, routing_batch_size> nodes{}, active;
+    std::array<uint32_t, routing_batch_size> rows;
+    std::array<float, routing_batch_size> scores;
+    int remaining = 0;
+    for (int t = 0; t < count; ++t)
+      if (forest[first + t][0].leaf < 0) active[remaining++] = t;
+
+    while (remaining) {
+      for (int i = 0; i < remaining; ++i) {
+        const int t = active[i];
+        rows[i] = forest[first + t][nodes[t]].projection;
+      }
+      mlann_detail::compute_one_to_many(query, projections.data(), dim, rows.data(),
+                                       remaining, mlann_detail::OneToManyMetric::IP,
+                                       scores.data());
+      int next = 0;
+      for (int i = 0; i < remaining; ++i) {
+        const int t = active[i];
+        const auto &node = forest[first + t][nodes[t]];
+        nodes[t] = scores[i] <= node.threshold ? node.left : node.right;
+        if (forest[first + t][nodes[t]].leaf < 0) active[next++] = t;
+      }
+      remaining = next;
+    }
+    for (int t = 0; t < count; ++t) leaves[t] = forest[first + t][nodes[t]].leaf;
+  }
 
   static std::vector<uint32_t> sample_unique(int n, int k, std::minstd_rand &generator) {
 
@@ -116,24 +171,29 @@ class PLSCentroid : public RFClass {
     return reservoir;
   }
 
-  Normal random_normal(int support, std::minstd_rand &rng) const {
-    Normal normal;
-    normal.dims = sample_unique(dim, std::min(dim, support), rng);
-    normal.weights.resize(normal.dims.size());
-    std::normal_distribution<float> gaussian;
-    for (int i = 0; i < normal.weights.size(); ++i) normal.weights[i] = gaussian(rng);
-    normal.weights.normalize();
-    return normal;
-  }
   RowMatrix make_targets(const Eigen::Ref<const UIntRowMatrix> &knn) const {
     const int r = options.sketch_dim;
     std::minstd_rand rng(options.seed + 271828U);
     RowMatrix embedding = RowMatrix::Zero(n_corpus, r);
-    std::vector<Normal> projections;
-    for (int j = 0; j < r; ++j) projections.push_back(random_normal(std::min(16, dim), rng));
+    // The fixed target sketch is independent of the full-support split normals.
+    // Retain 16 coordinates: the 40-tree sketch sweep found no consistent gain
+    // from changing this count (benchmarks/pls_centroid_sketch_support_t40).
+    struct Projection { std::vector<uint32_t> dims; Eigen::VectorXf weights; };
+    std::vector<Projection> projections(r);
+    for (auto &projection : projections) {
+      projection.dims = sample_unique(dim, std::min(16, dim), rng);
+      projection.weights.resize(projection.dims.size());
+      std::normal_distribution<float> gaussian;
+      for (int j = 0; j < projection.weights.size(); ++j) projection.weights[j] = gaussian(rng);
+      projection.weights.normalize();
+    }
 #pragma omp parallel for
     for (int i = 0; i < n_corpus; ++i)
-      for (int j = 0; j < r; ++j) embedding(i,j) = projections[j].project(corpus.row(i).data());
+      for (int j = 0; j < r; ++j) {
+        const auto &projection = projections[j];
+        for (size_t k = 0; k < projection.dims.size(); ++k)
+          embedding(i,j) += projection.weights[k] * corpus(i,projection.dims[k]);
+      }
     RowMatrix targets = RowMatrix::Zero(knn.rows(), r);
 #pragma omp parallel for
     for (int i = 0; i < knn.rows(); ++i) {
@@ -189,52 +249,26 @@ class PLSCentroid : public RFClass {
     for (auto id : touched) scratch.votes[id] = 0;
     return labels;
   }
-  static Eigen::MatrixXf centered_inputs(const std::vector<int> &rows, const std::vector<uint32_t> &dims,
-                                        const Eigen::Ref<const RowMatrix> &train) {
-    Eigen::MatrixXf x(rows.size(), dims.size());
-    for (size_t i = 0; i < rows.size(); ++i) for (size_t d = 0; d < dims.size(); ++d) x(i,d) = train(rows[i],dims[d]);
-    x.rowwise() -= x.colwise().mean().eval();
-    return x;
-  }
-  static Eigen::VectorXf leading(const Eigen::MatrixXf &cov, std::minstd_rand &rng) {
-    Eigen::VectorXf a(cov.cols());
-    std::normal_distribution<float> gaussian;
-    for (int j = 0; j < a.size(); ++j) a[j] = gaussian(rng);
-    a.normalize();
-    for (int step = 0; step < 8; ++step) {
-      a = (cov*a).eval();
-      if (a.norm() < 1e-12f) break;
-      a.normalize();
-    }
-    return a;
-  }
   std::vector<Normal> proposals(const std::vector<int> &rows,
                                 const Eigen::Ref<const RowMatrix> &train, const RowMatrix &z,
                                 std::minstd_rand &rng) {
+    // All candidates share one full-input cross-covariance matrix.
+    Eigen::MatrixXf x(rows.size(), dim);
+    for (size_t i = 0; i < rows.size(); ++i) x.row(i) = train.row(rows[i]);
+    x.rowwise() -= x.colwise().mean().eval();
+    const Eigen::MatrixXf zc = z.rowwise() - z.colwise().mean();
+    const Eigen::MatrixXf map = x.transpose() * zc / float(rows.size());
     std::vector<Normal> pool;
-    const int support = std::min(dim, options.support);
-    const int axes = std::max(1, options.candidates/4);
-    const int randoms = std::max(1, options.candidates/4);
-    for (uint32_t d : sample_unique(dim,std::min(dim,axes),rng)) {
-      Normal normal; normal.dims = {d}; normal.weights = Eigen::VectorXf::Ones(1); pool.push_back(normal);
-    }
-    for (int i = 0; i < randoms; ++i) pool.push_back(random_normal(support,rng));
-    Eigen::MatrixXf zc = z.rowwise() - z.colwise().mean();
-    int remaining = options.candidates-pool.size();
-    while (remaining > 0) {
-      auto dims = sample_unique(dim,support,rng);
-      Eigen::MatrixXf x = centered_inputs(rows,dims,train);
-      Eigen::MatrixXf map = x.transpose()*zc / float(rows.size());
-      const int count = std::min(remaining, 3);
-      for (int c = 0; c < count; ++c) {
-        Eigen::VectorXf a(map.cols());
-        if (c == 0) a = leading((zc.transpose()*zc).eval(),rng);
-        else { std::normal_distribution<float> gaussian; for (int j = 0; j < a.size(); ++j) a[j] = gaussian(rng); a.normalize(); }
-        Normal normal; normal.dims = dims; normal.weights = map*a;
-        if (normal.weights.norm() > 1e-10f) normal.weights.normalize();
-        pool.push_back(std::move(normal));
-      }
-      remaining -= count;
+    pool.reserve(options.candidates);
+    for (int c = 0; c < options.candidates; ++c) {
+      Eigen::VectorXf a(map.cols());
+      std::normal_distribution<float> gaussian;
+      for (int j = 0; j < a.size(); ++j) a[j] = gaussian(rng);
+      a.normalize();
+      Normal normal;
+      normal.weights = map * a;
+      if (normal.weights.norm() > 1e-10f) normal.weights.normalize();
+      pool.push_back(std::move(normal));
     }
     return pool;
   }
@@ -250,7 +284,7 @@ class PLSCentroid : public RFClass {
       auto sampled = sample_unique(n,std::min(n,options.sample),scratch.generator);
       std::vector<int> rows; rows.reserve(sampled.size());
       for (auto i : sampled) rows.push_back(begin[i]);
-      RowMatrix z(rows.size(),targets.cols());
+      RowMatrix z(rows.size(), targets.cols());
       for (size_t i = 0; i < rows.size(); ++i) z.row(i) = targets.row(rows[i]);
       int n_labels;
       auto labels = compact(rows,knn,n_labels,scratch);
@@ -261,7 +295,7 @@ class PLSCentroid : public RFClass {
         if (evaluated.gain > best.gain + tol) best = std::move(evaluated);
       }
     }
-    if (best.dims.empty()) {
+    if (best.weights.size() == 0) {
       const int leaf = labels_all[tree].size();
 
       auto votes = count_votes(begin,end,knn,scratch);
@@ -272,7 +306,10 @@ class PLSCentroid : public RFClass {
     auto mid = std::partition(begin,end,[&](int row) { return best.project(train.row(row).data()) <= best.threshold; });
     if (mid == begin || mid == end) throw std::logic_error("Hard scan produced an empty full-node child");
 
-    forest[tree][node].normal = std::move(best);
+    forest[tree][node].projection = scratch.projections.size() / dim;
+    forest[tree][node].threshold = best.threshold;
+    scratch.projections.insert(scratch.projections.end(), best.weights.data(),
+                               best.weights.data() + dim);
     const int left = grow_node(begin,mid,level+1,tree,train,knn,targets,scratch);
     const int right = grow_node(mid,end,level+1,tree,train,knn,targets,scratch);
     forest[tree][node].left = left; forest[tree][node].right = right;
