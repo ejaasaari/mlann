@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "../cpp/rf-class-depth.h"
+#include "../cpp/neighbor-mean-pls.h"
 
 namespace {
 
@@ -105,7 +107,7 @@ void normalize_rows(RowMatrix &matrix, const std::string &dataset_name) {
 
 void print_usage(const char *program) {
   std::cerr << "Usage: " << program << " <dataset> [options]\n"
-            << "Options: --trees=N --depth=N --density=F --leaf-votes=N "
+            << "Options: --index=RF|NeighborMeanPLS --trees=N --depth=N --density=F --leaf-votes=N "
                "--votes-required=F1,F2,... "
                "--query-repeats=N --queries=N --warmup=N\n"
             << "Available datasets: ";
@@ -143,7 +145,10 @@ BenchmarkOptions parse_options(int argc, char **argv) {
   for (int i = first_option; i < argc; ++i) {
     const std::string argument = argv[i];
     std::string value;
-    if (!(value = option_value(argument, "trees")).empty()) {
+    if (!(value = option_value(argument, "index")).empty()) {
+      if (value != "RF" && value != "NeighborMeanPLS") throw std::invalid_argument("Unknown index: " + value);
+      options.index_type = value;
+    } else if (!(value = option_value(argument, "trees")).empty()) {
       options.n_trees = parse_integer(value, "trees");
     } else if (!(value = option_value(argument, "depth")).empty()) {
       options.depth = parse_integer(value, "depth");
@@ -271,7 +276,10 @@ int main(int argc, char **argv) {
     std::cout << "MLANN training queries: " << training_queries.rows() << '\n';
     std::cout << "Building " << options.index_type << " MLANN index...\n";
 
-    RFClass index(train.data(), train.rows(), train.cols());
+    std::unique_ptr<MLANN> storage;
+    if (options.index_type == "NeighborMeanPLS") storage = std::make_unique<NeighborMeanPLS>(train.data(), train.rows(), train.cols());
+    else storage = std::make_unique<RFClass>(train.data(), train.rows(), train.cols());
+    MLANN &index = *storage;
     auto start = std::chrono::steady_clock::now();
     index.grow(options.n_trees, options.depth, training_neighbors, training_queries,
                options.density, options.leaf_vote_threshold);
