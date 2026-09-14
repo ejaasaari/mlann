@@ -47,7 +47,7 @@ class MLANNIndex(object):
         Builds a normal MLANN index.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
-        :param projection_sparsity: Expected ratio of non-zero components in a projection matrix.
+        :param density: Feature density for legacy methods; LabelCentroidPCA uses all input dimensions.
         :param b: Minimum vote threshold for candidates to be included in the linear search phase.
         :return:
         """

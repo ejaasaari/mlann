@@ -135,6 +135,7 @@ def run_configuration(configuration, arguments):
     command = [
         str(BINARY),
         dataset_name,
+        f"--index={arguments.index}",
         f"--trees={configuration.trees}",
         f"--depth={configuration.depth}",
         f"--leaf-votes={configuration.leaf_votes}",
@@ -163,7 +164,7 @@ def run_configuration(configuration, arguments):
         if match := RESULT_PATTERN.search(line):
             measurements.append(
                 {
-                    "config": configuration.name,
+                    "config": configuration.name if arguments.index == "RF" else f"{arguments.index}_{configuration.name}",
                     "trees": configuration.trees,
                     "depth": configuration.depth,
                     "leaf_votes": configuration.leaf_votes,
@@ -206,7 +207,8 @@ def parse_arguments():
         default=DEFAULT_RESULTS,
         help="result CSV; defaults to a non-baseline file so the baseline is preserved",
     )
-    parser.add_argument("--label", default="Current RF", help="label used in the comparison plot")
+    parser.add_argument("--index", choices=["RF", "LabelCentroidPCA"], default="RF")
+    parser.add_argument("--label", default=None, help="label used in the comparison plot")
     parser.add_argument("--queries", type=int, default=1_000)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--query-repeats", type=int, default=1)
@@ -214,6 +216,8 @@ def parse_arguments():
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--no-plot", action="store_true")
     arguments = parser.parse_args()
+    if arguments.label is None:
+        arguments.label = "Current " + arguments.index
     arguments.dataset = arguments.dataset.resolve()
     arguments.output = arguments.output.resolve()
     if not arguments.dataset.is_file():
