@@ -43,7 +43,7 @@ training_data = X[30_000:60_000]
 
 q = X[-1]
 
-index = mlann.MLANNIndex(data, "PCA")  # one of RP, PCA, or RF
+index = mlann.MLANNIndex(data, "PCA")  # one of RP, PCA, RF, or PALFisher
 knn = index.exact_search(training_data, training_k, dist=dist)  # required for training
 
 index.build(training_data, knn, n_trees, depth)
@@ -58,6 +58,7 @@ The following index types are available:
 - `RF`: random forest
 - `RP`: random projection tree
 - `PCA`: PCA tree
+- `PALFisher`: full-input supervised oblique tree with PAL thresholds
 
 On most datasets, `RF` will likely provide the best query performance but can be slower to build. `RP` will likely be the fastest to build while offering the worst query performance, and `PCA` is a compromise between the two.
 
@@ -91,3 +92,45 @@ If you use the library in an academic context, please consider citing the follow
 ## License
 
 MLANN is available under the MIT License (see [LICENSE](LICENSE)). Note that third-party libraries in the [cpp/lib](cpp/lib) folder may be distributed under other open source licenses (see [licenses](licenses)).
+
+## PALFisher
+
+This branch adds `PALFisher` using the PAL-Fisher generalized eigenvector with ridge regularization, followed by the hard PAL threshold scan.
+
+```python
+index = mlann.MLANNIndex(corpus, "PALFisher")
+index.build(training_queries, training_neighbors, n_trees=40, depth=15)
+neighbors = index.ann(queries, k=10, votes_required=0.000005, dist=mlann.IP)
+```
+
+The implementation in [cpp/pal-fisher.h](cpp/pal-fisher.h) uses all input dimensions,
+float throughout fitting, packed float projections and batched SIMD routing.
+It retains the optimized leading-eigenpair solver and applicable reductions
+from the combined implementation. Per-node diagnostics are removed. Defaults
+are 300 split samples and seed 17; the minimum split gain remains 1e-9 total
+natural-log units. `density` does not restrict this method's input support.
+
+`PALFisher::Options::alpha` defaults to 0.1. The ridge is `alpha * trace(query_covariance) / input_dimensions`.
+
+C++ callers can supply `PALFisher::Options` to the constructor to change the sample
+size and seed or Fisher alpha. Python uses those defaults.
+
+Build and test from this worktree:
+
+```bash
+python3 setup.py build_ext --inplace
+OMP_NUM_THREADS=2 python3 -m unittest discover -s tests -p 'test_pal_fisher.py'
+mkdir -p benchmarks/.build
+g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_pal_fisher.cpp -o benchmarks/.build/test_method
+benchmarks/.build/test_method
+```
+
+The benchmark runner accepts the added method:
+
+```bash
+python3 benchmarks/run_rf_yandex_pareto.py --index PALFisher --output benchmarks/pal-fisher_results.csv --label PALFisher
+```
+
+This branch is isolated from the same `dc4b882` baseline as `pls-centroid`.
+The extraction retains the tested float implementation; it does not add the
+other experimental index types or regenerate performance measurements.

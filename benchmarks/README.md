@@ -40,3 +40,5 @@ python3 benchmarks/plot_rf_yandex_pareto.py \
 The runner requires a C++17 compiler, OpenMP, HDF5 development files discoverable through
 `pkg-config`, and Matplotlib. Use `--skip-build` to reuse `benchmarks/.build/mlann_example`, or
 `--no-plot` to produce only the result CSV.
+
+The `pal-fisher` branch also accepts `--index PALFisher`. Use a separate `--output` path and `--label` for its results.
