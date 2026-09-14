@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <iterator>
 #include <random>
 #include <stdexcept>
 #include <utility>
@@ -13,7 +14,8 @@
 
 class RFPCA : public MLANN {
  public:
-  RFPCA(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
+  RFPCA(const float *corpus_, int n_corpus_, int dim_)
+      : RFPCA(corpus_, n_corpus_, dim_, false) {}
 
   void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
             const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {
@@ -39,7 +41,9 @@ class RFPCA : public MLANN {
     n_pool = n_inner_nodes * n_trees;
     n_array = 1 << (depth_ + 1);
 
-    if (density_ < 0) {
+    if (full_dimensions) {
+      density = 1.0f;
+    } else if (density_ < 0) {
       density = 1.0 / std::sqrt(dim);
     } else {
       density = density_;
@@ -76,14 +80,18 @@ class RFPCA : public MLANN {
       std::normal_distribution<float> norm_dist(0, 1);
 
       for (int i = n_inner_nodes * n_tree; i < n_inner_nodes * (n_tree + 1); ++i) {
-        std::generate(_random_dims[i].data(), _random_dims[i].data() + tgt,
-                      [&uni_dist, &gen] { return uni_dist(gen); });
+        if (full_dimensions) {
+          std::iota(_random_dims[i].data(), _random_dims[i].data() + tgt, 0);
+        } else {
+          std::generate(_random_dims[i].data(), _random_dims[i].data() + tgt,
+                        [&uni_dist, &gen] { return uni_dist(gen); });
+        }
         std::generate(_random_vectors[i].data(), _random_vectors[i].data() + tgt,
                       [&norm_dist, &gen] { return norm_dist(gen); });
       }
 
       grow_subtree(indices.begin(), indices.end(), 0, 0, n_tree, labels_all[n_tree],
-                   votes_all[n_tree], knn, train);
+                   votes_all[n_tree], knn, train, gen);
     }
   }
 
@@ -131,7 +139,12 @@ class RFPCA : public MLANN {
     exact_knn(q, k, elected, out, dist, out_distances);
   }
 
+ protected:
+  RFPCA(const float *corpus_, int n_corpus_, int dim_, bool full_dimensions_)
+      : MLANN(corpus_, n_corpus_, dim_), full_dimensions(full_dimensions_) {}
+
  private:
+  const bool full_dimensions;
   std::pair<std::vector<uint32_t>, std::vector<float>> count_votes(
       std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
       const Eigen::Ref<const UIntRowMatrix> &knn) {
@@ -172,7 +185,7 @@ class RFPCA : public MLANN {
                     int tree_level, int i, int n_tree,
                     std::vector<std::vector<uint32_t>> &labels_tree,
                     std::vector<std::vector<float>> &votes_tree, const UIntRowMatrix &knn,
-                    const RowMatrix &train) {
+                    const RowMatrix &train, std::minstd_rand &gen) {
     int n = end - begin;
     int idx_left = 2 * i + 1;
     int idx_right = idx_left + 1;
@@ -193,14 +206,34 @@ class RFPCA : public MLANN {
       rv /= rv.norm();
 
       Eigen::MatrixXf tmp = train(Eigen::Map<Eigen::VectorXi>(&*begin, n), dims).transpose();
-      float isz = 1. / (n - 1);
-      Eigen::MatrixXf centered = tmp.colwise() - tmp.rowwise().mean();
-      Eigen::MatrixXf cov = 2 * 0.01 * isz * (centered * centered.transpose());
+      // PCAFull fits on at most 300 unique node points, but routes every point.
+      Eigen::MatrixXf fit;
+      if (full_dimensions && n > 300) {
+        std::vector<int> sampled;
+        sampled.reserve(300);
+        std::sample(begin, end, std::back_inserter(sampled), 300, gen);
+        fit = train(Eigen::Map<Eigen::VectorXi>(sampled.data(), sampled.size()), dims)
+                  .transpose();
+      } else {
+        fit = tmp;
+      }
+      float isz = 1. / (fit.cols() - 1);
+      Eigen::MatrixXf centered = fit.colwise() - fit.rowwise().mean();
+      Eigen::MatrixXf cov;
+      if (!full_dimensions) {
+        cov = 2 * 0.01 * isz * (centered * centered.transpose());
+      }
 
       rv /= rv.norm();
       for (int i = 0; i < 20; ++i) {
         Eigen::VectorXf last = rv;
-        rv += cov * rv;
+        if (full_dimensions) {
+          // Apply covariance without allocating a dim-by-dim matrix.
+          Eigen::VectorXf projected = centered.transpose() * rv;
+          rv += (0.02f * isz) * (centered * projected);
+        } else {
+          rv += cov * rv;
+        }
         rv /= rv.norm();
         if ((rv - last).cwiseAbs().mean() < 0.01) break;
       }
@@ -228,10 +261,17 @@ class RFPCA : public MLANN {
       }
     }
 
-    grow_subtree(begin, mid, tree_level + 1, idx_left, n_tree, labels_tree, votes_tree, knn, train);
-    grow_subtree(mid, end, tree_level + 1, idx_right, n_tree, labels_tree, votes_tree, knn, train);
+    grow_subtree(begin, mid, tree_level + 1, idx_left, n_tree, labels_tree, votes_tree, knn, train, gen);
+    grow_subtree(mid, end, tree_level + 1, idx_right, n_tree, labels_tree, votes_tree, knn, train, gen);
   }
 
   std::vector<Eigen::Matrix<uint32_t, Eigen::Dynamic, 1>> _random_dims;
   std::vector<Eigen::VectorXf> _random_vectors;
+};
+
+// Full feature support with a fixed 300-point cap for fitting each node's PCA.
+class PCAFull : public RFPCA {
+ public:
+  PCAFull(const float *corpus_, int n_corpus_, int dim_)
+      : RFPCA(corpus_, n_corpus_, dim_, true) {}
 };

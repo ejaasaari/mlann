@@ -58,6 +58,8 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
     self->index = new RFRP(data, n, dim);
   else if (strcmp(index_type, "PCA") == 0)
     self->index = new RFPCA(data, n, dim);
+  else if (strcmp(index_type, "PCAFull") == 0)
+    self->index = new PCAFull(data, n, dim);
   else if (strcmp(index_type, "SORF") == 0) {
     self->sparse_oblique_index = new SparseObliqueRF(data, n, dim);
     self->index = self->sparse_oblique_index;

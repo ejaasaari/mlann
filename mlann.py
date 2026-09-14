@@ -60,6 +60,7 @@ class MLANNIndex(object):
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
         :param density: Fraction of input features considered at each split.
+                        PCAFull always uses all features.
         :param b: Minimum vote threshold for candidates to be included in the linear search phase.
         :param sketch_dim: Label-sketch width used by SORF; 16--32 is usually sufficient.
         :param oblique_candidates: Number of supervised oblique directions proposed at each
