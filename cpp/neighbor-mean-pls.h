@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <vector>
 #include "mlann.h"
+#include "huge-buffer.h"
 
 namespace neighbor_mean_pls_detail {
 using Matrix = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -350,18 +351,26 @@ class NeighborMeanPLS : public MLANN {
   }
   void query(const float *data, int k, float threshold, int *out, Distance dist = L2,
              float *distances = nullptr, int *elected_count = nullptr) const override {
-    Eigen::VectorXf votes = Eigen::VectorXf::Zero(n_corpus);
-    std::vector<uint32_t> elected;
+    static thread_local mlann_detail::HugeBuffer<float> votes;
+    static thread_local std::vector<uint32_t> elected;
+    votes.resize(n_corpus);
+    std::fill_n(votes.data(), n_corpus, 0.f);
+    elected.clear();
     std::array<int, routing_batch_size> leaves;
     for (int first = 0; first < n_trees; first += routing_batch_size) {
       const int count = std::min(routing_batch_size, n_trees - first);
       route_batch(data, first, count, leaves.data());
       for (int t = 0; t < count; ++t) {
         const auto &leaf = leaves_[first + t][leaves[t]];
-        for (size_t i = 0; i < leaf.labels.size(); ++i)
+        for (size_t i = 0; i < leaf.labels.size(); ++i) {
+#if defined(__GNUC__) || defined(__clang__)
+          if (i + 32 < leaf.labels.size())
+            __builtin_prefetch(votes.data() + leaf.labels[i + 32], 1, 1);
+#endif
           if ((votes[leaf.labels[i]] += leaf.votes[i]) >= threshold) {
             elected.push_back(leaf.labels[i]); votes[leaf.labels[i]] = -9999999;
           }
+        }
       }
     }
     if (elected_count) *elected_count = elected.size();

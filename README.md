@@ -112,6 +112,11 @@ natural-log units. `density` does not restrict this method's input support.
 
 Targets are the actual full-dimensional means of the corpus neighbors, accumulated in float and released after building.
 
+Queries reuse per-thread vote and candidate buffers and prefetch upcoming vote
+updates. Vote accumulation order and exact ranking of every elected candidate
+are preserved. Large Linux vote buffers request huge pages and fall back to
+ordinary pages when unavailable.
+
 C++ callers can supply `NeighborMeanPLS::Options` to the constructor to change the sample
 size and seed. Python uses those defaults.
 
@@ -123,6 +128,8 @@ OMP_NUM_THREADS=2 python3 -m unittest discover -s tests -p 'test_neighbor_mean_p
 mkdir -p benchmarks/.build
 g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_mean_pls.cpp -o benchmarks/.build/test_method
 benchmarks/.build/test_method
+g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_huge_buffer.cpp -o benchmarks/.build/test_huge_buffer
+benchmarks/.build/test_huge_buffer
 ```
 
 The benchmark runner accepts the added method:
@@ -132,5 +139,5 @@ python3 benchmarks/run_rf_yandex_pareto.py --index NeighborMeanPLS --output benc
 ```
 
 This branch is isolated from the same `dc4b882` baseline as `pls-centroid`.
-The extraction retains the tested float implementation; it does not add the
-other experimental index types or regenerate performance measurements.
+The branch retains the full-input float fitting implementation and adds the
+vote-prefetching and workspace reuse described above.
