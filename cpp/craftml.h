@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Eigen/Dense>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include "detail/huge-buffer.h"
 #include "detail/neighbor-query.h"
 #include "mlann.h"
+#include "utils.h"
 
 struct CraftMLOptions {
   int n_trees = 10;
@@ -38,18 +40,22 @@ class CraftML : public MLANN {
     uint32_t id;
     float score;
   };
+
   struct Node {
     RowMatrix centroids;
     std::vector<uint32_t> children;
     std::vector<LabelScore> labels;
     int training_size = 0;
+
     bool is_leaf() const { return children.empty(); }
   };
+
   struct Tree {
     uint64_t feature_seed = 0;
     uint64_t label_seed = 0;
     std::vector<Node> nodes;
   };
+
   struct QueryStats {
     size_t visited_labels = 0;
     size_t unique_labels = 0;
@@ -57,26 +63,33 @@ class CraftML : public MLANN {
     bool fallback = false;
   };
 
-  CraftML(const float *data, int n, int d) : MLANN(data, n, d) {
-    if (!data || n <= 0 || d <= 0) throw std::invalid_argument("Corpus must be nonempty");
+  CraftML(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {
+    if (!corpus_ || n_corpus_ <= 0 || dim_ <= 0) {
+      throw std::invalid_argument("Corpus must be nonempty");
+    }
   }
 
   const std::vector<Tree> &trees() const { return forest_; }
   Distance distance() const { return options_.distance; }
 
-  void grow(int count, int max_depth, const Eigen::Ref<const UIntRowMatrix> &knn,
-            const Eigen::Ref<const RowMatrix> &train, float density = -1, int b = 1) override {
-    if (density != -1 || b != 1)
+  void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn,
+            const Eigen::Ref<const RowMatrix> &train, float density_ = -1.0, int b_ = 1) override {
+    if (density_ != -1 || b_ != 1) {
       throw std::invalid_argument("Use CraftML::build to configure feature hashing and leaves");
+    }
+
     CraftMLOptions options;
-    options.n_trees = count;
-    options.max_depth = max_depth;
+    options.n_trees = n_trees_;
+    options.max_depth = depth_;
     build(knn, train, options);
   }
 
   void build(const Eigen::Ref<const UIntRowMatrix> &knn, const Eigen::Ref<const RowMatrix> &train,
              const CraftMLOptions &options = {}) {
-    if (!empty()) throw std::logic_error("The index has already been built");
+    if (!empty()) {
+      throw std::logic_error("The index has already been built");
+    }
+
     validate(knn, train, options);
     options_ = options;
     std::vector<Tree> forest(options.n_trees);
@@ -92,15 +105,15 @@ class CraftML : public MLANN {
       for (int t = 0; t < options.n_trees; ++t) {
         try {
           Tree &tree = forest[t];
-          tree.feature_seed = mix(uint64_t(options.seed) + 2ULL * t);
-          tree.label_seed = mix(uint64_t(options.seed) + 2ULL * t + 1);
-          std::mt19937 generator(static_cast<uint32_t>(mix(tree.label_seed)));
+          tree.feature_seed = mlann_detail::mix(uint64_t(options.seed) + 2ULL * t);
+          tree.label_seed = mlann_detail::mix(uint64_t(options.seed) + 2ULL * t + 1);
+          std::mt19937 generator(static_cast<uint32_t>(mlann_detail::mix(tree.label_seed)));
           auto &projected = scratch.projected;
           if (options.feature_dim > 0) {
             projected.resize(train.rows(), options.feature_dim);
             scratch.feature_hashes.resize(dim);
             for (int j = 0; j < dim; ++j)
-              scratch.feature_hashes[j] = mix(tree.feature_seed ^ uint64_t(j));
+              scratch.feature_hashes[j] = mlann_detail::mix(tree.feature_seed ^ uint64_t(j));
             for (int i = 0; i < train.rows(); ++i) {
               float *out = projected.row(i).data();
               std::fill_n(out, options.feature_dim, 0.f);
@@ -148,9 +161,10 @@ class CraftML : public MLANN {
   }
 
   using MLANN::query;
-  void query(const float *q, int k, float threshold, int *out, Distance dist = L2,
-             float *distances = nullptr, int *elected = nullptr) const override {
-    search(q, k, -1, threshold, out, dist, distances, elected);
+
+  void query(const float *data, int k, float vote_threshold, int *out, Distance dist = L2,
+             float *out_distances = nullptr, int *out_n_elected = nullptr) const override {
+    search(data, k, -1, vote_threshold, out, dist, out_distances, out_n_elected);
   }
 
   // budget == -1 selects strict score > threshold; otherwise budget must be >= k.
@@ -158,13 +172,19 @@ class CraftML : public MLANN {
   void search(const float *q, int k, int budget, float threshold, int *out, Distance dist = L2,
               float *distances = nullptr, int *elected = nullptr,
               QueryStats *stats = nullptr) const {
-    if (k <= 0 || k > n_corpus || !out)
+    if (k <= 0 || k > n_corpus || !out) {
       throw std::invalid_argument("k must be in [1, corpus size]");
-    if (dist != options_.distance)
+    }
+    if (dist != options_.distance) {
       throw std::invalid_argument("Search metric must match build metric");
-    if (budget != -1 && budget < k) throw std::invalid_argument("candidate_budget must be >= k");
-    if (budget == -1 && (!std::isfinite(threshold) || threshold < 0 || threshold > 1))
+    }
+    if (budget != -1 && budget < k) {
+      throw std::invalid_argument("candidate_budget must be >= k");
+    }
+    if (budget == -1 && (!std::isfinite(threshold) || threshold < 0 || threshold > 1)) {
       throw std::invalid_argument("Probability threshold must be in [0, 1]");
+    }
+
     auto &scratch = query_scratch();
     if (stats) *stats = {};
     accumulate(q, scratch, stats);
@@ -208,25 +228,29 @@ class CraftML : public MLANN {
   CraftMLOptions options_;
   std::vector<Tree> forest_;
 
-  static uint64_t mix(uint64_t x) {
-    x += 0x9e3779b97f4a7c15ULL;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-    return x ^ (x >> 31);
-  }
-
   static constexpr int routing_batch_size = 64;
 
   // One workspace per build worker; fitting arrays are reused after partitioning a node.
   // Only child boundaries must survive recursive calls, so those are kept per depth.
   struct BuildScratch {
-    std::vector<int> ids, grouped, routes, assignment, sizes;
-    std::vector<uint32_t> counts, touched;
+    std::vector<int> ids;
+    std::vector<int> grouped;
+    std::vector<int> routes;
+    std::vector<int> assignment;
+    std::vector<int> sizes;
+    std::vector<uint32_t> counts;
+    std::vector<uint32_t> touched;
     std::vector<uint64_t> feature_hashes;
     std::vector<std::vector<size_t>> boundaries;
     std::vector<size_t> offsets;
-    RowMatrix labels, centers, sums, similarity, classifier, projected;
+    RowMatrix labels;
+    RowMatrix centers;
+    RowMatrix sums;
+    RowMatrix similarity;
+    RowMatrix classifier;
+    RowMatrix projected;
     Eigen::VectorXf nearest;
+
     BuildScratch(int corpus_size, int train_size, int max_depth)
         : ids(train_size),
           grouped(train_size),
@@ -237,9 +261,11 @@ class CraftML : public MLANN {
 
   struct Scratch {
     mlann_detail::HugeBuffer<float> votes;
-    std::vector<uint32_t> touched, candidates;
+    std::vector<uint32_t> touched;
+    std::vector<uint32_t> candidates;
     std::vector<LabelScore> ranked;
     RowMatrix projected;
+
     void clear(int corpus_size) {
       if (votes.size() != size_t(corpus_size)) {
         votes.resize(corpus_size);
@@ -291,7 +317,7 @@ class CraftML : public MLANN {
   static void project(const float *x, int n, float *out, int p, uint64_t seed) {
     std::fill(out, out + p, 0);
     for (int j = 0; j < n; ++j) {
-      const uint64_t hash = mix(seed ^ uint64_t(j));
+      const uint64_t hash = mlann_detail::mix(seed ^ uint64_t(j));
       out[hash % p] += (hash >> 63) ? x[j] : -x[j];
     }
   }
@@ -300,27 +326,35 @@ class CraftML : public MLANN {
                 const Eigen::Ref<const RowMatrix> &train, const CraftMLOptions &o) const {
     if (o.n_trees <= 0 || o.max_depth < 0 || o.max_depth > 64 || o.branching_factor < 2 ||
         o.leaf_size <= 0 || o.label_dim <= 0 || o.feature_dim < 0 || o.iterations <= 0 ||
-        o.node_sample_size < o.branching_factor || (o.distance != IP && o.distance != L2))
+        o.node_sample_size < o.branching_factor || (o.distance != IP && o.distance != L2)) {
       throw std::invalid_argument("Invalid CraftML build parameters");
+    }
     if (!train.rows() || train.cols() != dim || train.rows() > std::numeric_limits<int>::max() ||
-        knn.rows() != train.rows() || knn.cols() <= 0 || knn.cols() > n_corpus)
+        knn.rows() != train.rows() || knn.cols() <= 0 || knn.cols() > n_corpus) {
       throw std::invalid_argument("Incompatible training features or neighbor labels");
-    if (!train.allFinite() || !corpus.allFinite())
+    }
+    if (!train.allFinite() || !corpus.allFinite()) {
       throw std::invalid_argument("Corpus and training features must be finite");
+    }
+
     std::vector<uint32_t> row(knn.cols());
     for (int i = 0; i < knn.rows(); ++i) {
       std::copy(knn.row(i).data(), knn.row(i).data() + knn.cols(), row.begin());
       miniselect::pdqsort_branchless(row.begin(), row.end());
       if (row.back() >= static_cast<uint32_t>(n_corpus) ||
-          std::adjacent_find(row.begin(), row.end()) != row.end())
+          std::adjacent_find(row.begin(), row.end()) != row.end()) {
         throw std::invalid_argument("Neighbor labels must be distinct valid corpus IDs per query");
+      }
     }
   }
 
   void check_query(const float *q) const {
-    if (empty()) throw std::logic_error("Cannot query before building index");
-    if (!q || !Eigen::Map<const Eigen::RowVectorXf>(q, dim).allFinite())
+    if (empty()) {
+      throw std::logic_error("Cannot query before building index");
+    }
+    if (!q || !Eigen::Map<const Eigen::RowVectorXf>(q, dim).allFinite()) {
       throw std::invalid_argument("Query features must be finite");
+    }
   }
 
   template <class Derived>
@@ -395,52 +429,56 @@ class CraftML : public MLANN {
     }
   }
 
-  uint32_t grow_node(Tree &tree, std::vector<int> &ids, size_t begin, size_t end, int level,
-                     const Eigen::Ref<const RowMatrix> &features,
+  // Sample query rows and hash their corpus-ID labels into normalized label vectors.
+  void sample_labels(std::vector<int> &ids, size_t begin, size_t end, uint64_t label_seed,
                      const Eigen::Ref<const UIntRowMatrix> &knn, std::mt19937 &generator,
                      BuildScratch &scratch) const {
-    const uint32_t node_id = static_cast<uint32_t>(tree.nodes.size());
-    tree.nodes.emplace_back();
-    tree.nodes[node_id].training_size = static_cast<int>(end - begin);
-    auto leaf = [&]() {
-      make_leaf(tree.nodes[node_id], ids, begin, end, knn, scratch);
-      return node_id;
-    };
-    if (end - begin <= static_cast<size_t>(options_.leaf_size) || level >= options_.max_depth)
-      return leaf();
-
     const int sample_size =
         static_cast<int>(std::min(end - begin, size_t(options_.node_sample_size)));
+
     // A partial Fisher-Yates shuffle samples without replacement in O(sample size).
     for (int i = 0; i < sample_size; ++i) {
       std::uniform_int_distribution<size_t> pick(begin + i, end - 1);
       std::swap(ids[begin + i], ids[pick(generator)]);
     }
+
     auto &labels = scratch.labels;
     labels.resize(sample_size, options_.label_dim);
     labels.setZero();
     for (int i = 0; i < sample_size; ++i) {
       for (int j = 0; j < knn.cols(); ++j) {
-        const uint64_t hash = mix(tree.label_seed ^ uint64_t(knn(ids[begin + i], j)));
+        const uint64_t hash = mlann_detail::mix(label_seed ^ uint64_t(knn(ids[begin + i], j)));
         labels(i, hash % options_.label_dim) += (hash >> 63) ? 1.0f : -1.0f;
       }
       labels.row(i).stableNormalize();  // Zero sketches remain zero.
     }
+  }
+
+  // Choose label centers with k-means++ sampling; coincident labels may yield one center.
+  int initialize_label_centers(std::mt19937 &generator, BuildScratch &scratch) const {
+    const auto &labels = scratch.labels;
+    const int sample_size = labels.rows();
     const int branches = std::min(options_.branching_factor, sample_size);
-    auto &all_centers = scratch.centers;
-    all_centers.resize(branches, options_.label_dim);
+
+    auto &centers = scratch.centers;
+    centers.resize(branches, options_.label_dim);
     std::uniform_int_distribution<int> first(0, sample_size - 1);
-    all_centers.row(0) = labels.row(first(generator));
+    centers.row(0) = labels.row(first(generator));
+
     auto &nearest = scratch.nearest;
     nearest.resize(sample_size);
     nearest.setConstant(std::numeric_limits<float>::infinity());
+
     int count = 1;
     while (count < branches) {
-      for (int i = 0; i < sample_size; ++i)
-        nearest(i) =
-            std::min(nearest(i), (labels.row(i) - all_centers.row(count - 1)).squaredNorm());
+      for (int i = 0; i < sample_size; ++i) {
+        const float distance = (labels.row(i) - centers.row(count - 1)).squaredNorm();
+        nearest(i) = std::min(nearest(i), distance);
+      }
+
       const double total = nearest.cast<double>().sum();
       if (total <= 1e-12) break;
+
       std::uniform_real_distribution<double> pick(0, total);
       double target = pick(generator);
       int selected = sample_size - 1;
@@ -451,23 +489,35 @@ class CraftML : public MLANN {
           break;
         }
       }
-      all_centers.row(count++) = labels.row(selected);
+      centers.row(count++) = labels.row(selected);
     }
-    if (count == 1) return leaf();
+
+    scratch.centers.conservativeResize(count, Eigen::NoChange);
+    return count;
+  }
+
+  void cluster_labels(BuildScratch &scratch) const {
+    const auto &labels = scratch.labels;
+    const int sample_size = labels.rows();
+
     auto &centers = scratch.centers;
-    centers.conservativeResize(count, Eigen::NoChange);
+    const int count = centers.rows();
+
     auto &assignment = scratch.assignment;
     auto &sizes = scratch.sizes;
     assignment.resize(sample_size);
     sizes.resize(count);
+
     auto &sums = scratch.sums;
     sums.resize(count, options_.label_dim);
     auto &similarity = scratch.similarity;
     similarity.resize(sample_size, count);
+
     for (int iteration = 0; iteration < options_.iterations; ++iteration) {
       sums.setZero();
       std::fill(sizes.begin(), sizes.end(), 0);
       similarity.noalias() = labels * centers.transpose();
+
       for (int i = 0; i < sample_size; ++i) {
         Eigen::Index cluster;
         similarity.row(i).maxCoeff(&cluster);
@@ -475,6 +525,7 @@ class CraftML : public MLANN {
         ++sizes[cluster];
         sums.row(cluster) += labels.row(i);
       }
+
       for (int c = 0; c < count; ++c) {
         if (sizes[c]) {
           centers.row(c) = sums.row(c);
@@ -482,11 +533,24 @@ class CraftML : public MLANN {
         }
       }
     }
+  }
+
+  // Average query features within each label cluster to obtain routing centroids.
+  int fit_feature_centroids(const std::vector<int> &ids, size_t begin,
+                            const Eigen::Ref<const RowMatrix> &features,
+                            BuildScratch &scratch) const {
+    const auto &assignment = scratch.assignment;
+    const auto &sizes = scratch.sizes;
+    const int sample_size = assignment.size();
+    const int count = sizes.size();
+
     auto &classifier = scratch.classifier;
     classifier.resize(count, features.cols());
     classifier.setZero();
-    for (int i = 0; i < sample_size; ++i)
+    for (int i = 0; i < sample_size; ++i) {
       classifier.row(assignment[i]) += features.row(ids[begin + i]);
+    }
+
     int fitted = 0;
     for (int c = 0; c < count; ++c) {
       if (!sizes[c]) continue;
@@ -496,7 +560,15 @@ class CraftML : public MLANN {
     }
 
     classifier.conservativeResize(fitted, Eigen::NoChange);
-    if (fitted < 2) return leaf();
+    return fitted;
+  }
+
+  bool partition_children(Node &node, std::vector<int> &ids, size_t begin, size_t end, int level,
+                          const Eigen::Ref<const RowMatrix> &features,
+                          BuildScratch &scratch) const {
+    const auto &classifier = scratch.classifier;
+    const int fitted = classifier.rows();
+    auto &sizes = scratch.sizes;
 
     // Stable counting partition preserves row order and random draws in each child.
     sizes.assign(fitted, 0);
@@ -505,33 +577,80 @@ class CraftML : public MLANN {
       scratch.routes[i] = child;
       ++sizes[child];
     }
+
     int occupied = 0;
     for (int size : sizes) occupied += size != 0;
-    if (occupied < 2) return leaf();
-    tree.nodes[node_id].centroids.resize(occupied, features.cols());
-    tree.nodes[node_id].children.resize(occupied);
+    if (occupied < 2) return false;
+
+    // Store only nonempty children and their contiguous row ranges.
+    node.centroids.resize(occupied, features.cols());
+    node.children.resize(occupied);
     auto &boundaries = scratch.boundaries[level];
     boundaries.resize(occupied + 1);
     scratch.offsets.resize(fitted);
+
     size_t offset = begin;
     int child = 0;
     for (int c = 0; c < fitted; ++c) {
       scratch.offsets[c] = offset;
       if (!sizes[c]) continue;
-      tree.nodes[node_id].centroids.row(child) = classifier.row(c);
+      node.centroids.row(child) = classifier.row(c);
       boundaries[child++] = offset;
       offset += sizes[c];
     }
     boundaries[occupied] = end;
-    for (size_t i = begin; i < end; ++i)
-      scratch.grouped[scratch.offsets[scratch.routes[i]]++] = ids[i];
-    std::copy(scratch.grouped.begin() + begin, scratch.grouped.begin() + end, ids.begin() + begin);
-    for (int c = 0; c < occupied; ++c) {
-      // Recursive growth can reallocate tree.nodes and overwrite all fitting buffers.
-      const uint32_t result = grow_node(tree, ids, boundaries[c], boundaries[c + 1], level + 1,
-                                        features, knn, generator, scratch);
-      tree.nodes[node_id].children[c] = result;
+
+    for (size_t i = begin; i < end; ++i) {
+      const int child = scratch.routes[i];
+      const size_t destination = scratch.offsets[child]++;
+      scratch.grouped[destination] = ids[i];
     }
+
+    std::copy(scratch.grouped.begin() + begin, scratch.grouped.begin() + end, ids.begin() + begin);
+    return true;
+  }
+
+  uint32_t grow_node(Tree &tree, std::vector<int> &ids, size_t begin, size_t end, int level,
+                     const Eigen::Ref<const RowMatrix> &features,
+                     const Eigen::Ref<const UIntRowMatrix> &knn, std::mt19937 &generator,
+                     BuildScratch &scratch) const {
+    const uint32_t node_id = static_cast<uint32_t>(tree.nodes.size());
+    tree.nodes.emplace_back();
+    tree.nodes[node_id].training_size = static_cast<int>(end - begin);
+
+    const auto make_node_leaf = [&]() {
+      make_leaf(tree.nodes[node_id], ids, begin, end, knn, scratch);
+      return node_id;
+    };
+
+    if (end - begin <= static_cast<size_t>(options_.leaf_size) || level >= options_.max_depth) {
+      return make_node_leaf();
+    }
+
+    sample_labels(ids, begin, end, tree.label_seed, knn, generator, scratch);
+    if (initialize_label_centers(generator, scratch) < 2) {
+      return make_node_leaf();
+    }
+
+    cluster_labels(scratch);
+    if (fit_feature_centroids(ids, begin, features, scratch) < 2) {
+      return make_node_leaf();
+    }
+
+    if (!partition_children(tree.nodes[node_id], ids, begin, end, level, features, scratch)) {
+      return make_node_leaf();
+    }
+
+    // Only per-depth boundaries survive recursion; fitting buffers are shared.
+    const auto &boundaries = scratch.boundaries[level];
+    const int n_children = tree.nodes[node_id].children.size();
+    for (int child = 0; child < n_children; ++child) {
+      const uint32_t child_id = grow_node(tree, ids, boundaries[child], boundaries[child + 1],
+                                          level + 1, features, knn, generator, scratch);
+      // Fetch the node again because recursive growth can reallocate tree.nodes.
+      tree.nodes[node_id].children[child] = child_id;
+    }
+
     return node_id;
   }
 };

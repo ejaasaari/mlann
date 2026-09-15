@@ -10,12 +10,12 @@
 
 #include "Python.h"
 #include "craftml.h"
-#include "neighbor-mean-pls.h"
+#include "pls.h"
 #include "numpy/arrayobject.h"
-#include "rf-class-depth.h"
-#include "rf-kd.h"
-#include "rf-pca.h"
-#include "rf-rp.h"
+#include "rf.h"
+#include "kd.h"
+#include "pca.h"
+#include "rp.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
 typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> UIntRowMatrix;
@@ -72,8 +72,8 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
     self->index = new RFPCA(data, n, dim);
   else if (strcmp(index_type, "PCAFull") == 0)
     self->index = new PCAFull(data, n, dim);
-  else if (strcmp(index_type, "NeighborMeanPLS") == 0)
-    self->index = new NeighborMeanPLS(data, n, dim);
+  else if (strcmp(index_type, "PLS") == 0)
+    self->index = new PLS(data, n, dim);
   else
     self->index = new RFClass(data, n, dim);
 

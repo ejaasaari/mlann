@@ -59,7 +59,7 @@ class MLANNIndex(object):
                              b must be 1. Default False preserves supervised leaf votes.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
-        :param density: Feature density for legacy methods; NeighborMeanPLS uses all input dimensions.
+        :param density: Feature density for legacy methods; PLS uses all input dimensions.
         :param b: Minimum vote threshold for candidates to be included in the linear search phase.
         :param top_variance_dims: Number of highest-variance dimensions KD chooses among
                                   at each node, capped at dim; positive integer, default 5.

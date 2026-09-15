@@ -1,6 +1,6 @@
 #pragma once
 
-// Neighbor-mean PLS projections with label-entropy split selection.
+// PLS projections with label-entropy split selection.
 #include <Eigen/Dense>
 #include <algorithm>
 #include <array>
@@ -10,14 +10,14 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
-#include <unordered_set>
 #include <vector>
 
 #include "detail/huge-buffer.h"
 #include "detail/neighbor-query.h"
 #include "mlann.h"
+#include "utils.h"
 
-namespace neighbor_mean_pls_detail {
+namespace pls_detail {
 
 using Matrix = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
@@ -394,52 +394,18 @@ inline Split threshold(const Sample &sample, const Eigen::VectorXf &projection) 
   return threshold(sample, projection, tables, scratch);
 }
 
-inline uint64_t mix(uint64_t x) {
-  x += 0x9e3779b97f4a7c15ULL;
-  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-  return x ^ (x >> 31);
-}
+}  // namespace pls_detail
 
-// Sample distinct row offsets without scanning large nodes.
-template <typename Generator>
-inline std::vector<int> sample(int n, int k, Generator &rng) {
-  std::vector<int> result;
-  result.reserve(k);
-  if (k < n / 4) {
-    std::unordered_set<int> selected;
-    selected.reserve(k);
-    for (int i = n - k; i < n; ++i) {
-      int j = std::uniform_int_distribution<int>(0, i)(rng);
-      if (!selected.insert(j).second) {
-        selected.insert(i);
-        j = i;
-      }
-      result.push_back(j);
-    }
-  } else {
-    result.resize(n);
-    std::iota(result.begin(), result.end(), 0);
-    for (int i = 0; i < k; ++i) {
-      std::swap(result[i], result[std::uniform_int_distribution<int>(i, n - 1)(rng)]);
-    }
-    result.resize(k);
-  }
-  return result;
-}
-}  // namespace neighbor_mean_pls_detail
-
-class NeighborMeanPLS : public MLANN {
+class PLS : public MLANN {
  public:
   struct Options {
     int sample = 300;
     uint64_t seed = 17;
   };
 
-  NeighborMeanPLS(const float *corpus_, int n_corpus_, int dim_)
-      : NeighborMeanPLS(corpus_, n_corpus_, dim_, Options{}) {}
+  PLS(const float *corpus_, int n_corpus_, int dim_) : PLS(corpus_, n_corpus_, dim_, Options{}) {}
 
-  NeighborMeanPLS(const float *corpus_, int n_corpus_, int dim_, Options options)
+  PLS(const float *corpus_, int n_corpus_, int dim_, Options options)
       : MLANN(corpus_, n_corpus_, dim_), options_(options) {
     if (options.sample < 2) {
       throw std::invalid_argument("sample must be >= 2");
@@ -482,10 +448,9 @@ class NeighborMeanPLS : public MLANN {
     forests_.resize(n_trees_);
     leaves_.resize(n_trees_);
     std::vector<std::vector<float>> tree_projections(n_trees_);
-    const neighbor_mean_pls_detail::PALTables tables(std::min<int>(options_.sample, train.rows()),
-                                                     knn.cols());
+    const pls_detail::PALTables tables(std::min<int>(options_.sample, train.rows()), knn.cols());
     // Compute neighbor means once and release them after fitting the forest.
-    RowMatrix targets = neighbor_mean_pls_detail::neighbor_means(corpus, knn);
+    RowMatrix targets = pls_detail::neighbor_means(corpus, knn);
 #pragma omp parallel
     {
       TreeScratch scratch(n_corpus);
@@ -495,8 +460,7 @@ class NeighborMeanPLS : public MLANN {
         std::iota(rows.begin(), rows.end(), 0);
         forests_[t].reserve(std::min<size_t>((size_t(1) << (depth + 1)) - 1, 2 * train.rows()));
         scratch.projections.clear();
-        scratch.generator.seed(uint32_t(
-            neighbor_mean_pls_detail::mix(options_.seed ^ neighbor_mean_pls_detail::mix(t))));
+        scratch.generator.seed(uint32_t(mlann_detail::mix(options_.seed ^ mlann_detail::mix(t))));
         grow_subtree(rows.begin(), rows.end(), 0, t, train, knn, targets, tables, scratch);
         forests_[t].shrink_to_fit();
         leaves_[t].shrink_to_fit();
@@ -594,7 +558,7 @@ class NeighborMeanPLS : public MLANN {
     std::vector<uint32_t> touched_ids;
     std::minstd_rand generator;
     std::vector<float> projections;
-    neighbor_mean_pls_detail::ThresholdScratch threshold_scratch;
+    pls_detail::ThresholdScratch threshold_scratch;
 
     explicit TreeScratch(int n_corpus) : label_map(n_corpus, 0) {}
 
@@ -677,8 +641,8 @@ class NeighborMeanPLS : public MLANN {
   int grow_subtree(IndexIterator begin, IndexIterator end, int level, int tree,
                    const Eigen::Ref<const RowMatrix> &train,
                    const Eigen::Ref<const UIntRowMatrix> &knn, const RowMatrix &targets,
-                   const neighbor_mean_pls_detail::PALTables &tables, TreeScratch &scratch) {
-    using namespace neighbor_mean_pls_detail;
+                   const pls_detail::PALTables &tables, TreeScratch &scratch) {
+    using namespace pls_detail;
     const int index = forests_[tree].size();
     forests_[tree].emplace_back();
     Node node;
@@ -689,7 +653,7 @@ class NeighborMeanPLS : public MLANN {
       return index;
     }
     const int n_sampled = std::min(options_.sample, count);
-    const auto sampled_rows = sample(count, n_sampled, scratch.generator);
+    const auto sampled_rows = mlann_detail::sample(count, n_sampled, scratch.generator);
     Sample sampled_queries;
     sampled_queries.k = knn.cols();
     sampled_queries.x.resize(n_sampled, dim);

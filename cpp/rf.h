@@ -13,29 +13,7 @@
 #include "detail/huge-buffer.h"
 #include "detail/neighbor-query.h"
 #include "mlann.h"
-
-inline void sample_unique(int n, int k, std::vector<uint32_t> &reservoir) {
-  std::random_device rd;
-  std::minstd_rand generator(rd());
-
-  reservoir.resize(k);
-  std::iota(reservoir.begin(), reservoir.end(), 0);
-
-  for (int i = k; i < n; ++i) {
-    std::uniform_int_distribution<int> distribution(0, i);
-    int j = distribution(generator);
-
-    if (j < k) {
-      reservoir[j] = i;
-    }
-  }
-}
-
-inline std::vector<uint32_t> sample_unique(int n, int k) {
-  std::vector<uint32_t> reservoir;
-  sample_unique(n, k, reservoir);
-  return reservoir;
-}
+#include "utils.h"
 
 struct SplitEntry {
   float key;
@@ -210,7 +188,7 @@ class RFClass : public MLANN {
 
     auto &local = scratch.local;
     if (n_subsample > 0 && n_subsample < n) {
-      sample_unique(n, n_subsample, local);
+      mlann_detail::sample_unique(n, n_subsample, local);
       n = n_subsample;
     } else {
       local.resize(n);
@@ -332,7 +310,7 @@ class RFClass : public MLANN {
     std::vector<std::vector<std::vector<uint32_t>>> dims_all(n_trees);
     for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
       for (int tree_level = 0; tree_level < depth; ++tree_level) {
-        std::vector<uint32_t> dims = sample_unique(dim, n_random_dim);
+        std::vector<uint32_t> dims = mlann_detail::sample_unique(dim, n_random_dim);
         dims_all[n_tree].push_back(dims);
       }
     }
