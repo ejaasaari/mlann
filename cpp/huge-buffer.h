@@ -100,4 +100,21 @@ class HugeBuffer {
   T &operator[](size_t i) { return data_[i]; }
   const T &operator[](size_t i) const { return data_[i]; }
 };
+
+// Promote only complete huge-page spans inside the existing corpus allocation.
+// No corpus copy or index metadata is created; unsupported advice is harmless.
+inline void promote_existing_corpus_pages(const void *data, size_t bytes) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+  constexpr uintptr_t page = 2 * 1024 * 1024;
+  const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+  if (bytes > UINTPTR_MAX - address || address > UINTPTR_MAX - (page - 1)) return;
+  const uintptr_t begin = (address + page - 1) & ~(page - 1);
+  const uintptr_t end = (address + bytes) & ~(page - 1);
+  if (end <= begin) return;
+  madvise(reinterpret_cast<void *>(begin), end - begin, MADV_HUGEPAGE);
+#ifdef MADV_COLLAPSE
+  madvise(reinterpret_cast<void *>(begin), end - begin, MADV_COLLAPSE);
+#endif
+#endif
+}
 }  // namespace mlann_detail

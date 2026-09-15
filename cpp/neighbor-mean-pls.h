@@ -14,6 +14,7 @@
 #include <vector>
 #include "mlann.h"
 #include "huge-buffer.h"
+#include "neighbor-query.h"
 
 namespace neighbor_mean_pls_detail {
 using Matrix = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -348,6 +349,7 @@ class NeighborMeanPLS : public MLANN {
     }
     targets.resize(0, 0);
     pack_projections(tree_projections);
+    mlann_detail::promote_existing_corpus_pages(corpus.data(), size_t(corpus.size()) * sizeof(float));
   }
   void query(const float *data, int k, float threshold, int *out, Distance dist = L2,
              float *distances = nullptr, int *elected_count = nullptr) const override {
@@ -374,7 +376,7 @@ class NeighborMeanPLS : public MLANN {
       }
     }
     if (elected_count) *elected_count = elected.size();
-    exact_knn(Eigen::Map<const Eigen::RowVectorXf>(data, dim), k, elected, out, dist, distances);
+    exact_knn(Eigen::Map<const Eigen::RowVectorXf>(data, dim), k, elected, out, dist, distances, mlann_detail::compute_neighbor_scores);
   }
  protected:
   struct Node {
@@ -399,7 +401,7 @@ class NeighborMeanPLS : public MLANN {
         const int t = active[i];
         rows[i] = forests_[first + t][nodes[t]].projection;
       }
-      mlann_detail::compute_one_to_many(query, projections_.data(), dim, rows.data(),
+      mlann_detail::compute_neighbor_one_to_many(query, projections_.data(), dim, rows.data(),
                                        remaining, mlann_detail::OneToManyMetric::IP, scores.data());
       int next = 0;
       for (int i = 0; i < remaining; ++i) {

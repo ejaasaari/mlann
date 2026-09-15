@@ -110,6 +110,11 @@ class MLANN {
   bool empty() const { return n_trees == 0; }
 
  protected:
+  using CandidateScoreKernel = void (*)(const float *, const float *, size_t,
+                                        const uint32_t *, size_t,
+                                        mlann_detail::OneToManyMetric,
+                                        mlann_detail::StridedFloatOutput);
+
   struct ScoredCandidate {
     float score;
     uint32_t label;
@@ -117,7 +122,7 @@ class MLANN {
 
   void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
                  const std::vector<uint32_t> &indices, int *out, Distance dist = L2,
-                 float *out_distances = nullptr) const {
+                 float *out_distances = nullptr, CandidateScoreKernel score_kernel = nullptr) const {
     if (indices.empty()) {
       for (int i = 0; i < k; ++i) out[i] = -1;
       if (out_distances) {
@@ -133,9 +138,15 @@ class MLANN {
     if (k == 1) {
       static thread_local Eigen::VectorXf distances;
       distances.resize(n_elected);
-      mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
-                                        indices.data(), static_cast<std::size_t>(n_elected), metric,
-                                        distances.data());
+      if (score_kernel) {
+        const mlann_detail::StridedFloatOutput output{
+            reinterpret_cast<unsigned char *>(distances.data()), sizeof(float)};
+        score_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, metric, output);
+      } else {
+        mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
+                                          indices.data(), static_cast<std::size_t>(n_elected), metric,
+                                          distances.data());
+      }
       Eigen::MatrixXf::Index index;
 
       if (dist == L2) {
@@ -157,9 +168,13 @@ class MLANN {
     for (int i = 0; i < n_elected; ++i) scored[i].label = indices[i];
     const mlann_detail::StridedFloatOutput scores{reinterpret_cast<unsigned char *>(scored.data()),
                                                   sizeof(ScoredCandidate)};
-    mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
-                                      indices.data(), static_cast<std::size_t>(n_elected), metric,
-                                      scores);
+    if (score_kernel) {
+      score_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, metric, scores);
+    } else {
+      mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
+                                        indices.data(), static_cast<std::size_t>(n_elected), metric,
+                                        scores);
+    }
 
     if (dist == L2) {
       miniselect::pdqpartial_sort_branchless(

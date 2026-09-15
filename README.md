@@ -117,6 +117,12 @@ updates. Vote accumulation order and exact ranking of every elected candidate
 are preserved. Large Linux vote buffers request huge pages and fall back to
 ordinary pages when unavailable.
 
+Neighbor-mean PLS scores full vectors in four-candidate SIMD batches with
+look-ahead prefetching. Linux builds request huge-page backing for complete
+spans inside the existing corpus allocation. These changes use the existing
+index and query buffers. Unsupported SIMD builds use the original scorer;
+page advice may be declined without affecting correctness.
+
 C++ callers can supply `NeighborMeanPLS::Options` to the constructor to change the sample
 size and seed. Python uses those defaults.
 
@@ -130,6 +136,8 @@ g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tes
 benchmarks/.build/test_method
 g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_huge_buffer.cpp -o benchmarks/.build/test_huge_buffer
 benchmarks/.build/test_huge_buffer
+g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_query.cpp -o benchmarks/.build/test_neighbor_query
+benchmarks/.build/test_neighbor_query
 ```
 
 The benchmark runner accepts the added method:
