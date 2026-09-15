@@ -115,14 +115,15 @@ class MLANN {
                                         mlann_detail::OneToManyMetric,
                                         mlann_detail::StridedFloatOutput);
 
-  struct ScoredCandidate {
-    float score;
-    uint32_t label;
-  };
+  using ScoredCandidate = mlann_detail::ScoredCandidate;
+  using CandidateTopKKernel = void (*)(const float *, const float *, size_t,
+                                       const uint32_t *, size_t, size_t,
+                                       mlann_detail::OneToManyMetric, ScoredCandidate *);
 
   void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
                  const std::vector<uint32_t> &indices, int *out, Distance dist = L2,
-                 float *out_distances = nullptr, CandidateScoreKernel score_kernel = nullptr) const {
+                 float *out_distances = nullptr, CandidateScoreKernel score_kernel = nullptr,
+                 CandidateTopKKernel topk_kernel = nullptr) const {
     if (indices.empty()) {
       for (int i = 0; i < k; ++i) out[i] = -1;
       if (out_distances) {
@@ -164,30 +165,36 @@ class MLANN {
 
     int n_to_sort = n_elected > k ? k : n_elected;
     static thread_local std::vector<ScoredCandidate> scored;
-    scored.resize(n_elected);
-    for (int i = 0; i < n_elected; ++i) scored[i].label = indices[i];
-    const mlann_detail::StridedFloatOutput scores{reinterpret_cast<unsigned char *>(scored.data()),
-                                                  sizeof(ScoredCandidate)};
-    if (score_kernel) {
-      score_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, metric, scores);
+    // Both paths share this allocation; streaming ranking only needs k records.
+    scored.resize(topk_kernel ? n_to_sort : n_elected);
+    if (topk_kernel) {
+      topk_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected,
+                   n_to_sort, metric, scored.data());
     } else {
-      mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
-                                        indices.data(), static_cast<std::size_t>(n_elected), metric,
-                                        scores);
-    }
+      for (int i = 0; i < n_elected; ++i) scored[i].label = indices[i];
+      const mlann_detail::StridedFloatOutput scores{reinterpret_cast<unsigned char *>(scored.data()),
+                                                    sizeof(ScoredCandidate)};
+      if (score_kernel) {
+        score_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, metric, scores);
+      } else {
+        mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
+                                          indices.data(), static_cast<std::size_t>(n_elected), metric,
+                                          scores);
+      }
 
-    if (dist == L2) {
-      miniselect::pdqpartial_sort_branchless(
-          scored.data(), scored.data() + n_to_sort, scored.data() + n_elected,
-          [](const ScoredCandidate &left, const ScoredCandidate &right) {
-            return left.score < right.score;
-          });
-    } else {
-      miniselect::pdqpartial_sort_branchless(
-          scored.data(), scored.data() + n_to_sort, scored.data() + n_elected,
-          [](const ScoredCandidate &left, const ScoredCandidate &right) {
-            return left.score > right.score;
-          });
+      if (dist == L2) {
+        miniselect::pdqpartial_sort_branchless(
+            scored.data(), scored.data() + n_to_sort, scored.data() + n_elected,
+            [](const ScoredCandidate &left, const ScoredCandidate &right) {
+              return left.score < right.score;
+            });
+      } else {
+        miniselect::pdqpartial_sort_branchless(
+            scored.data(), scored.data() + n_to_sort, scored.data() + n_elected,
+            [](const ScoredCandidate &left, const ScoredCandidate &right) {
+              return left.score > right.score;
+            });
+      }
     }
 
     for (int i = 0; i < k; ++i) {

@@ -2,6 +2,7 @@
 
 #include "one-to-many.h"
 #include <vector>
+#include <algorithm>
 
 namespace mlann_detail {
 // Same arithmetic and output buffers as the native scorer. Smaller batches and
@@ -150,6 +151,76 @@ inline void compute_neighbor_scores(const float *query, const float *data,
                                     size_t count, OneToManyMetric metric,
                                     StridedFloatOutput output) {
   compute_neighbor_one_to_many(query, data, dim, indices, count, metric, output);
+}
+
+// Score every elected vector with the same float kernel. Keeping a heap of the
+// best k scores avoids writing and selecting an entire candidate-score array.
+template <OneToManyMetric metric>
+struct NeighborTopKOrder {
+  bool operator()(const ScoredCandidate &left, const ScoredCandidate &right) const {
+    if constexpr (metric == OneToManyMetric::IP) return left.score > right.score;
+    else return left.score < right.score;
+  }
+};
+
+template <OneToManyMetric metric>
+struct NeighborTopKState {
+  ScoredCandidate *heap;
+  const uint32_t *indices;
+  size_t keep;
+  size_t used = 0;
+
+  void add(size_t index, float score) {
+    const NeighborTopKOrder<metric> better;
+    const ScoredCandidate item{score, indices[index]};
+    if (used < keep) {
+      heap[used++] = item;
+      if (used == keep) std::make_heap(heap, heap + keep, better);
+      return;
+    }
+    if (!better(item, heap[0])) return;
+    size_t hole = 0, child = 1;
+    while (child < keep) {
+      if (child + 1 < keep && better(heap[child], heap[child + 1])) ++child;
+      if (!better(item, heap[child])) break;
+      heap[hole] = heap[child];
+      hole = child;
+      child = 2 * hole + 1;
+    }
+    heap[hole] = item;
+  }
+};
+
+template <OneToManyMetric metric>
+struct NeighborTopKOutput {
+  NeighborTopKState<metric> *state;
+  struct Slot {
+    NeighborTopKState<metric> *state;
+    size_t index;
+    void operator=(float score) { state->add(index, score); }
+  };
+  Slot operator[](size_t index) const { return {state, index}; }
+};
+
+template <OneToManyMetric metric>
+inline void compute_neighbor_topk_impl(const float *query, const float *data,
+                                       size_t dim, const uint32_t *indices, size_t count,
+                                       size_t k, ScoredCandidate *output) {
+  const size_t keep = std::min(k, count);
+  if (!keep) return;
+  NeighborTopKState<metric> state{output, indices, keep};
+  compute_neighbor_one_to_many(query, data, dim, indices, count, metric,
+                               NeighborTopKOutput<metric>{&state});
+  std::sort(output, output + keep, NeighborTopKOrder<metric>{});
+}
+
+inline void compute_neighbor_topk(const float *query, const float *data, size_t dim,
+                                  const uint32_t *indices, size_t count, size_t k,
+                                  OneToManyMetric metric, ScoredCandidate *output) {
+  if (metric == OneToManyMetric::IP)
+    compute_neighbor_topk_impl<OneToManyMetric::IP>(query, data, dim, indices, count, k, output);
+  else
+    compute_neighbor_topk_impl<OneToManyMetric::L2>(query, data, dim, indices, count, k, output);
 }
 
 // Leaf labels are unique. SIMD updates therefore preserve the original

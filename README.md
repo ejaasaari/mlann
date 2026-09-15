@@ -124,6 +124,10 @@ index and query buffers. Unsupported SIMD builds use the original scorer;
 page advice may be declined without affecting correctness.
 Leaf labels are unique within each leaf, allowing SIMD vote updates while
 preserving accumulation and candidate election order.
+For k > 1, exact scoring feeds a heap of the best k candidates in the shared
+score buffer. Every elected vector is still scored in full. Result scores and
+candidate election are unchanged; equal-score result ordering is unspecified.
+This adds no corpus representation, index fields, or query buffer.
 
 C++ callers can supply `NeighborMeanPLS::Options` to the constructor to change the sample
 size and seed. Python uses those defaults.
@@ -141,7 +145,11 @@ benchmarks/.build/test_huge_buffer
 g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_query.cpp -o benchmarks/.build/test_neighbor_query
 benchmarks/.build/test_neighbor_query
 g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_votes.cpp -o benchmarks/.build/test_neighbor_votes
+g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_topk.cpp -o benchmarks/.build/test_neighbor_topk
+benchmarks/.build/test_neighbor_topk
 benchmarks/.build/test_neighbor_votes
+g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_topk.cpp -o benchmarks/.build/test_neighbor_topk
+benchmarks/.build/test_neighbor_topk
 ```
 
 The benchmark runner accepts the added method:
@@ -152,4 +160,4 @@ python3 benchmarks/run_rf_yandex_pareto.py --index NeighborMeanPLS --output benc
 
 This branch is isolated from the same `dc4b882` baseline as `pls-centroid`.
 The branch retains the full-input float fitting implementation and adds the
-vote-prefetching and workspace reuse described above.
+query optimizations described above.

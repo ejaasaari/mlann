@@ -369,7 +369,8 @@ class NeighborMeanPLS : public MLANN {
       }
     }
     if (elected_count) *elected_count = elected.size();
-    exact_knn(Eigen::Map<const Eigen::RowVectorXf>(data, dim), k, elected, out, dist, distances, mlann_detail::compute_neighbor_scores);
+    exact_knn(Eigen::Map<const Eigen::RowVectorXf>(data, dim), k, elected, out, dist, distances, mlann_detail::compute_neighbor_scores,
+              mlann_detail::compute_neighbor_topk);
   }
  protected:
   struct Node {
