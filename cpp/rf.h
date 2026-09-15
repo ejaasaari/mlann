@@ -29,6 +29,8 @@ struct SplitScratch {
     std::vector<SplitEntry> order;
     std::vector<float> left_ent;
     std::vector<uint32_t> sampled_labels;
+    std::vector<size_t> sampled_offsets;
+    std::vector<size_t> label_counts;
     std::vector<uint32_t> touched_ids;
 
     void ensure_corpus(std::size_t n_corpus) {
@@ -44,9 +46,20 @@ struct SplitScratch {
     }
 };
 
-class RFClass : public MLANN {
+class RF : public MLANN {
   public:
-    RFClass(const float* corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
+    RF(const float* corpus_, int n_corpus_, int dim_, int n_subsample_ = 200)
+        : MLANN(corpus_, n_corpus_, dim_) {
+        configure(n_subsample_);
+    }
+
+    void configure(int n_subsample_) {
+        if (!empty())
+            throw std::logic_error("The index has already been grown.");
+        if (n_subsample_ < 0)
+            throw std::invalid_argument("n_subsample must be non-negative; 0 uses all node rows.");
+        n_subsample = n_subsample_;
+    }
 
     void grow(
         int n_trees_,
@@ -115,7 +128,9 @@ class RFClass : public MLANN {
             scratch.ensure_corpus(n_corpus);
             std::vector<int> indices(n_train);
 
-#pragma omp for schedule(dynamic, 1)
+            // Release each worker's scratch as soon as its last tree finishes.
+            // The parallel-region barrier still waits for all trees.
+#pragma omp for schedule(dynamic, 1) nowait
             for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
                 labels_all[n_tree] = std::vector<std::vector<uint32_t>>(n_leaves);
                 votes_all[n_tree] = std::vector<std::vector<float>>(n_leaves);
@@ -271,6 +286,9 @@ class RFClass : public MLANN {
         auto& sampled_labels = scratch.sampled_labels;
         auto& touched_ids = scratch.touched_ids;
 
+        auto& label_counts = scratch.label_counts;
+        label_counts.clear();
+        label_counts.reserve(std::min(n_sampled_labels, static_cast<size_t>(n_corpus)));
         int n_labels = 0;
         for (int i = 0; i < n; ++i) {
             const uint32_t* knn_ptr = knn.row(ids[i]).data();
@@ -281,12 +299,33 @@ class RFClass : public MLANN {
                 if (dense_id == 0) {
                     dense_id = ++n_labels;
                     touched_ids.push_back(id);
+                    label_counts.push_back(0);
                 }
+                ++label_counts[dense_id - 1];
                 sampled_ptr[j] = static_cast<uint32_t>(dense_id - 1);
             }
         }
         for (const uint32_t id : touched_ids)
             votes[id] = 0;
+
+        // Singleton labels contribute t_tbl[1] == 0 for every candidate split.
+        // Keep the repeated labels in their original order and retain k_build
+        // for entropy normalization, including the omitted singleton labels.
+        n_labels = 0;
+        for (auto& count : label_counts)
+            count = count > 1 ? static_cast<size_t>(n_labels++) : SIZE_MAX;
+        scratch.sampled_offsets.resize(n + 1);
+        size_t kept = 0;
+        for (int row = 0; row < n; ++row) {
+            scratch.sampled_offsets[row] = kept;
+            for (int j = 0; j < k_build; ++j) {
+                const auto mapped =
+                    label_counts[sampled_labels[static_cast<size_t>(row) * k_build + j]];
+                if (mapped != SIZE_MAX)
+                    sampled_labels[kept++] = static_cast<uint32_t>(mapped);
+            }
+        }
+        scratch.sampled_offsets[n] = kept;
 
         const auto evaluate_dimensions = [&](auto& compact_votes) {
             for (uint32_t d : random_dims) {
@@ -307,8 +346,10 @@ class RFClass : public MLANN {
                 float entropy = 0.f;
                 for (int pos = 0; pos < n; ++pos) {
                     const uint32_t* knn_ptr =
-                        sampled_labels.data() + static_cast<size_t>(order[pos].index) * k_build;
-                    for (int j = 0; j < k_build; ++j) {
+                        sampled_labels.data() + scratch.sampled_offsets[order[pos].index];
+                    const size_t count = scratch.sampled_offsets[order[pos].index + 1] -
+                                         scratch.sampled_offsets[order[pos].index];
+                    for (size_t j = 0; j < count; ++j) {
                         const int gid = int(knn_ptr[j]);
                         const int v = ++compact_votes[gid];
                         entropy += t_tbl[v];
@@ -319,8 +360,10 @@ class RFClass : public MLANN {
                 const float base = left_ent[n - 1];
                 for (int pos = 0; pos < n - 1; ++pos) {
                     const uint32_t* knn_ptr =
-                        sampled_labels.data() + static_cast<size_t>(order[pos].index) * k_build;
-                    for (int j = 0; j < k_build; ++j) {
+                        sampled_labels.data() + scratch.sampled_offsets[order[pos].index];
+                    const size_t count = scratch.sampled_offsets[order[pos].index + 1] -
+                                         scratch.sampled_offsets[order[pos].index];
+                    for (size_t j = 0; j < count; ++j) {
                         const int gid = int(knn_ptr[j]);
                         const int v = --compact_votes[gid];
                         entropy -= t_tbl[v + 1];
@@ -345,8 +388,10 @@ class RFClass : public MLANN {
 
                 // Restore the compact vote counters for the next dimension.
                 const uint32_t* last_knn_ptr =
-                    sampled_labels.data() + static_cast<size_t>(order[n - 1].index) * k_build;
-                for (int j = 0; j < k_build; ++j)
+                    sampled_labels.data() + scratch.sampled_offsets[order[n - 1].index];
+                const size_t last_count = scratch.sampled_offsets[order[n - 1].index + 1] -
+                                          scratch.sampled_offsets[order[n - 1].index];
+                for (size_t j = 0; j < last_count; ++j)
                     --compact_votes[last_knn_ptr[j]];
             }
         };

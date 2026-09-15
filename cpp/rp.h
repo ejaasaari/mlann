@@ -17,9 +17,9 @@
 
 // Median-split forest with one Gaussian projection per tree level. Below
 // density 1, each coordinate is included independently with that probability.
-class RFRP : public MLANN {
+class RP : public MLANN {
   public:
-    RFRP(const float* corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
+    RP(const float* corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
     void grow(
         int n_trees_,
@@ -92,21 +92,45 @@ class RFRP : public MLANN {
 #pragma omp parallel
         {
             TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, depth);
-#pragma omp for schedule(dynamic, 1)
+            // Release each worker's scratch as soon as its last tree finishes.
+            // The parallel-region barrier still waits for all trees.
+#pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 labels_all[tree].resize(n_leaves);
                 if (!corpus_leaves)
                     votes_all[tree].resize(n_leaves);
                 std::iota(scratch.rows.begin(), scratch.rows.end(), 0);
-                // Retain Eigen's original projection arithmetic and matrix layout.
                 if (density < 1) {
+                    // Keep each sparse-projection level contiguous for selection.
                     scratch.projections.noalias() =
                         sparse_random_matrix.middleRows(tree * depth, depth) * train.transpose();
+                    grow_subtree(
+                        scratch.rows.begin(),
+                        scratch.rows.end(),
+                        0,
+                        0,
+                        tree,
+                        knn,
+                        scratch.projections,
+                        scratch
+                    );
                 } else {
-                    scratch.projections.noalias() =
+                    Eigen::Map<Eigen::MatrixXf> projections(
+                        scratch.projection_storage.data(), depth, n_train
+                    );
+                    projections.noalias() =
                         dense_random_matrix.middleRows(tree * depth, depth) * train.transpose();
+                    grow_subtree(
+                        scratch.rows.begin(),
+                        scratch.rows.end(),
+                        0,
+                        0,
+                        tree,
+                        knn,
+                        projections,
+                        scratch
+                    );
                 }
-                grow_subtree(scratch.rows.begin(), scratch.rows.end(), 0, 0, tree, knn, scratch);
             }
         }
         mlann_detail::promote_existing_corpus_pages(
@@ -176,18 +200,41 @@ class RFRP : public MLANN {
   private:
     using IndexIterator = std::vector<int>::iterator;
     static constexpr int routing_batch_size = 64;
+    static constexpr int cached_selection_min_size = 256;
     bool corpus_leaves = false;
     RowMatrix dense_random_matrix;
     Eigen::SparseMatrix<float, Eigen::RowMajor> sparse_random_matrix;
 
+    struct ProjectionRow {
+        float value;
+        int row;
+    };
+
     struct TreeScratch {
+        std::vector<ProjectionRow> keys;
         std::vector<int> rows;
         std::vector<int> votes;
         std::vector<uint32_t> touched_ids;
-        Eigen::MatrixXf projections;
+        // Partitioning repeatedly gathers projections by shuffled row ID. Use
+        // huge-page-backed scratch to reduce address-translation work on large
+        // training sets. Sparse products use contiguous rows; dense products
+        // use a column-major view of the same buffer to retain their arithmetic.
+        mlann_detail::HugeBuffer<float> projection_storage;
+        Eigen::Map<RowMatrix> projections;
 
         TreeScratch(int corpus_size, int train_size, int depth)
-            : rows(train_size), votes(corpus_size, 0), projections(depth, train_size) {}
+            : keys(train_size >= cached_selection_min_size ? train_size : 0), rows(train_size),
+              votes(corpus_size, 0),
+              projections(allocate_projections(depth, train_size), depth, train_size) {}
+
+        TreeScratch(const TreeScratch&) = delete;
+        TreeScratch& operator=(const TreeScratch&) = delete;
+
+      private:
+        float* allocate_projections(int depth, int train_size) {
+            projection_storage.resize(size_t(depth) * train_size);
+            return projection_storage.data();
+        }
     };
 
     void initialize_projections() {
@@ -250,12 +297,12 @@ class RFRP : public MLANN {
             scratch.votes[label] = 0;
             if (count >= b) {
                 labels.push_back(label);
-                // RP retains raw counts; RF's leaf-vote normalization does not apply.
                 votes.push_back(static_cast<float>(count));
             }
         }
     }
 
+    template <class ProjectionMatrix>
     void grow_subtree(
         IndexIterator begin,
         IndexIterator end,
@@ -263,6 +310,7 @@ class RFRP : public MLANN {
         int node,
         int tree,
         const Eigen::Ref<const UIntRowMatrix>& knn,
+        const ProjectionMatrix& projections,
         TreeScratch& scratch
     ) {
         if (level == depth) {
@@ -270,20 +318,43 @@ class RFRP : public MLANN {
             return;
         }
         const int count = end - begin;
-        const auto less = [&](int left, int right) {
-            return scratch.projections(level, left) < scratch.projections(level, right);
-        };
-        miniselect::pdqselect_branchless(begin, begin + count / 2, end, less);
         const auto mid = end - count / 2;
-        if (count % 2) {
-            split_points(node, tree) = scratch.projections(level, *(mid - 1));
+        if (count >= cached_selection_min_size) {
+            // Cache large nodes' comparison keys contiguously. This avoids
+            // repeatedly gathering projections through shuffled row IDs during
+            // selection; copying the resulting IDs back preserves leaf order.
+            auto first = scratch.keys.begin();
+            auto last = first + count;
+            for (int i = 0; i < count; ++i)
+                first[i] = {projections(level, begin[i]), begin[i]};
+            const auto less = [](const ProjectionRow& left, const ProjectionRow& right) {
+                return left.value < right.value;
+            };
+            miniselect::pdqselect_branchless(first, first + count / 2, last, less);
+            const auto mid_key = last - count / 2;
+            if (count % 2) {
+                split_points(node, tree) = (mid_key - 1)->value;
+            } else {
+                const auto left = std::max_element(first, mid_key, less);
+                split_points(node, tree) = (mid_key->value + left->value) / 2.0;
+            }
+            for (int i = 0; i < count; ++i)
+                begin[i] = first[i].row;
         } else {
-            const auto left = std::max_element(begin, mid, less);
-            split_points(node, tree) =
-                (scratch.projections(level, *mid) + scratch.projections(level, *left)) / 2.0;
+            const auto less = [&](int left, int right) {
+                return projections(level, left) < projections(level, right);
+            };
+            miniselect::pdqselect_branchless(begin, begin + count / 2, end, less);
+            if (count % 2) {
+                split_points(node, tree) = projections(level, *(mid - 1));
+            } else {
+                const auto left = std::max_element(begin, mid, less);
+                split_points(node, tree) =
+                    (projections(level, *mid) + projections(level, *left)) / 2.0;
+            }
         }
-        grow_subtree(begin, mid, level + 1, 2 * node + 1, tree, knn, scratch);
-        grow_subtree(mid, end, level + 1, 2 * node + 2, tree, knn, scratch);
+        grow_subtree(begin, mid, level + 1, 2 * node + 1, tree, knn, projections, scratch);
+        grow_subtree(mid, end, level + 1, 2 * node + 2, tree, knn, projections, scratch);
     }
 
     void route_batch(const float* projected, int first, int count, int* leaves) const {

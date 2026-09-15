@@ -15,9 +15,9 @@
 
 // Randomized k-d forest: choose uniformly among the top_variance_dims highest-variance
 // coordinates at each node, then split at the median.
-class RFKD : public MLANN {
+class KD : public MLANN {
   public:
-    RFKD(const float* corpus_, int n_corpus_, int dim_, int top_variance_dims_ = 5)
+    KD(const float* corpus_, int n_corpus_, int dim_, int top_variance_dims_ = 5)
         : MLANN(corpus_, n_corpus_, dim_) {
         configure(top_variance_dims_);
     }
@@ -94,7 +94,9 @@ class RFKD : public MLANN {
 #pragma omp parallel
         {
             TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, dim);
-#pragma omp for schedule(dynamic, 1)
+            // Release each worker's scratch as soon as its last tree finishes.
+            // The parallel-region barrier still waits for all trees.
+#pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 labels_all[tree].resize(n_leaves);
                 if (!corpus_leaves)

@@ -63,19 +63,19 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
   self->dim = dim;
 
   if (strcmp(index_type, "RP") == 0)
-    self->index = new RFRP(data, n, dim);
+    self->index = new RP(data, n, dim);
   else if (strcmp(index_type, "CRAFTML") == 0 || strcmp(index_type, "CraftML") == 0)
     self->index = new CraftML(data, n, dim);
   else if (strcmp(index_type, "KD") == 0)
-    self->index = new RFKD(data, n, dim);
+    self->index = new KD(data, n, dim);
   else if (strcmp(index_type, "PCA") == 0)
-    self->index = new RFPCA(data, n, dim);
+    self->index = new PCA(data, n, dim);
   else if (strcmp(index_type, "PCAFull") == 0)
     self->index = new PCAFull(data, n, dim);
   else if (strcmp(index_type, "PLS") == 0)
     self->index = new PLS(data, n, dim);
   else
-    self->index = new RFClass(data, n, dim);
+    self->index = new RF(data, n, dim);
 
   return 0;
 }
@@ -89,11 +89,12 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
 
   int n_trees, depth, b;
   int top_variance_dims = 5;
+  int n_subsample = 200;
   float density;
 
-  if (!PyArg_ParseTuple(args, "O!iiO!iiiifi|i", &PyArray_Type, &train_data, &n_train, &dim_train,
+  if (!PyArg_ParseTuple(args, "O!iiO!iiiifi|ii", &PyArray_Type, &train_data, &n_train, &dim_train,
                         &PyArray_Type, &knn_data, &n_knn, &dim_knn, &n_trees, &depth, &density, &b,
-                        &top_variance_dims))
+                        &top_variance_dims, &n_subsample))
     return NULL;
 
   Eigen::Map<const UIntRowMatrix> knn(reinterpret_cast<uint32_t *>(PyArray_DATA(knn_data)), n_knn,
@@ -103,7 +104,8 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
 
   PyThreadState *_save = PyEval_SaveThread();
   try {
-    if (auto *kd = dynamic_cast<RFKD *>(self->index)) kd->configure(top_variance_dims);
+    if (auto *kd = dynamic_cast<KD *>(self->index)) kd->configure(top_variance_dims);
+    if (auto *rf = dynamic_cast<RF *>(self->index)) rf->configure(n_subsample);
     self->index->grow(n_trees, depth, knn, train, density, b);
     PyEval_RestoreThread(_save);
   } catch (const std::exception &e) {
@@ -122,7 +124,7 @@ static PyObject *build_unsupervised(mlannIndex *self, PyObject *args) {
 
   PyThreadState *_save = PyEval_SaveThread();
   try {
-    if (auto *kd = dynamic_cast<RFKD *>(self->index)) kd->configure(top_variance_dims);
+    if (auto *kd = dynamic_cast<KD *>(self->index)) kd->configure(top_variance_dims);
     self->index->grow_unsupervised(n_trees, depth, density);
     PyEval_RestoreThread(_save);
   } catch (const std::exception &e) {

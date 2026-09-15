@@ -110,8 +110,10 @@ class CraftML : public MLANN {
 #endif
         {
             BuildScratch scratch(n_corpus, train.rows(), options.max_depth);
+            // Release each worker's scratch as soon as its last tree finishes.
+            // The parallel-region barrier still waits for all trees.
 #ifdef _OPENMP
-#pragma omp for schedule(dynamic, 1)
+#pragma omp for schedule(dynamic, 1) nowait
 #endif
             for (int t = 0; t < options.n_trees; ++t) {
                 try {

@@ -131,9 +131,9 @@ inline Eigen::VectorXf principal_direction(
 
 // Median-split PCA forest. Sparse PCA samples coordinates with replacement;
 // PCAFull fits on at most 300 rows and uses every coordinate.
-class RFPCA : public MLANN {
+class PCA : public MLANN {
   public:
-    RFPCA(const float* corpus_, int n_corpus_, int dim_) : RFPCA(corpus_, n_corpus_, dim_, false) {}
+    PCA(const float* corpus_, int n_corpus_, int dim_) : PCA(corpus_, n_corpus_, dim_, false) {}
 
     void grow(
         int n_trees_,
@@ -210,7 +210,9 @@ class RFPCA : public MLANN {
 #pragma omp parallel
         {
             TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train);
-#pragma omp for schedule(dynamic, 1)
+            // Release each worker's scratch as soon as its last tree finishes.
+            // The parallel-region barrier still waits for all trees.
+#pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 try {
                     labels_all[tree].resize(n_leaves);
@@ -307,7 +309,7 @@ class RFPCA : public MLANN {
     }
 
   protected:
-    RFPCA(const float* corpus_, int n_corpus_, int dim_, bool full_dimensions_)
+    PCA(const float* corpus_, int n_corpus_, int dim_, bool full_dimensions_)
         : MLANN(corpus_, n_corpus_, dim_), full_dimensions(full_dimensions_) {}
 
   private:
@@ -509,8 +511,7 @@ class RFPCA : public MLANN {
     }
 };
 
-class PCAFull : public RFPCA {
+class PCAFull : public PCA {
   public:
-    PCAFull(const float* corpus_, int n_corpus_, int dim_)
-        : RFPCA(corpus_, n_corpus_, dim_, true) {}
+    PCAFull(const float* corpus_, int n_corpus_, int dim_) : PCA(corpus_, n_corpus_, dim_, true) {}
 };

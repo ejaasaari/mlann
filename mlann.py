@@ -48,7 +48,7 @@ class MLANNIndex(object):
 
     def build(
         self, train=None, knn=None, n_trees=None, depth=None, density="auto", b=1,
-        top_variance_dims=5, unsupervised=False, *, branching_factor=10,
+        top_variance_dims=5, unsupervised=False, *, n_subsample=200, branching_factor=10,
         leaf_size=32, label_dim=128, feature_dim=0, iterations=2,
         node_sample_size=1000, seed=42, dist=L2,
     ):
@@ -64,10 +64,19 @@ class MLANNIndex(object):
         :param top_variance_dims: Number of highest-variance dimensions KD chooses among
                                   at each node, capped at dim; positive integer, default 5.
                                   KD ignores density.
+        :param n_subsample: RF split-scoring sample size per node; non-negative integer,
+                            default 200. Use 0 for all node rows. Leaf votes use all rows.
         :return:
         """
         if self.built:
             raise RuntimeError("The index has already been built")
+
+        if self.index_type == "RF":
+            if (not isinstance(n_subsample, (int, np.integer))
+                    or isinstance(n_subsample, (bool, np.bool_)) or n_subsample < 0):
+                raise ValueError("n_subsample must be a non-negative integer; 0 uses all node rows")
+        elif n_subsample != 200:
+            raise ValueError("n_subsample is only supported by RF")
 
         if self.index_type == "CRAFTML":
             if unsupervised:
@@ -126,6 +135,7 @@ class MLANNIndex(object):
             density,
             b,
             top_variance_dims,
+            n_subsample,
         )
         self.built = True
 

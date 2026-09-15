@@ -354,7 +354,8 @@ inline RowMatrix neighbor_means(
 #pragma omp parallel
     {
         Eigen::RowVectorXf sum(corpus.cols());
-#pragma omp for schedule(static)
+        // Release worker-local storage before the parallel-region barrier.
+#pragma omp for schedule(static) nowait
         for (int i = 0; i < labels.rows(); ++i) {
             sum.setZero();
             for (int j = 0; j < labels.cols(); ++j) {
@@ -509,7 +510,9 @@ class PLS : public MLANN {
 #pragma omp parallel
         {
             TreeScratch scratch(n_corpus);
-#pragma omp for schedule(dynamic, 1)
+            // Release each worker's scratch as soon as its last tree finishes.
+            // The parallel-region barrier still waits for all trees.
+#pragma omp for schedule(dynamic, 1) nowait
             for (int t = 0; t < n_trees_; ++t) {
                 std::vector<int> rows(train.rows());
                 std::iota(rows.begin(), rows.end(), 0);
@@ -683,7 +686,8 @@ class PLS : public MLANN {
 #pragma omp parallel reduction(| : duplicates)
         {
             std::vector<uint32_t> ids(knn.cols());
-#pragma omp for schedule(static)
+            // Release worker-local storage before the parallel-region barrier.
+#pragma omp for schedule(static) nowait
             for (int i = 0; i < knn.rows(); ++i) {
                 std::copy_n(knn.row(i).data(), knn.cols(), ids.begin());
                 miniselect::pdqsort_branchless(ids.begin(), ids.end());
