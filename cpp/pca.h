@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <exception>
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -13,6 +15,101 @@
 #include "detail/huge-buffer.h"
 #include "detail/neighbor-query.h"
 #include "mlann.h"
+
+namespace pca_detail {
+
+struct FitStats {
+  int iterations = 0;
+  bool fallback = false;
+};
+
+// Solve in the smaller of feature space and sample space. Double precision keeps
+// the fallback accurate when the leading eigenvalues are close together.
+inline Eigen::VectorXf direct_direction(const Eigen::MatrixXf &centered) {
+  const Eigen::MatrixXd points = centered.cast<double>();
+  const bool dual = points.cols() < points.rows();
+  Eigen::MatrixXd covariance;
+  if (dual) {
+    covariance.noalias() = points.transpose() * points;
+  } else {
+    covariance.noalias() = points * points.transpose();
+  }
+
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(covariance);
+  if (solver.info() != Eigen::Success) {
+    throw std::runtime_error("PCA eigensolver failed");
+  }
+
+  Eigen::VectorXd direction = solver.eigenvectors().rightCols(1);
+  if (dual) direction = (points * direction).eval();
+  const double norm = direction.stableNorm();
+  if (!direction.allFinite() || !(norm > 0)) {
+    throw std::runtime_error("PCA eigensolver returned an invalid direction");
+  }
+  return (direction / norm).cast<float>();
+}
+
+// Points are columns. Scale before iteration so convergence does not depend on
+// input units; compute the mean in double precision before converting back.
+inline Eigen::VectorXf principal_direction(const Eigen::Ref<const Eigen::MatrixXf> &points,
+                                           Eigen::VectorXf initial, bool matrix_free,
+                                           FitStats *stats = nullptr) {
+  if (stats) *stats = {};
+  if (points.rows() == 0 || points.cols() < 2 || !points.allFinite()) {
+    throw std::invalid_argument("PCA requires finite points and at least two samples");
+  }
+  if (initial.size() != points.rows() || !initial.allFinite() || initial.stableNorm() == 0) {
+    initial = Eigen::VectorXf::Ones(points.rows());
+  }
+  initial /= initial.cwiseAbs().maxCoeff();
+  initial /= initial.norm();
+
+  const Eigen::VectorXd mean = points.cast<double>().rowwise().mean();
+  double scale = 0;
+  for (Eigen::Index i = 0; i < points.cols(); ++i) {
+    scale = std::max(scale, (points.col(i).cast<double>() - mean).cwiseAbs().maxCoeff());
+  }
+  if (scale == 0) return initial;  // Every direction is valid for constant data.
+
+  Eigen::MatrixXf centered(points.rows(), points.cols());
+  for (Eigen::Index i = 0; i < points.cols(); ++i) {
+    centered.col(i) = ((points.col(i).cast<double>() - mean) / scale).cast<float>();
+  }
+  centered /= centered.norm();
+
+  if (!matrix_free) return direct_direction(centered);
+
+  constexpr int max_iterations = 100;
+  constexpr float tolerance = 1e-5f;
+  const double half_trace = 0.5 * centered.cast<double>().squaredNorm();
+  Eigen::VectorXf direction = initial;
+  Eigen::VectorXf projected(points.cols());
+  Eigen::VectorXf product(points.rows());
+  for (int iteration = 0; iteration < max_iterations; ++iteration) {
+    projected.noalias() = centered.transpose() * direction;
+    product.noalias() = centered * projected;
+    if (stats) ++stats->iterations;
+
+    const float eigenvalue = direction.dot(product);
+    const float product_norm = product.norm();
+    if (!product.allFinite() || !(eigenvalue > 0) || !(product_norm > 0)) break;
+
+    const float residual = (product - eigenvalue * direction).norm();
+    if (residual <= tolerance * eigenvalue) {
+      // A small residual alone can also identify a non-leading eigenvector.
+      // For a positive semidefinite matrix, an eigenvalue above half its trace
+      // must be the largest. Otherwise verify the leading direction directly.
+      if (eigenvalue - residual > half_trace) return direction;
+      break;
+    }
+    direction = product / product_norm;
+  }
+
+  if (stats) stats->fallback = true;
+  return direct_direction(centered);
+}
+
+}  // namespace pca_detail
 
 // Median-split PCA forest. Sparse PCA samples coordinates with replacement;
 // PCAFull fits on at most 300 rows and uses every coordinate.
@@ -45,8 +142,8 @@ class RFPCA : public MLANN {
       throw std::out_of_range(
           "The depth must belong to the set {1, ... , min(log2(n_train), 29)}.");
     }
-    if (dim <= 0 || n_corpus <= 0 || train.cols() != dim || b_ < 1 ||
-        (unsupervised && !train.allFinite()) ||
+    if (dim <= 0 || n_corpus <= 0 || train.cols() != dim || b_ < 1 || !train.allFinite() ||
+        !corpus.allFinite() ||
         (!unsupervised &&
          (knn.rows() != n_train || knn.cols() < 1 || knn.maxCoeff() >= uint32_t(n_corpus)))) {
       throw std::invalid_argument("Invalid forest data or dimensions.");
@@ -74,22 +171,39 @@ class RFPCA : public MLANN {
     if (!full_dimensions) projection_dims.resize(node_count, support);
     labels_all.resize(n_trees);
     if (!corpus_leaves) votes_all.resize(n_trees);
+    std::exception_ptr error;
 
 #pragma omp parallel
     {
       TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train);
 #pragma omp for schedule(dynamic, 1)
       for (int tree = 0; tree < n_trees; ++tree) {
-        labels_all[tree].resize(n_leaves);
-        if (!corpus_leaves) votes_all[tree].resize(n_leaves);
-        std::iota(scratch.rows.begin(), scratch.rows.end(), 0);
+        try {
+          labels_all[tree].resize(n_leaves);
+          if (!corpus_leaves) votes_all[tree].resize(n_leaves);
+          std::iota(scratch.rows.begin(), scratch.rows.end(), 0);
 
-        std::random_device rd;
-        std::minstd_rand generator(rd());
-        initialize_projections(tree, generator);
-        grow_subtree(scratch.rows.begin(), scratch.rows.end(), 0, 0, tree, knn, train, generator,
-                     scratch);
+          std::random_device rd;
+          std::minstd_rand generator(rd());
+          initialize_projections(tree, generator);
+          grow_subtree(scratch.rows.begin(), scratch.rows.end(), 0, 0, tree, knn, train, generator,
+                       scratch);
+        } catch (...) {
+#pragma omp critical(pca_build_error)
+          {
+            if (!error) error = std::current_exception();
+          }
+        }
       }
+    }
+    if (error) {
+      n_trees = 0;
+      labels_all.clear();
+      votes_all.clear();
+      projections.resize(0, 0);
+      projection_dims.resize(0, 0);
+      split_points.resize(0, 0);
+      std::rethrow_exception(error);
     }
     mlann_detail::promote_existing_corpus_pages(corpus.data(),
                                                 size_t(corpus.size()) * sizeof(float));
@@ -145,13 +259,11 @@ class RFPCA : public MLANN {
     std::vector<uint32_t> touched_ids;
     std::vector<int> sampled_rows;
     std::vector<float> row_scores;
-    Eigen::MatrixXf points, fit, centered, covariance;
-    Eigen::VectorXf direction, last, projected, scores;
+    Eigen::MatrixXf fit;
 
     TreeScratch(int corpus_size, int train_size)
         : rows(train_size), votes(corpus_size, 0), row_scores(train_size) {
       sampled_rows.reserve(fit_sample);
-      scores.resize(train_size);
     }
   };
 
@@ -194,47 +306,38 @@ class RFPCA : public MLANN {
       for (auto it = begin; it != end; ++it) scratch.row_scores[*it] = 0.f;
       return;
     }
-    auto &direction = scratch.direction;
-    direction = projections.row(row).transpose();
-    direction /= direction.norm();
-    gather_points(begin, count, row, train, scratch.points);
-
-    const float *fit_data = scratch.points.data();
     int fit_count = count;
     if (full_dimensions && count > fit_sample) {
       scratch.sampled_rows.clear();
       std::sample(begin, end, std::back_inserter(scratch.sampled_rows), fit_sample, generator);
-      gather_points(scratch.sampled_rows.begin(), fit_sample, row, train, scratch.fit);
-      fit_data = scratch.fit.data();
       fit_count = fit_sample;
+      gather_points(scratch.sampled_rows.begin(), fit_count, row, train, scratch.fit);
+    } else {
+      gather_points(begin, fit_count, row, train, scratch.fit);
     }
-    const Eigen::Map<const Eigen::MatrixXf> fit(fit_data, support, fit_count);
-    const float scale = 1. / (fit_count - 1);
-    if (scratch.centered.rows() != support || scratch.centered.cols() < fit_count) {
-      scratch.centered.resize(support, fit_count);
-    }
-    Eigen::Map<Eigen::MatrixXf> centered(scratch.centered.data(), support, fit_count);
-    centered = fit.colwise() - fit.rowwise().mean();
-    if (!full_dimensions) {
-      scratch.covariance = 2 * 0.01 * scale * (centered * centered.transpose());
-    }
-    direction /= direction.norm();
-    for (int iteration = 0; iteration < 20; ++iteration) {
-      scratch.last = direction;
-      if (full_dimensions) {
-        if (scratch.projected.size() < fit_count) scratch.projected.resize(fit_count);
-        auto projected = scratch.projected.head(fit_count);
-        projected = centered.transpose() * direction;
-        direction += (0.02f * scale) * (centered * projected);
-      } else {
-        direction += scratch.covariance * direction;
-      }
-      direction /= direction.norm();
-      if ((direction - scratch.last).cwiseAbs().mean() < 0.01) break;
-    }
-    scratch.scores.head(count) = direction.transpose() * scratch.points.leftCols(count);
+
+    const auto points = scratch.fit.leftCols(fit_count);
+    const Eigen::VectorXf direction =
+        pca_detail::principal_direction(points, projections.row(row).transpose(), full_dimensions);
     projections.row(row) = direction.transpose();
-    for (int i = 0; i < count; ++i) scratch.row_scores[begin[i]] = scratch.scores[i];
+
+    // Route the complete node without gathering another feature matrix. Use the
+    // same arithmetic as query routing, including repeated sparse coordinates.
+    for (auto it = begin; it != end; ++it) {
+      scratch.row_scores[*it] = project(train.row(*it).data(), row);
+    }
+  }
+
+  float project(const float *point, Eigen::Index row) const {
+    float score = 0.f;
+    if (full_dimensions) {
+      for (int j = 0; j < support; ++j) score += point[j] * projections(row, j);
+    } else {
+      for (int j = 0; j < support; ++j) {
+        score += point[projection_dims(row, j)] * projections(row, j);
+      }
+    }
+    return score;
   }
 
   void make_leaf(IndexIterator begin, IndexIterator end, int tree, int leaf,
@@ -297,14 +400,7 @@ class RFPCA : public MLANN {
     for (int level = 0; level < depth; ++level) {
       for (int t = 0; t < count; ++t) {
         const auto row = projection_row(first + t, nodes[t]);
-        float score = 0.f;
-        // Keep the sparse projection's accumulation order, including repeated coordinates.
-        if (full_dimensions) {
-          for (int j = 0; j < support; ++j) score += query[j] * projections(row, j);
-        } else {
-          for (int j = 0; j < support; ++j)
-            score += query[projection_dims(row, j)] * projections(row, j);
-        }
+        const float score = project(query, row);
         nodes[t] = 2 * nodes[t] + (score <= split_points(nodes[t], first + t) ? 1 : 2);
       }
     }

@@ -10,6 +10,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "detail/huge-buffer.h"
@@ -47,53 +48,22 @@ struct LeadingEigenStats {
   bool fallback = false;
 };
 
-// Compute only the largest eigenpair: Householder tridiagonalization, Sturm
-// bisection, then inverse iteration. Never form the dense Householder Q or a
-// complete eigenvector basis. Small problems and failed checks use Eigen's
-// original solver. No random probes or fixed-budget approximate directions.
-inline Eigen::VectorXf leading_bisect(const Eigen::MatrixXf &matrix,
-                                      LeadingEigenStats *stats = nullptr) {
-  if (stats) {
-    *stats = {};
-  }
-  const int n = matrix.rows();
-  if (n <= 8) {
-    return leading_dense(matrix);
-  }
-  const float scale = matrix.cwiseAbs().maxCoeff();
-  if (!(scale > 0)) {
-    return Eigen::VectorXf::Zero(n);
-  }
-  const Eigen::MatrixXf scaled = matrix / scale;
-  Eigen::Tridiagonalization<Eigen::MatrixXf> reduction(scaled);
-  Eigen::VectorXf diagonal = reduction.diagonal(), off_diagonal = reduction.subDiagonal();
-  // A diagonal sign change makes every off-diagonal nonnegative. Starting
-  // inverse iteration with positive entries then cannot be orthogonal to the
-  // leading eigenspace, including reducible / repeated-eigenvalue problems.
-  Eigen::VectorXf signs = Eigen::VectorXf::Ones(n);
-  for (int i = 1; i < n; ++i) {
-    signs[i] = off_diagonal[i - 1] < 0 ? -signs[i - 1] : signs[i - 1];
-  }
-  off_diagonal = off_diagonal.cwiseAbs();
-  float norm = 0;
-  for (int i = 0; i < n; ++i) {
-    norm = std::max(norm, std::abs(diagonal[i]) + (i ? off_diagonal[i - 1] : 0) +
-                              (i + 1 < n ? off_diagonal[i] : 0));
-  }
-  if (!(norm > 0)) {
-    return Eigen::VectorXf::Zero(n);
-  }
-  diagonal /= norm;
-  off_diagonal /= norm;
+// Bound the largest eigenvalue of a normalized symmetric tridiagonal matrix.
+inline float largest_eigenvalue_bound(const Eigen::VectorXf &diagonal,
+                                      const Eigen::VectorXf &off_diagonal) {
+  const int n = diagonal.size();
+
   constexpr float epsilon = std::numeric_limits<float>::epsilon();
   constexpr float pivot_min = 16 * std::numeric_limits<float>::min();
-  constexpr float tolerance = 2e-6f;
-  float lower = diagonal.maxCoeff(), upper = lower;
+
+  float lower = diagonal.maxCoeff();
+  float upper = lower;
   for (int i = 0; i < n; ++i) {
     upper = std::max(
         upper, diagonal[i] + (i ? off_diagonal[i - 1] : 0) + (i + 1 < n ? off_diagonal[i] : 0));
   }
   upper += 8 * epsilon;
+
   // Count eigenvalues below the trial shift using the signs of LDL' pivots.
   for (int step = 0; step < 64 && upper - lower > 8 * epsilon; ++step) {
     const float shift = lower + (upper - lower) / 2;
@@ -109,12 +79,65 @@ inline Eigen::VectorXf leading_bisect(const Eigen::MatrixXf &matrix,
       }
       below += pivot < 0;
     }
+
     if (below < n) {
       lower = shift;
     } else {
       upper = shift;
     }
   }
+  return upper;
+}
+
+// Compute only the largest eigenpair: Householder tridiagonalization, Sturm
+// bisection, then inverse iteration. Never form the dense Householder Q or a
+// complete eigenvector basis. Small problems and failed checks use Eigen's
+// original solver. No random probes or fixed-budget approximate directions.
+inline Eigen::VectorXf leading_bisect(const Eigen::MatrixXf &matrix,
+                                      LeadingEigenStats *stats = nullptr) {
+  if (stats) {
+    *stats = {};
+  }
+  const int n = matrix.rows();
+  if (n <= 8) {
+    return leading_dense(matrix);
+  }
+
+  const float scale = matrix.cwiseAbs().maxCoeff();
+  if (!(scale > 0)) {
+    return Eigen::VectorXf::Zero(n);
+  }
+
+  const Eigen::MatrixXf scaled = matrix / scale;
+  Eigen::Tridiagonalization<Eigen::MatrixXf> reduction(scaled);
+  Eigen::VectorXf diagonal = reduction.diagonal();
+  Eigen::VectorXf off_diagonal = reduction.subDiagonal();
+
+  // A diagonal sign change makes every off-diagonal nonnegative. Starting
+  // inverse iteration with positive entries then cannot be orthogonal to the
+  // leading eigenspace, including reducible / repeated-eigenvalue problems.
+  Eigen::VectorXf signs = Eigen::VectorXf::Ones(n);
+  for (int i = 1; i < n; ++i) {
+    signs[i] = off_diagonal[i - 1] < 0 ? -signs[i - 1] : signs[i - 1];
+  }
+
+  off_diagonal = off_diagonal.cwiseAbs();
+  float norm = 0;
+  for (int i = 0; i < n; ++i) {
+    norm = std::max(norm, std::abs(diagonal[i]) + (i ? off_diagonal[i - 1] : 0) +
+                              (i + 1 < n ? off_diagonal[i] : 0));
+  }
+  if (!(norm > 0)) {
+    return Eigen::VectorXf::Zero(n);
+  }
+
+  diagonal /= norm;
+  off_diagonal /= norm;
+
+  constexpr float epsilon = std::numeric_limits<float>::epsilon();
+  constexpr float tolerance = 2e-6f;
+  const float upper = largest_eigenvalue_bound(diagonal, off_diagonal);
+
   auto fallback = [&]() -> Eigen::VectorXf {
     if (stats) {
       stats->fallback = true;
@@ -125,9 +148,11 @@ inline Eigen::VectorXf leading_bisect(const Eigen::MatrixXf &matrix,
   if (upper <= 0) {
     return Eigen::VectorXf::Zero(n);
   }
+
   // Keep the shifted matrix positive definite, even after bisection rounding.
   const float shift = upper + 8 * epsilon;
-  Eigen::VectorXf pivots(n), factors(n - 1);
+  Eigen::VectorXf pivots(n);
+  Eigen::VectorXf factors(n - 1);
   pivots[0] = shift - diagonal[0];
   for (int i = 1; i < n; ++i) {
     if (!(pivots[i - 1] > 0)) {
@@ -139,11 +164,14 @@ inline Eigen::VectorXf leading_bisect(const Eigen::MatrixXf &matrix,
   if (!(pivots[n - 1] > 0)) {
     return fallback();
   }
-  Eigen::VectorXf direction = Eigen::VectorXf::Ones(n), product(n);
+
+  Eigen::VectorXf direction = Eigen::VectorXf::Ones(n);
+  Eigen::VectorXf product(n);
   for (int iteration = 0; iteration < 8; ++iteration) {
     if (stats) {
       ++stats->iterations;
     }
+
     for (int i = 1; i < n; ++i) {
       direction[i] -= factors[i - 1] * direction[i - 1];
     }
@@ -154,17 +182,20 @@ inline Eigen::VectorXf leading_bisect(const Eigen::MatrixXf &matrix,
     if (!direction.allFinite() || !(direction.norm() > 0)) {
       return fallback();
     }
+
     direction.normalize();
     product = diagonal.array() * direction.array();
     for (int i = 0; i + 1 < n; ++i) {
       product[i] += off_diagonal[i] * direction[i + 1];
       product[i + 1] += off_diagonal[i] * direction[i];
     }
+
     const float value = direction.dot(product);
     if (std::abs(upper - value) <= tolerance && (product - value * direction).norm() <= tolerance) {
       if (!(value > 0)) {
         return fallback();
       }
+
       Eigen::VectorXf result = reduction.matrixQ() * (signs.array() * direction.array()).matrix();
       result.normalize();
       const Eigen::VectorXf residual =
@@ -188,19 +219,25 @@ inline Eigen::VectorXf leading(const Eigen::MatrixXf &matrix, LeadingEigenStats 
   if (stats) {
     *stats = {};
   }
+
   const float scale = matrix.cwiseAbs().maxCoeff();
   if (!(scale > 0)) {
     return Eigen::VectorXf::Zero(n);
   }
+
   const Eigen::MatrixXf scaled_matrix = (matrix / scale).selfadjointView<Eigen::Lower>();
   const int limit = std::min(n, 48);
   Eigen::MatrixXf basis(n, limit);
-  Eigen::VectorXf diagonal(limit), off_diagonal(limit), direction(n);
+  Eigen::VectorXf diagonal(limit);
+  Eigen::VectorXf off_diagonal(limit);
+  Eigen::VectorXf direction(n);
+
   std::minstd_rand generator(193U + n);
   for (int i = 0; i < n; ++i) {
     direction[i] = std::uniform_real_distribution<float>(-1, 1)(generator);
   }
   direction.normalize();
+
   const float tolerance = 1e-6f * scaled_matrix.norm();
   for (int j = 0; j < limit; ++j) {
     basis.col(j) = direction;
@@ -210,10 +247,12 @@ inline Eigen::VectorXf leading(const Eigen::MatrixXf &matrix, LeadingEigenStats 
     if (j) {
       residual -= off_diagonal[j - 1] * basis.col(j - 1);
     }
+
     for (int pass = 0; pass < 2; ++pass) {
       const Eigen::VectorXf coefficients = basis.leftCols(j + 1).transpose() * residual;
       residual.noalias() -= basis.leftCols(j + 1) * coefficients;
     }
+
     off_diagonal[j] = residual.norm();
     const bool breakdown = off_diagonal[j] <= 32 * std::numeric_limits<float>::epsilon();
     if ((j + 1) % 8 == 0 || breakdown || j + 1 == limit) {
@@ -222,6 +261,7 @@ inline Eigen::VectorXf leading(const Eigen::MatrixXf &matrix, LeadingEigenStats 
       if (ritz.info() != Eigen::Success) {
         break;
       }
+
       const float value = ritz.eigenvalues()[j];
       Eigen::VectorXf result = basis.leftCols(j + 1) * ritz.eigenvectors().col(j);
       result.normalize();
@@ -235,8 +275,10 @@ inline Eigen::VectorXf leading(const Eigen::MatrixXf &matrix, LeadingEigenStats 
         break;
       }
     }
+
     direction = residual / off_diagonal[j];
   }
+
   Eigen::VectorXf result = leading_bisect(matrix, stats);
   if (stats) {
     stats->fallback = true;
@@ -275,6 +317,7 @@ struct QueryBasis {
   }
 
   const Matrix &get(const Matrix &queries) const { return reduced ? coordinates : queries; }
+
   Eigen::VectorXf expand(const Eigen::VectorXf &direction) const {
     Eigen::VectorXf result;
     if (!reduced) {
@@ -359,10 +402,13 @@ inline Split threshold(const Sample &sample, const Eigen::VectorXf &projection,
   miniselect::pdqsort_branchless(order.begin(), order.end(), [&](int i, int j) {
     return projection[i] < projection[j] || (projection[i] == projection[j] && i < j);
   });
-  float left_entropy = 0, right_entropy = 0;
+
+  float left_entropy = 0;
+  float right_entropy = 0;
   for (int c : sample.counts) {
     right_entropy += tables.label[c];
   }
+
   const float parent = tables.mass[sample.n()] - right_entropy;
   Split best;
   for (int split_index = 0; split_index + 1 < sample.n(); ++split_index) {
@@ -371,10 +417,13 @@ inline Split threshold(const Sample &sample, const Eigen::VectorXf &projection,
       left_entropy += tables.delta[++left[label]];
       right_entropy -= tables.delta[right[label]--];
     }
-    const float lower = projection[order[split_index]], upper = projection[order[split_index + 1]];
+
+    const float lower = projection[order[split_index]];
+    const float upper = projection[order[split_index + 1]];
     if (!(lower < upper)) {
       continue;
     }
+
     const float loss = tables.mass[split_index + 1] + tables.mass[sample.n() - split_index - 1] -
                        left_entropy - right_entropy;
     if (loss < best.loss) {
@@ -416,39 +465,19 @@ class PLS : public MLANN {
 
   void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn,
             const Eigen::Ref<const RowMatrix> &train, float density_ = -1, int b_ = 1) override {
-    if (!empty()) {
-      throw std::logic_error("Index already grown");
-    }
-    if (dim < 1 || n_corpus < 1 || n_trees_ <= 0 || train.rows() < 2 || depth_ < 1 || depth_ > 29 ||
-        depth_ > std::log2(train.rows()) || b_ < 1 || knn.cols() < 1 ||
-        knn.rows() != train.rows() || train.cols() != dim || !train.allFinite() ||
-        !corpus.allFinite() || knn.maxCoeff() >= uint32_t(n_corpus)) {
-      throw std::invalid_argument("Invalid forest data or dimensions");
-    }
-    // Reuse one sorting buffer per worker instead of allocating for every row.
-    int duplicates = 0;
-#pragma omp parallel reduction(| : duplicates)
-    {
-      std::vector<uint32_t> ids(knn.cols());
-#pragma omp for schedule(static)
-      for (int i = 0; i < knn.rows(); ++i) {
-        std::copy_n(knn.row(i).data(), knn.cols(), ids.begin());
-        miniselect::pdqsort_branchless(ids.begin(), ids.end());
-        duplicates |= std::adjacent_find(ids.begin(), ids.end()) != ids.end();
-      }
-    }
-    if (duplicates) {
-      throw std::invalid_argument("Neighbor IDs must be distinct within each row");
-    }
+    validate_training(n_trees_, depth_, knn, train, b_);
+
     // Accepted for compatibility with MLANN::grow; PLS uses every feature.
     (void)density_;
     n_trees = n_trees_;
     depth = depth_;
     b = b_;
+
     forests_.resize(n_trees_);
     leaves_.resize(n_trees_);
     std::vector<std::vector<float>> tree_projections(n_trees_);
     const pls_detail::PALTables tables(std::min<int>(options_.sample, train.rows()), knn.cols());
+
     // Compute neighbor means once and release them after fitting the forest.
     RowMatrix targets = pls_detail::neighbor_means(corpus, knn);
 #pragma omp parallel
@@ -467,6 +496,7 @@ class PLS : public MLANN {
         tree_projections[t] = std::move(scratch.projections);
       }
     }
+
     targets.resize(0, 0);
     pack_projections(tree_projections);
     mlann_detail::promote_existing_corpus_pages(corpus.data(),
@@ -480,6 +510,7 @@ class PLS : public MLANN {
     votes_total.resize(n_corpus);
     std::fill_n(votes_total.data(), n_corpus, 0.f);
     elected.clear();
+
     std::array<int, routing_batch_size> leaves;
     for (int first = 0; first < n_trees; first += routing_batch_size) {
       const int count = std::min(routing_batch_size, n_trees - first);
@@ -490,6 +521,7 @@ class PLS : public MLANN {
                                                 vote_threshold, elected);
       }
     }
+
     if (out_n_elected) {
       *out_n_elected = elected.size();
     }
@@ -517,7 +549,8 @@ class PLS : public MLANN {
   static constexpr int routing_batch_size = 64;
 
   void route_batch(const float *query, int first, int count, int *leaves) const {
-    std::array<int, routing_batch_size> nodes{}, active;
+    std::array<int, routing_batch_size> nodes{};
+    std::array<int, routing_batch_size> active;
     std::array<uint32_t, routing_batch_size> rows;
     std::array<float, routing_batch_size> scores;
     int remaining = 0;
@@ -526,14 +559,17 @@ class PLS : public MLANN {
         active[remaining++] = t;
       }
     }
+
     while (remaining) {
       for (int i = 0; i < remaining; ++i) {
         const int t = active[i];
         rows[i] = forests_[first + t][nodes[t]].projection;
       }
+
       mlann_detail::compute_neighbor_one_to_many(query, projections_.data(), dim, rows.data(),
                                                  remaining, mlann_detail::OneToManyMetric::IP,
                                                  scores.data());
+
       int next = 0;
       for (int i = 0; i < remaining; ++i) {
         const int t = active[i];
@@ -545,6 +581,7 @@ class PLS : public MLANN {
       }
       remaining = next;
     }
+
     for (int t = 0; t < count; ++t) {
       leaves[t] = forests_[first + t][nodes[t]].leaf;
     }
@@ -556,6 +593,7 @@ class PLS : public MLANN {
   struct TreeScratch {
     std::vector<int> label_map;
     std::vector<uint32_t> touched_ids;
+
     std::minstd_rand generator;
     std::vector<float> projections;
     pls_detail::ThresholdScratch threshold_scratch;
@@ -570,6 +608,36 @@ class PLS : public MLANN {
     }
   };
 
+  void validate_training(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn,
+                         const Eigen::Ref<const RowMatrix> &train, int b_) const {
+    if (!empty()) {
+      throw std::logic_error("Index already grown");
+    }
+    if (dim < 1 || n_corpus < 1 || n_trees_ <= 0 || train.rows() < 2 || depth_ < 1 || depth_ > 29 ||
+        depth_ > std::log2(train.rows()) || b_ < 1 || knn.cols() < 1 ||
+        knn.rows() != train.rows() || train.cols() != dim || !train.allFinite() ||
+        !corpus.allFinite() || knn.maxCoeff() >= uint32_t(n_corpus)) {
+      throw std::invalid_argument("Invalid forest data or dimensions");
+    }
+
+    // Reuse one sorting buffer per worker instead of allocating for every row.
+    int duplicates = 0;
+#pragma omp parallel reduction(| : duplicates)
+    {
+      std::vector<uint32_t> ids(knn.cols());
+#pragma omp for schedule(static)
+      for (int i = 0; i < knn.rows(); ++i) {
+        std::copy_n(knn.row(i).data(), knn.cols(), ids.begin());
+        miniselect::pdqsort_branchless(ids.begin(), ids.end());
+        duplicates |= std::adjacent_find(ids.begin(), ids.end()) != ids.end();
+      }
+    }
+
+    if (duplicates) {
+      throw std::invalid_argument("Neighbor IDs must be distinct within each row");
+    }
+  }
+
   void pack_projections(std::vector<std::vector<float>> &trees) {
     size_t rows = 0;
     for (const auto &values : trees) {
@@ -578,6 +646,7 @@ class PLS : public MLANN {
     if (rows > std::numeric_limits<uint32_t>::max()) {
       throw std::length_error("Too many oblique projections");
     }
+
     projections_.resize(rows, dim);
     size_t offset = 0;
     for (int t = 0; t < n_trees; ++t) {
@@ -610,6 +679,7 @@ class PLS : public MLANN {
     node.leaf = leaves_[tree].size();
     leaves_[tree].emplace_back();
     auto &output = leaves_[tree].back();
+
     scratch.touched_ids.reserve(std::min<size_t>(n_corpus, size_t(end - begin) * knn.cols()));
     for (auto it = begin; it != end; ++it) {
       for (int j = 0; j < knn.cols(); ++j) {
@@ -619,6 +689,7 @@ class PLS : public MLANN {
         }
       }
     }
+
     output.labels.reserve(scratch.touched_ids.size());
     output.votes.reserve(scratch.touched_ids.size());
     uint64_t total = 0;
@@ -629,36 +700,28 @@ class PLS : public MLANN {
         total += scratch.label_map[id];
       }
     }
+
     if (total) {
       const float normalization = 1.f / (float(total) * float(n_trees));
       for (auto &v : output.votes) {
         v *= normalization;
       }
     }
+
     scratch.reset();
   }
 
-  int grow_subtree(IndexIterator begin, IndexIterator end, int level, int tree,
-                   const Eigen::Ref<const RowMatrix> &train,
-                   const Eigen::Ref<const UIntRowMatrix> &knn, const RowMatrix &targets,
-                   const pls_detail::PALTables &tables, TreeScratch &scratch) {
-    using namespace pls_detail;
-    const int index = forests_[tree].size();
-    forests_[tree].emplace_back();
-    Node node;
-    const int count = end - begin;
-    if (level == depth || count < 2) {
-      make_leaf(node, tree, begin, end, knn, scratch);
-      forests_[tree][index] = node;
-      return index;
-    }
-    const int n_sampled = std::min(options_.sample, count);
-    const auto sampled_rows = mlann_detail::sample(count, n_sampled, scratch.generator);
-    Sample sampled_queries;
+  pls_detail::Sample sample_queries(IndexIterator begin, const std::vector<int> &sampled_rows,
+                                    const Eigen::Ref<const RowMatrix> &train,
+                                    const Eigen::Ref<const UIntRowMatrix> &knn,
+                                    TreeScratch &scratch) const {
+    const int n_sampled = sampled_rows.size();
+    pls_detail::Sample sampled_queries;
     sampled_queries.k = knn.cols();
     sampled_queries.x.resize(n_sampled, dim);
     sampled_queries.labels.resize(size_t(n_sampled) * sampled_queries.k);
     sampled_queries.counts.reserve(std::min<size_t>(n_corpus, sampled_queries.labels.size()));
+
     for (int i = 0; i < n_sampled; ++i) {
       const int row = begin[sampled_rows[i]];
       sampled_queries.x.row(i) = train.row(row);
@@ -674,37 +737,85 @@ class PLS : public MLANN {
         ++sampled_queries.counts[compact_label];
       }
     }
+
     scratch.reset();
     sampled_queries.x.rowwise() -= sampled_queries.x.colwise().mean().eval();
-    Matrix neighbor_targets(n_sampled, dim);
+    return sampled_queries;
+  }
+
+  struct FittedSplit {
+    Eigen::VectorXf normal;
+    pls_detail::Split split;
+  };
+
+  FittedSplit fit_split(IndexIterator begin, IndexIterator end,
+                        const Eigen::Ref<const RowMatrix> &train,
+                        const Eigen::Ref<const UIntRowMatrix> &knn, const RowMatrix &targets,
+                        const pls_detail::PALTables &tables, TreeScratch &scratch) const {
+    const int count = end - begin;
+    const int n_sampled = std::min(options_.sample, count);
+    const auto sampled_rows = mlann_detail::sample(count, n_sampled, scratch.generator);
+    const pls_detail::Sample sampled_queries =
+        sample_queries(begin, sampled_rows, train, knn, scratch);
+
+    pls_detail::Matrix neighbor_targets(n_sampled, dim);
     for (int i = 0; i < n_sampled; ++i) {
       neighbor_targets.row(i) = targets.row(begin[sampled_rows[i]]);
     }
     neighbor_targets.rowwise() -= neighbor_targets.colwise().mean().eval();
-    const Eigen::VectorXf normal = pls(sampled_queries, neighbor_targets);
+
+    Eigen::VectorXf normal = pls_detail::pls(sampled_queries, neighbor_targets);
     Eigen::VectorXf projections(n_sampled);
     for (int i = 0; i < n_sampled; ++i) {
       projections[i] = project(normal, train.row(begin[sampled_rows[i]]).data());
     }
-    const Split fit = threshold(sampled_queries, projections, tables, scratch.threshold_scratch);
-    if (!fit.valid || !(fit.gain > 1e-9f)) {
+
+    const pls_detail::Split split =
+        pls_detail::threshold(sampled_queries, projections, tables, scratch.threshold_scratch);
+    return {std::move(normal), split};
+  }
+
+  int grow_subtree(IndexIterator begin, IndexIterator end, int level, int tree,
+                   const Eigen::Ref<const RowMatrix> &train,
+                   const Eigen::Ref<const UIntRowMatrix> &knn, const RowMatrix &targets,
+                   const pls_detail::PALTables &tables, TreeScratch &scratch) {
+    const int index = forests_[tree].size();
+    forests_[tree].emplace_back();
+    Node node;
+
+    const auto finish_leaf = [&]() {
       make_leaf(node, tree, begin, end, knn, scratch);
-    } else {
-      node.threshold = fit.threshold;
-      const auto split_position = std::partition(begin, end, [&](int row) {
-        return project(normal, train.row(row).data()) <= node.threshold;
-      });
-      if (split_position == begin || split_position == end) {
-        make_leaf(node, tree, begin, end, knn, scratch);
-      } else {
-        node.projection = scratch.projections.size() / dim;
-        scratch.projections.insert(scratch.projections.end(), normal.data(), normal.data() + dim);
-        node.left = grow_subtree(begin, split_position, level + 1, tree, train, knn, targets,
-                                 tables, scratch);
-        node.right = grow_subtree(split_position, end, level + 1, tree, train, knn, targets, tables,
-                                  scratch);
-      }
+      forests_[tree][index] = node;
+      return index;
+    };
+
+    if (level == depth || end - begin < 2) {
+      return finish_leaf();
     }
+
+    const FittedSplit fit = fit_split(begin, end, train, knn, targets, tables, scratch);
+    if (!fit.split.valid || !(fit.split.gain > 1e-9f)) {
+      return finish_leaf();
+    }
+
+    // Fit on the sample, then route every training row through the chosen split.
+    node.threshold = fit.split.threshold;
+    const auto split_position = std::partition(begin, end, [&](int row) {
+      return project(fit.normal, train.row(row).data()) <= node.threshold;
+    });
+    if (split_position == begin || split_position == end) {
+      return finish_leaf();
+    }
+
+    node.projection = scratch.projections.size() / dim;
+    scratch.projections.insert(scratch.projections.end(), fit.normal.data(),
+                               fit.normal.data() + dim);
+    node.left =
+        grow_subtree(begin, split_position, level + 1, tree, train, knn, targets, tables, scratch);
+    node.right =
+        grow_subtree(split_position, end, level + 1, tree, train, knn, targets, tables, scratch);
+
+    // Recursive growth can reallocate the forest, so retain the index, not a reference.
     forests_[tree][index] = node;
     return index;
   }

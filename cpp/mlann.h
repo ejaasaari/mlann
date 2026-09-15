@@ -3,11 +3,13 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include <cstdint>
+#include <numeric>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 #include "detail/distance.h"
-#include "detail/one-to-many.h"
+#include "detail/neighbor-query.h"
 #include "miniselect/pdqselect.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
@@ -40,58 +42,12 @@ class MLANN {
 
   static void exact_knn(const float *q_data, const float *X_data, int n_corpus, int dim, int k,
                         int *out, Distance dist = L2, float *out_distances = nullptr) {
-    const Eigen::Map<const RowMatrix> corpus(X_data, n_corpus, dim);
-    const Eigen::Map<const Eigen::RowVectorXf> q(q_data, dim);
+    static thread_local std::vector<uint32_t> indices;
+    indices.resize(n_corpus);
+    std::iota(indices.begin(), indices.end(), 0);
 
-    Eigen::VectorXf distances(n_corpus);
-    if (dist == L2) {
-      for (int i = 0; i < n_corpus; ++i) {
-        distances(i) = squared_euclidean(corpus.row(i).data(), q.data(), dim);
-      }
-    } else {
-      for (int i = 0; i < n_corpus; ++i) {
-        distances(i) = dot_product(corpus.row(i).data(), q.data(), dim);
-      }
-    }
-
-    if (k == 1) {
-      Eigen::MatrixXf::Index index;
-
-      if (dist == L2) {
-        distances.minCoeff(&index);
-        out[0] = index;
-        if (out_distances) out_distances[0] = std::sqrt(distances(index));
-      } else {
-        distances.maxCoeff(&index);
-        out[0] = index;
-        if (out_distances) out_distances[0] = distances(index);
-      }
-
-      return;
-    }
-
-    Eigen::VectorXi idx(n_corpus);
-    std::iota(idx.data(), idx.data() + n_corpus, 0);
-
-    if (dist == L2) {
-      miniselect::pdqpartial_sort_branchless(
-          idx.data(), idx.data() + k, idx.data() + n_corpus,
-          [&distances](int i1, int i2) { return distances(i1) < distances(i2); });
-    } else {
-      miniselect::pdqpartial_sort_branchless(
-          idx.data(), idx.data() + k, idx.data() + n_corpus,
-          [&distances](int i1, int i2) { return distances(i1) > distances(i2); });
-    }
-
-    for (int i = 0; i < k; ++i) out[i] = idx(i);
-
-    if (out_distances) {
-      if (dist == L2) {
-        for (int i = 0; i < k; ++i) out_distances[i] = std::sqrt(distances(idx(i)));
-      } else {
-        for (int i = 0; i < k; ++i) out_distances[i] = distances(idx(i));
-      }
-    }
+    exact_knn_impl(q_data, X_data, dim, k, indices, out, dist, out_distances,
+                   mlann_detail::compute_neighbor_scores, mlann_detail::compute_neighbor_topk);
   }
 
   static void exact_knn(const Eigen::Ref<const Eigen::RowVectorXf> &q,
@@ -127,6 +83,17 @@ class MLANN {
                  const std::vector<uint32_t> &indices, int *out, Distance dist = L2,
                  float *out_distances = nullptr, CandidateScoreKernel score_kernel = nullptr,
                  CandidateTopKKernel topk_kernel = nullptr) const {
+    exact_knn_impl(q.data(), corpus.data(), dim, k, indices, out, dist, out_distances, score_kernel,
+                   topk_kernel);
+  }
+
+  // Full-corpus and candidate searches share scoring, selection, and result formatting.
+  static void exact_knn_impl(const float *q_data, const float *corpus_data, int dim, int k,
+                             const std::vector<uint32_t> &indices, int *out, Distance dist,
+                             float *out_distances, CandidateScoreKernel score_kernel,
+                             CandidateTopKKernel topk_kernel) {
+    if (k <= 0) return;
+
     if (indices.empty()) {
       for (int i = 0; i < k; ++i) out[i] = -1;
       if (out_distances) {
@@ -145,9 +112,9 @@ class MLANN {
       if (score_kernel) {
         const mlann_detail::StridedFloatOutput output{
             reinterpret_cast<unsigned char *>(distances.data()), sizeof(float)};
-        score_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, metric, output);
+        score_kernel(q_data, corpus_data, dim, indices.data(), n_elected, metric, output);
       } else {
-        mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
+        mlann_detail::compute_one_to_many(q_data, corpus_data, static_cast<std::size_t>(dim),
                                           indices.data(), static_cast<std::size_t>(n_elected),
                                           metric, distances.data());
       }
@@ -171,16 +138,16 @@ class MLANN {
     // Both paths share this allocation; streaming ranking only needs k records.
     scored.resize(topk_kernel ? n_to_sort : n_elected);
     if (topk_kernel) {
-      topk_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, n_to_sort, metric,
+      topk_kernel(q_data, corpus_data, dim, indices.data(), n_elected, n_to_sort, metric,
                   scored.data());
     } else {
       for (int i = 0; i < n_elected; ++i) scored[i].label = indices[i];
       const mlann_detail::StridedFloatOutput scores{
           reinterpret_cast<unsigned char *>(scored.data()), sizeof(ScoredCandidate)};
       if (score_kernel) {
-        score_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, metric, scores);
+        score_kernel(q_data, corpus_data, dim, indices.data(), n_elected, metric, scores);
       } else {
-        mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
+        mlann_detail::compute_one_to_many(q_data, corpus_data, static_cast<std::size_t>(dim),
                                           indices.data(), static_cast<std::size_t>(n_elected),
                                           metric, scores);
       }
