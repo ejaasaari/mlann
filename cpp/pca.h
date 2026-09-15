@@ -23,8 +23,8 @@ struct FitStats {
   bool fallback = false;
 };
 
-// Solve in the smaller of feature space and sample space. Double precision keeps
-// the fallback accurate when the leading eigenvalues are close together.
+// Sparse PCA solves in the smaller feature or sample space. Double precision
+// keeps the direction accurate when the leading eigenvalues are close together.
 inline Eigen::VectorXf direct_direction(const Eigen::MatrixXf &centered) {
   const Eigen::MatrixXd points = centered.cast<double>();
   const bool dual = points.cols() < points.rows();
@@ -49,10 +49,42 @@ inline Eigen::VectorXf direct_direction(const Eigen::MatrixXf &centered) {
   return (direction / norm).cast<float>();
 }
 
-// Points are columns. Scale before iteration so convergence does not depend on
-// input units; compute the mean in double precision before converting back.
+// PCAFull trades exact convergence for bounded build cost. Apply the covariance
+// through the samples, with no dense covariance matrix or eigensolver fallback.
+inline Eigen::VectorXf power_direction(const Eigen::MatrixXf &centered, Eigen::VectorXf direction,
+                                       FitStats *stats) {
+  constexpr int max_iterations = 20;
+  constexpr float tolerance = 1e-3f;
+  Eigen::VectorXf projected(centered.cols());
+  Eigen::VectorXf product(centered.rows());
+  for (int iteration = 0; iteration < max_iterations; ++iteration) {
+    projected.noalias() = centered.transpose() * direction;
+    product.noalias() = centered * projected;
+    if (stats) ++stats->iterations;
+
+    const float norm = product.norm();
+    if (!(norm > 0)) {
+      // An initial direction in the nullspace has no covariance product. A
+      // nonzero sample gives iteration a direction within the data's span.
+      Eigen::Index column;
+      centered.colwise().squaredNorm().maxCoeff(&column);
+      direction = centered.col(column).normalized();
+      if (stats) stats->fallback = true;
+      continue;
+    }
+
+    const float eigenvalue = direction.dot(product);
+    const float residual = (product - eigenvalue * direction).norm();
+    direction = product / norm;
+    if (residual <= tolerance * eigenvalue) break;
+  }
+  return direction;
+}
+
+// Points are columns. Center and scale in double precision so input units and
+// large constant offsets do not hide the variance before fitting in float.
 inline Eigen::VectorXf principal_direction(const Eigen::Ref<const Eigen::MatrixXf> &points,
-                                           Eigen::VectorXf initial, bool matrix_free,
+                                           Eigen::VectorXf initial, bool approximate,
                                            FitStats *stats = nullptr) {
   if (stats) *stats = {};
   if (points.rows() == 0 || points.cols() < 2 || !points.allFinite()) {
@@ -77,36 +109,9 @@ inline Eigen::VectorXf principal_direction(const Eigen::Ref<const Eigen::MatrixX
   }
   centered /= centered.norm();
 
-  if (!matrix_free) return direct_direction(centered);
+  if (!approximate) return direct_direction(centered);
 
-  constexpr int max_iterations = 100;
-  constexpr float tolerance = 1e-5f;
-  const double half_trace = 0.5 * centered.cast<double>().squaredNorm();
-  Eigen::VectorXf direction = initial;
-  Eigen::VectorXf projected(points.cols());
-  Eigen::VectorXf product(points.rows());
-  for (int iteration = 0; iteration < max_iterations; ++iteration) {
-    projected.noalias() = centered.transpose() * direction;
-    product.noalias() = centered * projected;
-    if (stats) ++stats->iterations;
-
-    const float eigenvalue = direction.dot(product);
-    const float product_norm = product.norm();
-    if (!product.allFinite() || !(eigenvalue > 0) || !(product_norm > 0)) break;
-
-    const float residual = (product - eigenvalue * direction).norm();
-    if (residual <= tolerance * eigenvalue) {
-      // A small residual alone can also identify a non-leading eigenvector.
-      // For a positive semidefinite matrix, an eigenvalue above half its trace
-      // must be the largest. Otherwise verify the leading direction directly.
-      if (eigenvalue - residual > half_trace) return direction;
-      break;
-    }
-    direction = product / product_norm;
-  }
-
-  if (stats) stats->fallback = true;
-  return direct_direction(centered);
+  return power_direction(centered, initial, stats);
 }
 
 }  // namespace pca_detail
