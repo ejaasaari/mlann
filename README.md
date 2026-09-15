@@ -122,6 +122,8 @@ look-ahead prefetching. Linux builds request huge-page backing for complete
 spans inside the existing corpus allocation. These changes use the existing
 index and query buffers. Unsupported SIMD builds use the original scorer;
 page advice may be declined without affecting correctness.
+Leaf labels are unique within each leaf, allowing SIMD vote updates while
+preserving accumulation and candidate election order.
 
 C++ callers can supply `NeighborMeanPLS::Options` to the constructor to change the sample
 size and seed. Python uses those defaults.
@@ -138,6 +140,8 @@ g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tes
 benchmarks/.build/test_huge_buffer
 g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_query.cpp -o benchmarks/.build/test_neighbor_query
 benchmarks/.build/test_neighbor_query
+g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_votes.cpp -o benchmarks/.build/test_neighbor_votes
+benchmarks/.build/test_neighbor_votes
 ```
 
 The benchmark runner accepts the added method:

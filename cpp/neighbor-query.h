@@ -1,6 +1,7 @@
 #pragma once
 
 #include "one-to-many.h"
+#include <vector>
 
 namespace mlann_detail {
 // Same arithmetic and output buffers as the native scorer. Smaller batches and
@@ -149,5 +150,41 @@ inline void compute_neighbor_scores(const float *query, const float *data,
                                     size_t count, OneToManyMetric metric,
                                     StridedFloatOutput output) {
   compute_neighbor_one_to_many(query, data, dim, indices, count, metric, output);
+}
+
+// Leaf labels are unique. SIMD updates therefore preserve the original
+// per-label accumulation order across trees and the elected-candidate order.
+inline void accumulate_neighbor_votes(const std::vector<uint32_t> &labels,
+                                       const std::vector<float> &weights,
+                                       float *votes, float threshold,
+                                       std::vector<uint32_t> &elected) {
+  size_t i = 0;
+#if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__))
+  const __m512 limit = _mm512_set1_ps(threshold);
+  const __m512 sentinel = _mm512_set1_ps(-9999999.f);
+  for (; i + 16 <= labels.size(); i += 16) {
+    for (size_t j = i + 32; j < labels.size() && j < i + 48; ++j)
+      __builtin_prefetch(votes + labels[j], 1, 1);
+    const __m512i ids = _mm512_loadu_si512(labels.data() + i);
+    const __m512 updated = _mm512_add_ps(_mm512_i32gather_ps(ids, votes, 4),
+                                        _mm512_loadu_ps(weights.data() + i));
+    unsigned selected = _mm512_cmp_ps_mask(updated, limit, _CMP_GE_OQ);
+    _mm512_i32scatter_ps(votes, ids, _mm512_mask_mov_ps(updated, selected, sentinel), 4);
+    while (selected) {
+      const unsigned lane = __builtin_ctz(selected);
+      elected.push_back(labels[i + lane]);
+      selected &= selected - 1;
+    }
+  }
+#endif
+  for (; i < labels.size(); ++i) {
+#if defined(__GNUC__) || defined(__clang__)
+    if (i + 32 < labels.size()) __builtin_prefetch(votes + labels[i + 32], 1, 1);
+#endif
+    if ((votes[labels[i]] += weights[i]) >= threshold) {
+      elected.push_back(labels[i]);
+      votes[labels[i]] = -9999999.f;
+    }
+  }
 }
 }  // namespace mlann_detail

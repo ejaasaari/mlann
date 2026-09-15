@@ -364,15 +364,8 @@ class NeighborMeanPLS : public MLANN {
       route_batch(data, first, count, leaves.data());
       for (int t = 0; t < count; ++t) {
         const auto &leaf = leaves_[first + t][leaves[t]];
-        for (size_t i = 0; i < leaf.labels.size(); ++i) {
-#if defined(__GNUC__) || defined(__clang__)
-          if (i + 32 < leaf.labels.size())
-            __builtin_prefetch(votes.data() + leaf.labels[i + 32], 1, 1);
-#endif
-          if ((votes[leaf.labels[i]] += leaf.votes[i]) >= threshold) {
-            elected.push_back(leaf.labels[i]); votes[leaf.labels[i]] = -9999999;
-          }
-        }
+        mlann_detail::accumulate_neighbor_votes(leaf.labels, leaf.votes,
+                                                votes.data(), threshold, elected);
       }
     }
     if (elected_count) *elected_count = elected.size();
