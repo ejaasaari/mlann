@@ -17,7 +17,7 @@ class MLANNIndex(object):
         :return:
         """
         if isinstance(data, np.ndarray):
-            if len(data) == 0 or len(data.shape) != 2:
+            if data.ndim != 2 or 0 in data.shape:
                 raise ValueError("The data matrix should be non-empty and two-dimensional")
             if data.dtype != np.float32:
                 raise ValueError("The data matrix should have type float32")
@@ -28,8 +28,12 @@ class MLANNIndex(object):
             raise ValueError("Data must be an ndarray")
 
         if data is not None:
+            if index_type.upper() == "CRAFTML":
+                index_type = "CRAFTML"
+            self.n_samples = n_samples
             self.index = mlannlib.MLANNIndex(data, n_samples, dim, index_type)
             self.dim = dim
+            self.index_type = index_type
 
         self.built = False
 
@@ -42,19 +46,74 @@ class MLANNIndex(object):
             raise ValueError("Density should be in (0, 1]")
         return density
 
-    def build(self, train, knn, n_trees, depth, density="auto", b=1):
+    def build(
+        self, train=None, knn=None, n_trees=None, depth=None, density="auto", b=1,
+        top_variance_dims=5, unsupervised=False, *, branching_factor=10,
+        leaf_size=32, label_dim=128, feature_dim=0, iterations=2,
+        node_sample_size=1000, seed=42, dist=L2,
+    ):
         """
         Builds a normal MLANN index.
+        :param unsupervised: Build KD/PCA/PCAFull/RP directly on the constructor's corpus,
+                             with one vote per point in each routed leaf. Omit train and knn;
+                             b must be 1. Default False preserves supervised leaf votes.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
         :param density: Feature density for legacy methods; NeighborMeanPLS uses all input dimensions.
         :param b: Minimum vote threshold for candidates to be included in the linear search phase.
+        :param top_variance_dims: Number of highest-variance dimensions KD chooses among
+                                  at each node, capped at dim; positive integer, default 5.
+                                  KD ignores density.
         :return:
         """
         if self.built:
             raise RuntimeError("The index has already been built")
 
+        if self.index_type == "CRAFTML":
+            if unsupervised:
+                raise ValueError("unsupervised is only supported by KD, PCA, PCAFull and RP")
+            train = self._craft_features(train, matrix=True)
+            knn = np.asarray(knn)
+            if (knn.ndim != 2 or knn.shape[0] != train.shape[0] or knn.shape[1] == 0
+                    or not np.issubdtype(knn.dtype, np.integer)
+                    or np.any(knn < 0) or np.any(knn >= self.n_samples)):
+                raise ValueError("knn must contain valid integer corpus IDs, one row per query")
+            if dist not in (IP, L2):
+                raise ValueError("dist must be IP or L2")
+            if not isinstance(seed, (int, np.integer)) or not 0 <= seed <= np.iinfo(np.uint32).max:
+                raise ValueError("seed must be an integer in [0, 2**32 - 1]")
+            if density != "auto" or b != 1:
+                raise ValueError("CraftML uses feature_dim and unpruned leaves instead of density/b")
+            self.index.build_craftml(
+                train, np.ascontiguousarray(knn, dtype=np.uint32),
+                10 if n_trees is None else n_trees, 20 if depth is None else depth,
+                branching_factor, leaf_size, label_dim, feature_dim,
+                iterations, node_sample_size, seed, dist,
+            )
+            self.dist = dist
+            self.built = True
+            return
+
+        if self.index_type == "KD" and (
+            not isinstance(top_variance_dims, (int, np.integer)) or top_variance_dims < 1
+        ):
+            raise ValueError("top_variance_dims must be a positive integer")
+
+        if n_trees is None or depth is None:
+            raise TypeError("n_trees and depth are required")
         density = self._compute_density(density)
+        if unsupervised:
+            if self.index_type not in ("KD", "PCA", "PCAFull", "RP"):
+                raise ValueError("unsupervised is only supported by KD, PCA, PCAFull and RP")
+            if train is not None or knn is not None:
+                raise ValueError("Omit train and knn when unsupervised=True; trees use the corpus")
+            if b != 1:
+                raise ValueError("b must be 1 when unsupervised=True; each leaf member gets one vote")
+            self.index.build_unsupervised(n_trees, depth, density, top_variance_dims)
+            self.built = True
+            return
+        if train is None or knn is None:
+            raise ValueError("train and knn are required unless unsupervised=True")
         self.index.build(
             train,
             train.shape[0],
@@ -66,13 +125,18 @@ class MLANNIndex(object):
             depth,
             density,
             b,
+            top_variance_dims,
         )
         self.built = True
 
-    def ann(self, q, k, votes_required, dist=mlannlib.L2, return_distances=False):
+    def ann(self, q, k, votes_required=None, dist=None, return_distances=False, *,
+            candidate_budget=None):
         """
         Performs an approximate nearest neighbor query for a single query vector or multiple query vectors
         in parallel. The queries are given as a numpy vector or a numpy matrix where each row contains a query.
+        :param candidate_budget: CraftML shortlist size (>= k), ranked by forest probability.
+                                 Alternatively, votes_required selects strict probability > tau.
+                                 Fewer than k candidates triggers full-corpus exact search.
         :param q: The query object. Can be either a single query vector or a matrix with one query vector per row.
         :param k: The number of nearest neighbors to be returned.
         :param votes_required: The number of votes an object has to get to be included in the linear search part of the query.
@@ -84,10 +148,44 @@ class MLANNIndex(object):
         """
         if not self.built:
             raise RuntimeError("Cannot query before building index")
+        if self.index_type == "CRAFTML":
+            q = self._craft_features(q)
+            if candidate_budget is not None and votes_required is not None:
+                raise ValueError("Specify candidate_budget or votes_required, not both")
+            if candidate_budget is None and votes_required is None:
+                raise ValueError("Specify candidate_budget or votes_required")
+            if candidate_budget is not None and (
+                    not isinstance(candidate_budget, (int, np.integer)) or candidate_budget < k):
+                raise ValueError("candidate_budget must be an integer >= k")
+            return self.index.ann_craftml(
+                q, k, -1 if candidate_budget is None else candidate_budget,
+                0.0 if votes_required is None else votes_required,
+                self.dist if dist is None else dist, return_distances,
+            )
+        if candidate_budget is not None:
+            raise ValueError("candidate_budget is available for CraftML")
+        if votes_required is None:
+            raise ValueError("votes_required is required")
         if q.dtype != np.float32:
             raise ValueError("The query matrix should have type float32")
 
-        return self.index.ann(q, k, votes_required, dist, return_distances)
+        return self.index.ann(q, k, votes_required, L2 if dist is None else dist, return_distances)
+
+    def _craft_features(self, q, matrix=False):
+        q = np.asarray(q)
+        if (q.ndim not in ((2,) if matrix else (1, 2)) or q.shape[-1] != self.dim
+                or (matrix and not q.shape[0]) or q.dtype != np.float32
+                or not np.isfinite(q).all()):
+            raise ValueError("Features must be finite float32 vectors with the corpus dimension")
+        return np.require(q, dtype=np.float32, requirements=["C", "A"])
+
+    def candidate_scores(self, q):
+        """Return (corpus IDs, probabilities) for one CraftML query, before selection/fallback."""
+        if not self.built:
+            raise RuntimeError("Cannot query before building index")
+        if self.index_type != "CRAFTML":
+            raise ValueError("candidate_scores is available for CraftML")
+        return self.index.craftml_scores(self._craft_features(q))
 
     def exact_search(self, q, k, dist=mlannlib.L2, return_distances=False):
         """
@@ -101,6 +199,10 @@ class MLANNIndex(object):
                  returns a tuple where the first element contains the nearest neighbors and the second
                  element contains their distances to the query.
         """
+        if self.index_type == "CRAFTML":
+            q = self._craft_features(q)
+            if not 1 <= k <= self.n_samples or dist not in (IP, L2):
+                raise ValueError("Invalid k or metric")
         if q.dtype != np.float32:
             raise ValueError("The query matrix should have type float32")
 

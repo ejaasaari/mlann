@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -9,13 +10,15 @@
 #include <stdexcept>
 #include <utility>
 
+#include "detail/huge-buffer.h"
+#include "detail/neighbor-query.h"
 #include "mlann.h"
 
-std::vector<uint32_t> sample_unique(int n, int k) {
+inline void sample_unique(int n, int k, std::vector<uint32_t> &reservoir) {
   std::random_device rd;
   std::minstd_rand generator(rd());
 
-  std::vector<uint32_t> reservoir(k);
+  reservoir.resize(k);
   std::iota(reservoir.begin(), reservoir.end(), 0);
 
   for (int i = k; i < n; ++i) {
@@ -26,7 +29,11 @@ std::vector<uint32_t> sample_unique(int n, int k) {
       reservoir[j] = i;
     }
   }
+}
 
+inline std::vector<uint32_t> sample_unique(int n, int k) {
+  std::vector<uint32_t> reservoir;
+  sample_unique(n, k, reservoir);
   return reservoir;
 }
 
@@ -40,6 +47,7 @@ struct SplitScratch {
   std::vector<int> compact_votes;
   std::vector<uint16_t> compact_votes_16;
   std::vector<int> ids;
+  std::vector<uint32_t> local;
   std::vector<SplitEntry> order;
   std::vector<float> left_ent;
   std::vector<uint32_t> sampled_labels;
@@ -128,56 +136,64 @@ class RFClass : public MLANN {
                      votes_all[n_tree], train, knn, random_dims_all[n_tree], n_subsample, scratch);
       }
     }
+    mlann_detail::promote_existing_corpus_pages(corpus.data(),
+                                                size_t(corpus.size()) * sizeof(float));
   }
 
   void query(const float *data, int k, float vote_threshold, int *out, Distance dist = L2,
-             float *out_distances = nullptr, int *out_n_elected = nullptr) const {
-    const Eigen::Map<const Eigen::RowVectorXf> q(data, dim);
+             float *out_distances = nullptr, int *out_n_elected = nullptr) const override {
+    static thread_local mlann_detail::HugeBuffer<float> votes_total;
+    static thread_local std::vector<uint32_t> elected;
+    votes_total.resize(n_corpus);
+    std::fill_n(votes_total.data(), n_corpus, 0.f);
+    elected.clear();
 
-    std::vector<int> found_leaves(n_trees);
-    for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
-      int idx_tree = 0;
-      int d = 0;
-      for (; d < depth; ++d) {
-        const int idx_left = 2 * idx_tree + 1;
-        const int idx_right = idx_left + 1;
-        const float split_point = split_points(idx_tree, n_tree);
-        const uint32_t split_dimension = split_dimensions(idx_tree, n_tree);
-        if (split_dimension == UINT32_MAX) {
-          break;
-        }
-        if (q(split_dimension) <= split_point) {
-          idx_tree = idx_left;
-        } else {
-          idx_tree = idx_right;
-        }
-      }
-      const int levels2leaf = depth - d;
-      found_leaves[n_tree] = (1 << levels2leaf) * (idx_tree + 1) - 1 - n_inner_nodes;
-    }
-
-    std::vector<uint32_t> elected;
-    Eigen::VectorXf votes_total = Eigen::VectorXf::Zero(n_corpus);
-
-    for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
-      int leaf_idx = found_leaves[n_tree];
-      const std::vector<uint32_t> &labels = labels_all[n_tree][leaf_idx];
-      const std::vector<float> &votes = votes_all[n_tree][leaf_idx];
-      int n_labels = labels.size();
-      for (int i = 0; i < n_labels; ++i) {
-        if ((votes_total(labels[i]) += votes[i]) >= vote_threshold) {
-          elected.push_back(labels[i]);
-          votes_total(labels[i]) = -9999999;
-        }
+    std::array<int, routing_batch_size> found_leaves;
+    for (int first = 0; first < n_trees; first += routing_batch_size) {
+      const int count = std::min(routing_batch_size, n_trees - first);
+      route_batch(data, first, count, found_leaves.data());
+      for (int t = 0; t < count; ++t) {
+        const int leaf = found_leaves[t];
+        mlann_detail::accumulate_neighbor_votes(labels_all[first + t][leaf],
+                                                votes_all[first + t][leaf], votes_total.data(),
+                                                vote_threshold, elected);
       }
     }
 
     if (out_n_elected) *out_n_elected = elected.size();
-
-    exact_knn(q, k, elected, out, dist, out_distances);
+    exact_knn(Eigen::Map<const Eigen::RowVectorXf>(data, dim), k, elected, out, dist, out_distances,
+              mlann_detail::compute_neighbor_scores, mlann_detail::compute_neighbor_topk);
   }
 
  private:
+  static constexpr int routing_batch_size = 64;
+
+  // Advance independent trees together while preserving their leaf-vote order.
+  void route_batch(const float *query, int first, int count, int *leaves) const {
+    std::array<int, routing_batch_size> nodes{}, active;
+    std::iota(active.begin(), active.begin() + count, 0);
+    int remaining = count;
+    for (int level = 0; level < depth && remaining; ++level) {
+      int next = 0;
+      for (int i = 0; i < remaining; ++i) {
+        const int t = active[i];
+        const int node = nodes[t];
+        const uint32_t dimension = split_dimensions(node, first + t);
+        if (dimension == UINT32_MAX) {
+          leaves[t] = (1 << (depth - level)) * (node + 1) - 1 - n_inner_nodes;
+          continue;
+        }
+        nodes[t] = 2 * node + 1 + !(query[dimension] <= split_points(node, first + t));
+        if (level + 1 == depth) {
+          leaves[t] = nodes[t] - n_inner_nodes;
+        } else {
+          active[next++] = t;
+        }
+      }
+      remaining = next;
+    }
+  }
+
   std::vector<float> log2_tbl;
   std::vector<float> t_tbl;
 
@@ -192,9 +208,9 @@ class RFClass : public MLANN {
     float max_gain = 0.f, max_split = 0.f;
     if (n <= 1) return std::make_tuple(max_dim, max_split, max_gain);
 
-    std::vector<uint32_t> local;
+    auto &local = scratch.local;
     if (n_subsample > 0 && n_subsample < n) {
-      local = sample_unique(n, n_subsample);
+      sample_unique(n, n_subsample, local);
       n = n_subsample;
     } else {
       local.resize(n);
@@ -301,10 +317,10 @@ class RFClass : public MLANN {
     };
 
     if (n_sampled_labels <= std::numeric_limits<uint16_t>::max()) {
-      scratch.compact_votes_16.resize(n_sampled_labels);
+      scratch.compact_votes_16.resize(n_labels);
       evaluate_dimensions(scratch.compact_votes_16);
     } else {
-      scratch.compact_votes.resize(n_sampled_labels);
+      scratch.compact_votes.resize(n_labels);
       evaluate_dimensions(scratch.compact_votes);
     }
 

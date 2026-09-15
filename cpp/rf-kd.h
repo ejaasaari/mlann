@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <iterator>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -14,11 +13,20 @@
 #include "detail/neighbor-query.h"
 #include "mlann.h"
 
-// Median-split PCA forest. Sparse PCA samples coordinates with replacement;
-// PCAFull fits on at most 300 rows and uses every coordinate.
-class RFPCA : public MLANN {
+// Randomized k-d forest: choose uniformly among the top_variance_dims highest-variance
+// coordinates at each node, then split at the median.
+class RFKD : public MLANN {
  public:
-  RFPCA(const float *corpus_, int n_corpus_, int dim_) : RFPCA(corpus_, n_corpus_, dim_, false) {}
+  RFKD(const float *corpus_, int n_corpus_, int dim_, int top_variance_dims_ = 5)
+      : MLANN(corpus_, n_corpus_, dim_) {
+    configure(top_variance_dims_);
+  }
+
+  void configure(int top_variance_dims_) {
+    if (!empty()) throw std::logic_error("The index has already been grown.");
+    if (top_variance_dims_ < 1) throw std::invalid_argument("top_variance_dims must be positive.");
+    top_variance_dims = top_variance_dims_;
+  }
 
   void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn,
             const Eigen::Ref<const RowMatrix> &train, float density_ = -1.0, int b_ = 1) override {
@@ -45,17 +53,13 @@ class RFPCA : public MLANN {
       throw std::out_of_range(
           "The depth must belong to the set {1, ... , min(log2(n_train), 29)}.");
     }
-    if (dim <= 0 || n_corpus <= 0 || train.cols() != dim || b_ < 1 ||
-        (unsupervised && !train.allFinite()) ||
+    if (dim <= 0 || n_corpus <= 0 || train.cols() != dim || b_ < 1 || !train.allFinite() ||
         (!unsupervised &&
          (knn.rows() != n_train || knn.cols() < 1 || knn.maxCoeff() >= uint32_t(n_corpus)))) {
       throw std::invalid_argument("Invalid forest data or dimensions.");
     }
-    const float requested_density =
-        full_dimensions ? 1.f : (density_ < 0 ? float(1.0 / std::sqrt(dim)) : density_);
-    if (!std::isfinite(requested_density) || requested_density < 0.f || requested_density > 1.f) {
-      throw std::invalid_argument("Density must belong to [0, 1].");
-    }
+    // KD always ranks all input dimensions; density is accepted for API compatibility.
+    (void)density_;
 
     corpus_leaves = unsupervised;
     n_trees = n_trees_;
@@ -63,30 +67,24 @@ class RFPCA : public MLANN {
     n_inner_nodes = (1 << depth) - 1;
     n_leaves = 1 << depth;
     n_array = 1 << (depth + 1);
+    density = 1.f;
     b = b_;
-    density = requested_density;
-    support = static_cast<int>(density * dim);
-    const Eigen::Index node_count = Eigen::Index(n_inner_nodes) * n_trees;
 
     split_points.resize(n_inner_nodes, n_trees);
-    projections.resize(node_count, support);
-    // Full-support nodes share implicit coordinates 0..dim-1.
-    if (!full_dimensions) projection_dims.resize(node_count, support);
+    split_dimensions.resize(n_inner_nodes, n_trees);
     labels_all.resize(n_trees);
     if (!corpus_leaves) votes_all.resize(n_trees);
 
 #pragma omp parallel
     {
-      TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train);
+      TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, dim);
 #pragma omp for schedule(dynamic, 1)
       for (int tree = 0; tree < n_trees; ++tree) {
         labels_all[tree].resize(n_leaves);
         if (!corpus_leaves) votes_all[tree].resize(n_leaves);
         std::iota(scratch.rows.begin(), scratch.rows.end(), 0);
-
         std::random_device rd;
         std::minstd_rand generator(rd());
-        initialize_projections(tree, generator);
         grow_subtree(scratch.rows.begin(), scratch.rows.end(), 0, 0, tree, knn, train, generator,
                      scratch);
       }
@@ -125,116 +123,52 @@ class RFPCA : public MLANN {
               mlann_detail::compute_neighbor_scores, mlann_detail::compute_neighbor_topk);
   }
 
- protected:
-  RFPCA(const float *corpus_, int n_corpus_, int dim_, bool full_dimensions_)
-      : MLANN(corpus_, n_corpus_, dim_), full_dimensions(full_dimensions_) {}
-
  private:
   using IndexIterator = std::vector<int>::iterator;
   static constexpr int routing_batch_size = 64;
   bool corpus_leaves = false;
-  static constexpr int fit_sample = 300;
-  const bool full_dimensions;
-  int support = 0;
-  RowMatrix projections;
-  UIntRowMatrix projection_dims;
+  int top_variance_dims = 5;
 
   struct TreeScratch {
-    std::vector<int> rows;
-    std::vector<int> votes;
+    std::vector<int> rows, dimensions, votes;
     std::vector<uint32_t> touched_ids;
-    std::vector<int> sampled_rows;
     std::vector<float> row_scores;
-    Eigen::MatrixXf points, fit, centered, covariance;
-    Eigen::VectorXf direction, last, projected, scores;
+    Eigen::RowVectorXd mean, variance;
 
-    TreeScratch(int corpus_size, int train_size)
-        : rows(train_size), votes(corpus_size, 0), row_scores(train_size) {
-      sampled_rows.reserve(fit_sample);
-      scores.resize(train_size);
-    }
+    TreeScratch(int corpus_size, int train_size, int dim)
+        : rows(train_size),
+          dimensions(dim),
+          votes(corpus_size, 0),
+          row_scores(train_size),
+          mean(dim),
+          variance(dim) {}
   };
 
-  Eigen::Index projection_row(int tree, int node) const {
-    return Eigen::Index(tree) * n_inner_nodes + node;
-  }
-
-  void initialize_projections(int tree, std::minstd_rand &generator) {
-    std::uniform_int_distribution<int> coordinate(0, dim - 1);
-    std::normal_distribution<float> normal(0, 1);
-    // Preserve per-tree random draw order, including initialization of every node.
-    for (int node = 0; node < n_inner_nodes; ++node) {
-      const auto row = projection_row(tree, node);
-      if (!full_dimensions) {
-        for (int j = 0; j < support; ++j) projection_dims(row, j) = coordinate(generator);
-      }
-      for (int j = 0; j < support; ++j) projections(row, j) = normal(generator);
+  int choose_dimension(IndexIterator begin, IndexIterator end,
+                       const Eigen::Ref<const RowMatrix> &train, std::minstd_rand &generator,
+                       TreeScratch &scratch) const {
+    // Two-pass double accumulation keeps small variances accurate at large offsets.
+    scratch.mean.setZero();
+    for (auto it = begin; it != end; ++it) scratch.mean += train.row(*it).cast<double>();
+    scratch.mean /= double(end - begin);
+    scratch.variance.setZero();
+    for (auto it = begin; it != end; ++it) {
+      scratch.variance.array() += (train.row(*it).cast<double>() - scratch.mean).array().square();
     }
-  }
-
-  void gather_points(IndexIterator begin, int count, Eigen::Index row,
-                     const Eigen::Ref<const RowMatrix> &train, Eigen::MatrixXf &output) const {
-    if (output.rows() != support || output.cols() < count) output.resize(support, count);
-    for (int i = 0; i < count; ++i) {
-      const float *point = train.row(begin[i]).data();
-      float *column = output.col(i).data();
-      if (full_dimensions) {
-        std::copy_n(point, support, column);
-      } else {
-        for (int j = 0; j < support; ++j) column[j] = point[projection_dims(row, j)];
-      }
+    // The common variance denominator cannot change the dimension ranking.
+    std::iota(scratch.dimensions.begin(), scratch.dimensions.end(), 0);
+    const int count = std::min(top_variance_dims, dim);
+    if (count < dim) {
+      miniselect::pdqpartial_sort_branchless(
+          scratch.dimensions.begin(), scratch.dimensions.begin() + count, scratch.dimensions.end(),
+          [&](int left, int right) {
+            if (scratch.variance[left] != scratch.variance[right]) {
+              return scratch.variance[left] > scratch.variance[right];
+            }
+            return left < right;
+          });
     }
-  }
-
-  void fit_projection(IndexIterator begin, IndexIterator end, Eigen::Index row,
-                      const Eigen::Ref<const RowMatrix> &train, std::minstd_rand &generator,
-                      TreeScratch &scratch) {
-    const int count = end - begin;
-    if (support == 0) {
-      for (auto it = begin; it != end; ++it) scratch.row_scores[*it] = 0.f;
-      return;
-    }
-    auto &direction = scratch.direction;
-    direction = projections.row(row).transpose();
-    direction /= direction.norm();
-    gather_points(begin, count, row, train, scratch.points);
-
-    const float *fit_data = scratch.points.data();
-    int fit_count = count;
-    if (full_dimensions && count > fit_sample) {
-      scratch.sampled_rows.clear();
-      std::sample(begin, end, std::back_inserter(scratch.sampled_rows), fit_sample, generator);
-      gather_points(scratch.sampled_rows.begin(), fit_sample, row, train, scratch.fit);
-      fit_data = scratch.fit.data();
-      fit_count = fit_sample;
-    }
-    const Eigen::Map<const Eigen::MatrixXf> fit(fit_data, support, fit_count);
-    const float scale = 1. / (fit_count - 1);
-    if (scratch.centered.rows() != support || scratch.centered.cols() < fit_count) {
-      scratch.centered.resize(support, fit_count);
-    }
-    Eigen::Map<Eigen::MatrixXf> centered(scratch.centered.data(), support, fit_count);
-    centered = fit.colwise() - fit.rowwise().mean();
-    if (!full_dimensions) {
-      scratch.covariance = 2 * 0.01 * scale * (centered * centered.transpose());
-    }
-    direction /= direction.norm();
-    for (int iteration = 0; iteration < 20; ++iteration) {
-      scratch.last = direction;
-      if (full_dimensions) {
-        if (scratch.projected.size() < fit_count) scratch.projected.resize(fit_count);
-        auto projected = scratch.projected.head(fit_count);
-        projected = centered.transpose() * direction;
-        direction += (0.02f * scale) * (centered * projected);
-      } else {
-        direction += scratch.covariance * direction;
-      }
-      direction /= direction.norm();
-      if ((direction - scratch.last).cwiseAbs().mean() < 0.01) break;
-    }
-    scratch.scores.head(count) = direction.transpose() * scratch.points.leftCols(count);
-    projections.row(row) = direction.transpose();
-    for (int i = 0; i < count; ++i) scratch.row_scores[begin[i]] = scratch.scores[i];
+    return scratch.dimensions[std::uniform_int_distribution<int>(0, count - 1)(generator)];
   }
 
   void make_leaf(IndexIterator begin, IndexIterator end, int tree, int leaf,
@@ -261,7 +195,7 @@ class RFPCA : public MLANN {
       scratch.votes[label] = 0;
       if (count >= b) {
         labels.push_back(label);
-        // PCA uses raw counts, unlike RF's normalized leaf votes.
+        // Median-split forests use raw leaf counts, as in RP and PCA.
         votes.push_back(static_cast<float>(count));
       }
     }
@@ -275,18 +209,24 @@ class RFPCA : public MLANN {
       make_leaf(begin, end, tree, node - n_inner_nodes, knn, scratch);
       return;
     }
-    const int count = end - begin;
-    const auto mid = end - count / 2;
-    fit_projection(begin, end, projection_row(tree, node), train, generator, scratch);
+    const int dimension = choose_dimension(begin, end, train, generator, scratch);
+    split_dimensions(node, tree) = dimension;
+    for (auto it = begin; it != end; ++it) scratch.row_scores[*it] = train(*it, dimension);
     const auto less = [&](int left, int right) {
       return scratch.row_scores[left] < scratch.row_scores[right];
     };
+    const int count = end - begin;
     miniselect::pdqselect_branchless(begin, begin + count / 2, end, less);
+    const auto mid = end - count / 2;
     if (count % 2) {
       split_points(node, tree) = scratch.row_scores[*(mid - 1)];
     } else {
       const auto left = std::max_element(begin, mid, less);
-      split_points(node, tree) = (scratch.row_scores[*mid] + scratch.row_scores[*left]) / 2.0;
+      const float lower = scratch.row_scores[*left], upper = scratch.row_scores[*mid];
+      // Avoid overflow and keep adjacent floats on opposite sides of the split.
+      float threshold = (double(lower) + upper) / 2.0;
+      if (lower < upper && threshold >= upper) threshold = lower;
+      split_points(node, tree) = threshold;
     }
     grow_subtree(begin, mid, level + 1, 2 * node + 1, tree, knn, train, generator, scratch);
     grow_subtree(mid, end, level + 1, 2 * node + 2, tree, knn, train, generator, scratch);
@@ -296,23 +236,12 @@ class RFPCA : public MLANN {
     std::array<int, routing_batch_size> nodes{};
     for (int level = 0; level < depth; ++level) {
       for (int t = 0; t < count; ++t) {
-        const auto row = projection_row(first + t, nodes[t]);
-        float score = 0.f;
-        // Keep the sparse projection's accumulation order, including repeated coordinates.
-        if (full_dimensions) {
-          for (int j = 0; j < support; ++j) score += query[j] * projections(row, j);
-        } else {
-          for (int j = 0; j < support; ++j)
-            score += query[projection_dims(row, j)] * projections(row, j);
-        }
-        nodes[t] = 2 * nodes[t] + (score <= split_points(nodes[t], first + t) ? 1 : 2);
+        const int tree = first + t;
+        const int node = nodes[t];
+        nodes[t] =
+            2 * node + (query[split_dimensions(node, tree)] <= split_points(node, tree) ? 1 : 2);
       }
     }
     for (int t = 0; t < count; ++t) leaves[t] = nodes[t] - n_inner_nodes;
   }
-};
-
-class PCAFull : public RFPCA {
- public:
-  PCAFull(const float *corpus_, int n_corpus_, int dim_) : RFPCA(corpus_, n_corpus_, dim_, true) {}
 };

@@ -3,259 +3,243 @@
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
-#include <utility>
 #include <vector>
 
+#include "detail/huge-buffer.h"
+#include "detail/neighbor-query.h"
 #include "mlann.h"
 
+// Median-split forest with one Gaussian projection per tree level. Below
+// density 1, each coordinate is included independently with that probability.
 class RFRP : public MLANN {
  public:
   RFRP(const float *corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
-  void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
-            const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {
+  void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn,
+            const Eigen::Ref<const RowMatrix> &train, float density_ = -1.0, int b_ = 1) override {
+    grow_impl(n_trees_, depth_, knn, train, density_, b_, false);
+  }
+
+  // Partition the corpus itself; leaves hold corpus IDs with implicit unit votes.
+  void grow_unsupervised(int n_trees_, int depth_, float density_ = -1.0) override {
+    grow_impl(n_trees_, depth_, UIntRowMatrix(), corpus, density_, 1, true);
+  }
+
+ private:
+  void grow_impl(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn,
+                 const Eigen::Ref<const RowMatrix> &train, float density_, int b_,
+                 bool unsupervised) {
     if (!empty()) {
       throw std::logic_error("The index has already been grown.");
     }
-
     if (n_trees_ <= 0) {
       throw std::out_of_range("The number of trees must be positive.");
     }
-
-    int n_train = train_.rows();
+    const int n_train = train.rows();
     if (depth_ <= 0 || depth_ > std::log2(n_train) || depth_ > 29) {
       throw std::out_of_range(
           "The depth must belong to the set {1, ... , min(log2(n_train), 29)}.");
     }
+    if (dim <= 0 || n_corpus <= 0 || train.cols() != dim || (unsupervised && !train.allFinite()) ||
+        (!unsupervised &&
+         (knn.rows() != n_train || knn.cols() < 1 || knn.maxCoeff() >= uint32_t(n_corpus)))) {
+      throw std::invalid_argument("Invalid forest data or dimensions.");
+    }
+    const float requested_density = density_ < 0 ? float(1.0 / std::sqrt(dim)) : density_;
+    if (!std::isfinite(requested_density)) {
+      throw std::invalid_argument("Density must be finite.");
+    }
+    if (n_trees_ > std::numeric_limits<int>::max() / depth_) {
+      throw std::length_error("Too many random projections.");
+    }
 
+    corpus_leaves = unsupervised;
     n_trees = n_trees_;
     depth = depth_;
-    n_inner_nodes = (1 << depth_) - 1;
-    n_leaves = 1 << depth_;
+    n_inner_nodes = (1 << depth) - 1;
+    n_leaves = 1 << depth;
+    n_array = 1 << (depth + 1);
+    n_pool = n_trees * depth;
+    density = requested_density;
     b = b_;
-    n_pool = n_trees_ * depth_;
-    n_array = 1 << (depth_ + 1);
 
-    if (density_ < 0) {
-      density = 1.0 / std::sqrt(dim);
-    } else {
-      density = density_;
+    initialize_projections();
+    split_points.resize(n_inner_nodes, n_trees);
+    labels_all.resize(n_trees);
+    if (!corpus_leaves) votes_all.resize(n_trees);
+
+#pragma omp parallel
+    {
+      TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, depth);
+#pragma omp for schedule(dynamic, 1)
+      for (int tree = 0; tree < n_trees; ++tree) {
+        labels_all[tree].resize(n_leaves);
+        if (!corpus_leaves) votes_all[tree].resize(n_leaves);
+        std::iota(scratch.rows.begin(), scratch.rows.end(), 0);
+        // Retain Eigen's original projection arithmetic and matrix layout.
+        if (density < 1) {
+          scratch.projections.noalias() =
+              sparse_random_matrix.middleRows(tree * depth, depth) * train.transpose();
+        } else {
+          scratch.projections.noalias() =
+              dense_random_matrix.middleRows(tree * depth, depth) * train.transpose();
+        }
+        grow_subtree(scratch.rows.begin(), scratch.rows.end(), 0, 0, tree, knn, scratch);
+      }
     }
-
-    const Eigen::Map<const UIntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
-    const Eigen::Map<const RowMatrix> train(train_.data(), train_.rows(), train_.cols());
-
-    density < 1 ? build_sparse_random_matrix(sparse_random_matrix, n_pool, dim, density)
-                : build_dense_random_matrix(dense_random_matrix, n_pool, dim);
-
-    split_points = Eigen::MatrixXf(n_array, n_trees);
-    labels_all = std::vector<std::vector<std::vector<uint32_t>>>(n_trees);
-    votes_all = std::vector<std::vector<std::vector<float>>>(n_trees);
-
-#pragma omp parallel for
-    for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
-      labels_all[n_tree] = std::vector<std::vector<uint32_t>>(n_leaves);
-      votes_all[n_tree] = std::vector<std::vector<float>>(n_leaves);
-      Eigen::MatrixXf tree_projections;
-
-      if (density < 1)
-        tree_projections.noalias() =
-            sparse_random_matrix.middleRows(n_tree * depth, depth) * train.transpose();
-      else
-        tree_projections.noalias() =
-            dense_random_matrix.middleRows(n_tree * depth, depth) * train.transpose();
-
-      std::vector<int> indices(n_train);
-      std::iota(indices.begin(), indices.end(), 0);
-
-      grow_subtree(indices.begin(), indices.end(), 0, 0, n_tree, tree_projections,
-                   labels_all[n_tree], votes_all[n_tree], knn);
-    }
+    mlann_detail::promote_existing_corpus_pages(corpus.data(),
+                                                size_t(corpus.size()) * sizeof(float));
   }
 
+ public:
   void query(const float *data, int k, float vote_threshold, int *out, Distance dist = L2,
-             float *out_distances = nullptr, int *out_n_elected = nullptr) const {
-    const Eigen::Map<const Eigen::VectorXf> q(data, dim);
+             float *out_distances = nullptr, int *out_n_elected = nullptr) const override {
+    static thread_local Eigen::VectorXf projected;
+    static thread_local mlann_detail::HugeBuffer<float> votes_total;
+    static thread_local std::vector<uint32_t> elected;
+    projected.resize(n_pool);
+    const Eigen::Map<const Eigen::VectorXf> query(data, dim);
+    if (density < 1) {
+      projected.noalias() = sparse_random_matrix * query;
+    } else {
+      projected.noalias() = dense_random_matrix * query;
+    }
+    votes_total.resize(n_corpus);
+    std::fill_n(votes_total.data(), n_corpus, 0.f);
+    elected.clear();
 
-    Eigen::VectorXf projected_query(n_pool);
-    if (density < 1)
-      projected_query.noalias() = sparse_random_matrix * q;
-    else
-      projected_query.noalias() = dense_random_matrix * q;
-
-    std::vector<int> found_leaves(n_trees);
-    for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
-      int idx_tree = 0;
-      for (int d = 0; d < depth; ++d) {
-        const int j = n_tree * depth + d;
-        const int idx_left = 2 * idx_tree + 1;
-        const int idx_right = idx_left + 1;
-        const float split_point = split_points(idx_tree, n_tree);
-        if (projected_query(j) <= split_point) {
-          idx_tree = idx_left;
+    std::array<int, routing_batch_size> leaves;
+    for (int first = 0; first < n_trees; first += routing_batch_size) {
+      const int count = std::min(routing_batch_size, n_trees - first);
+      route_batch(projected.data(), first, count, leaves.data());
+      for (int t = 0; t < count; ++t) {
+        const int leaf = leaves[t];
+        if (corpus_leaves) {
+          mlann_detail::accumulate_unit_votes(labels_all[first + t][leaf], votes_total.data(),
+                                              vote_threshold, elected);
         } else {
-          idx_tree = idx_right;
-        }
-      }
-      found_leaves[n_tree] = idx_tree - n_inner_nodes;
-    }
-
-    std::vector<uint32_t> elected;
-    Eigen::VectorXf votes_total = Eigen::VectorXf::Zero(n_corpus);
-
-    for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
-      int leaf_idx = found_leaves[n_tree];
-      const std::vector<uint32_t> &labels = labels_all[n_tree][leaf_idx];
-      const std::vector<float> &votes = votes_all[n_tree][leaf_idx];
-      int n_labels = labels.size();
-      for (int i = 0; i < n_labels; ++i) {
-        if ((votes_total(labels[i]) += votes[i]) >= vote_threshold) {
-          elected.push_back(labels[i]);
-          votes_total(labels[i]) = -9999999;
+          mlann_detail::accumulate_neighbor_votes(labels_all[first + t][leaf],
+                                                  votes_all[first + t][leaf], votes_total.data(),
+                                                  vote_threshold, elected);
         }
       }
     }
-
     if (out_n_elected) *out_n_elected = elected.size();
-
-    const Eigen::Map<const Eigen::RowVectorXf> qT(data, dim);
-    exact_knn(qT, k, elected, out, dist, out_distances);
+    exact_knn(Eigen::Map<const Eigen::RowVectorXf>(data, dim), k, elected, out, dist, out_distances,
+              mlann_detail::compute_neighbor_scores, mlann_detail::compute_neighbor_topk);
   }
 
  private:
-  std::pair<std::vector<uint32_t>, std::vector<float>> count_votes(
-      std::vector<int>::iterator leaf_begin, std::vector<int>::iterator leaf_end,
-      const Eigen::Ref<const UIntRowMatrix> &knn) {
-    const int k_build = knn.cols();
-    const size_t L = static_cast<size_t>(leaf_end - leaf_begin);
-    const size_t M = L * static_cast<size_t>(k_build);
+  using IndexIterator = std::vector<int>::iterator;
+  static constexpr int routing_batch_size = 64;
+  bool corpus_leaves = false;
+  RowMatrix dense_random_matrix;
+  Eigen::SparseMatrix<float, Eigen::RowMajor> sparse_random_matrix;
 
-    std::unordered_map<uint32_t, int> votes;
-    votes.reserve(M);
+  struct TreeScratch {
+    std::vector<int> rows;
+    std::vector<int> votes;
+    std::vector<uint32_t> touched_ids;
+    Eigen::MatrixXf projections;
 
-    for (auto it = leaf_begin; it != leaf_end; ++it) {
-      const int col_idx = *it;
-      auto col = knn.row(col_idx);
-      for (int j = 0; j < k_build; ++j) {
-        const uint32_t id = col(j);
-        auto [p, inserted] = votes.try_emplace(id, 0);
-        ++p->second;
+    TreeScratch(int corpus_size, int train_size, int depth)
+        : rows(train_size), votes(corpus_size, 0), projections(depth, train_size) {}
+  };
+
+  void initialize_projections() {
+    std::random_device rd;
+    std::minstd_rand generator(rd());
+    std::normal_distribution<float> normal(0, 1);
+    if (density < 1) {
+      std::uniform_real_distribution<float> uniform(0, 1);
+      sparse_random_matrix.resize(n_pool, dim);
+      // Rows and coordinates arrive in sorted order; fill CSR directly instead
+      // of constructing and sorting a second collection of triplets.
+      for (int row = 0; row < n_pool; ++row) {
+        sparse_random_matrix.startVec(row);
+        for (int column = 0; column < dim; ++column) {
+          if (uniform(generator) > density) continue;
+          sparse_random_matrix.insertBack(row, column) = normal(generator);
+        }
       }
+      sparse_random_matrix.finalize();
+      sparse_random_matrix.makeCompressed();
+    } else {
+      dense_random_matrix.resize(n_pool, dim);
+      std::generate(dense_random_matrix.data(),
+                    dense_random_matrix.data() + dense_random_matrix.size(),
+                    [&] { return normal(generator); });
     }
-
-    std::vector<uint32_t> out_labels;
-    std::vector<float> out_votes;
-    out_labels.reserve(votes.size());
-    out_votes.reserve(votes.size());
-
-    for (const auto &kv : votes) {
-      const int cnt = kv.second;
-      if (cnt >= b) {
-        out_labels.push_back(kv.first);
-        out_votes.push_back(static_cast<float>(cnt));
-      }
-    }
-
-    return {std::move(out_labels), std::move(out_votes)};
   }
 
-  /**
-   * Builds a single random projection tree. The tree is constructed by recursively
-   * projecting the data on a random vector and splitting into two by the median.
-   */
-  void grow_subtree(std::vector<int>::iterator begin, std::vector<int>::iterator end,
-                    int tree_level, int i, int n_tree, const Eigen::MatrixXf &tree_projections,
-                    std::vector<std::vector<uint32_t>> &labels_tree,
-                    std::vector<std::vector<float>> &votes_tree,
-                    const Eigen::Map<const UIntRowMatrix> &knn) {
-    int n = end - begin;
-    int idx_left = 2 * i + 1;
-    int idx_right = idx_left + 1;
-
-    if (tree_level == depth) {
-      int index_leaf = i - n_inner_nodes;
-      auto ret = count_votes(begin, end, knn);
-      labels_tree[index_leaf] = ret.first;
-      votes_tree[index_leaf] = ret.second;
+  void make_leaf(IndexIterator begin, IndexIterator end, int tree, int leaf,
+                 const Eigen::Ref<const UIntRowMatrix> &knn, TreeScratch &scratch) {
+    if (corpus_leaves) {
+      labels_all[tree][leaf].assign(begin, end);
       return;
     }
-
-    miniselect::pdqselect_branchless(
-        begin, begin + n / 2, end, [&tree_projections, tree_level](int i1, int i2) {
-          return tree_projections(tree_level, i1) < tree_projections(tree_level, i2);
-        });
-    auto mid = end - n / 2;
-
-    if (n % 2) {
-      split_points(i, n_tree) = tree_projections(tree_level, *(mid - 1));
-    } else {
-      auto left_it = std::max_element(begin, mid, [&tree_projections, tree_level](int i1, int i2) {
-        return tree_projections(tree_level, i1) < tree_projections(tree_level, i2);
-      });
-      split_points(i, n_tree) =
-          (tree_projections(tree_level, *mid) + tree_projections(tree_level, *left_it)) / 2.0;
-    }
-
-    grow_subtree(begin, mid, tree_level + 1, idx_left, n_tree, tree_projections, labels_tree,
-                 votes_tree, knn);
-    grow_subtree(mid, end, tree_level + 1, idx_right, n_tree, tree_projections, labels_tree,
-                 votes_tree, knn);
-  }
-
-  /**
-   * Builds a random sparse matrix for use in random projection. The components of
-   * the matrix are drawn from the distribution
-   *
-   *       0 w.p. 1 - a
-   * N(0, 1) w.p. a
-   *
-   * where a = density.
-   */
-  static void build_sparse_random_matrix(
-      Eigen::SparseMatrix<float, Eigen::RowMajor> &sparse_random_matrix, int n_row, int n_col,
-      float density) {
-    sparse_random_matrix = Eigen::SparseMatrix<float, Eigen::RowMajor>(n_row, n_col);
-
-    std::random_device rd;
-    std::minstd_rand gen(rd());
-    std::uniform_real_distribution<float> uni_dist(0, 1);
-    std::normal_distribution<float> norm_dist(0, 1);
-
-    std::vector<Eigen::Triplet<float>> triplets;
-    for (int j = 0; j < n_row; ++j) {
-      for (int i = 0; i < n_col; ++i) {
-        if (uni_dist(gen) > density) continue;
-        triplets.push_back(Eigen::Triplet<float>(j, i, norm_dist(gen)));
+    scratch.touched_ids.clear();
+    scratch.touched_ids.reserve(std::min<size_t>(n_corpus, size_t(end - begin) * knn.cols()));
+    for (auto it = begin; it != end; ++it) {
+      const uint32_t *labels = knn.row(*it).data();
+      for (int j = 0; j < knn.cols(); ++j) {
+        const auto label = labels[j];
+        if (scratch.votes[label]++ == 0) scratch.touched_ids.push_back(label);
       }
     }
-
-    sparse_random_matrix.setFromTriplets(triplets.begin(), triplets.end());
-    sparse_random_matrix.makeCompressed();
+    auto &labels = labels_all[tree][leaf];
+    auto &votes = votes_all[tree][leaf];
+    labels.reserve(scratch.touched_ids.size());
+    votes.reserve(scratch.touched_ids.size());
+    for (const auto label : scratch.touched_ids) {
+      const int count = scratch.votes[label];
+      scratch.votes[label] = 0;
+      if (count >= b) {
+        labels.push_back(label);
+        // RP retains raw counts; RF's leaf-vote normalization does not apply.
+        votes.push_back(static_cast<float>(count));
+      }
+    }
   }
 
-  /*
-   * Builds a random dense matrix for use in random projection. The components of
-   * the matrix are drawn from the standard normal distribution.
-   */
-  static void build_dense_random_matrix(
-      Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> &dense_random_matrix,
-      int n_row, int n_col) {
-    dense_random_matrix =
-        Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(n_row, n_col);
-
-    std::random_device rd;
-    std::minstd_rand gen(rd());
-    std::normal_distribution<float> normal_dist(0, 1);
-
-    std::generate(dense_random_matrix.data(),
-                  dense_random_matrix.data() + dense_random_matrix.size(),
-                  [&normal_dist, &gen] { return normal_dist(gen); });
+  void grow_subtree(IndexIterator begin, IndexIterator end, int level, int node, int tree,
+                    const Eigen::Ref<const UIntRowMatrix> &knn, TreeScratch &scratch) {
+    if (level == depth) {
+      make_leaf(begin, end, tree, node - n_inner_nodes, knn, scratch);
+      return;
+    }
+    const int count = end - begin;
+    const auto less = [&](int left, int right) {
+      return scratch.projections(level, left) < scratch.projections(level, right);
+    };
+    miniselect::pdqselect_branchless(begin, begin + count / 2, end, less);
+    const auto mid = end - count / 2;
+    if (count % 2) {
+      split_points(node, tree) = scratch.projections(level, *(mid - 1));
+    } else {
+      const auto left = std::max_element(begin, mid, less);
+      split_points(node, tree) =
+          (scratch.projections(level, *mid) + scratch.projections(level, *left)) / 2.0;
+    }
+    grow_subtree(begin, mid, level + 1, 2 * node + 1, tree, knn, scratch);
+    grow_subtree(mid, end, level + 1, 2 * node + 2, tree, knn, scratch);
   }
 
-  Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> dense_random_matrix;
-  Eigen::SparseMatrix<float, Eigen::RowMajor> sparse_random_matrix;
+  void route_batch(const float *projected, int first, int count, int *leaves) const {
+    std::array<int, routing_batch_size> nodes{};
+    for (int level = 0; level < depth; ++level) {
+      for (int t = 0; t < count; ++t) {
+        const int tree = first + t;
+        nodes[t] = 2 * nodes[t] +
+                   (projected[tree * depth + level] <= split_points(nodes[t], tree) ? 1 : 2);
+      }
+    }
+    for (int t = 0; t < count; ++t) leaves[t] = nodes[t] - n_inner_nodes;
+  }
 };

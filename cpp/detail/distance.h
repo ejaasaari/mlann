@@ -50,8 +50,8 @@ static inline float dot_product(const float *x1, const float *x2, size_t length)
 
   size_t i;
   for (i = 0; i + 7 < length; i += 8) {
-    __m256 v1 = _mm256_load_ps(x1 + i);
-    __m256 v2 = _mm256_load_ps(x2 + i);
+    __m256 v1 = _mm256_loadu_ps(x1 + i);
+    __m256 v2 = _mm256_loadu_ps(x2 + i);
     sum = _mm256_fmadd_ps(v1, v2, sum);
   }
 
@@ -71,8 +71,8 @@ static inline float dot_product(const float *x1, const float *x2, size_t length)
 
   size_t i;
   for (i = 0; i + 7 < length; i += 8) {
-    __m256 v1 = _mm256_load_ps(x1 + i);
-    __m256 v2 = _mm256_load_ps(x2 + i);
+    __m256 v1 = _mm256_loadu_ps(x1 + i);
+    __m256 v2 = _mm256_loadu_ps(x2 + i);
     __m256 prod = _mm256_mul_ps(v1, v2);
     sum = _mm256_add_ps(sum, prod);
   }
@@ -162,8 +162,8 @@ static inline float squared_euclidean(const float *x1, const float *x2, size_t l
 
   size_t i;
   for (i = 0; i + 7 < length; i += 8) {
-    __m256 v1 = _mm256_load_ps(x1 + i);
-    __m256 v2 = _mm256_load_ps(x2 + i);
+    __m256 v1 = _mm256_loadu_ps(x1 + i);
+    __m256 v2 = _mm256_loadu_ps(x2 + i);
     __m256 diff = _mm256_sub_ps(v1, v2);
     sum = _mm256_fmadd_ps(diff, diff, sum);
   }
@@ -185,8 +185,8 @@ static inline float squared_euclidean(const float *x1, const float *x2, size_t l
 
   size_t i;
   for (i = 0; i + 7 < length; i += 8) {
-    __m256 v1 = _mm256_load_ps(x1 + i);
-    __m256 v2 = _mm256_load_ps(x2 + i);
+    __m256 v1 = _mm256_loadu_ps(x1 + i);
+    __m256 v2 = _mm256_loadu_ps(x2 + i);
     __m256 diff = _mm256_sub_ps(v1, v2);
     __m256 squared = _mm256_mul_ps(diff, diff);
     sum = _mm256_add_ps(sum, squared);

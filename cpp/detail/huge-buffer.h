@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <new>
 #include <memory>
+#include <new>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -71,8 +71,8 @@ class HugeBuffer {
     if (n > (SIZE_MAX - 2 * huge) / sizeof(T)) throw std::bad_alloc();
     if (n * sizeof(T) >= huge) {
       const size_t bytes = (n * sizeof(T) + huge - 1) & ~(huge - 1);
-      void *raw = mmap(nullptr, bytes + huge, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      void *raw =
+          mmap(nullptr, bytes + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       if (raw != MAP_FAILED) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(raw);
         const uintptr_t aligned = (base + huge - 1) & ~uintptr_t(huge - 1);

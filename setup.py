@@ -66,6 +66,12 @@ def get_architecture():
 def native_flags(compiler):
     c = compiler.lower()
     a = get_architecture()
+    target = os.environ.get("MLANN_TARGET_ARCH")
+    if target:
+        if a not in ("x86", "x86-64"):
+            raise ValueError("MLANN_TARGET_ARCH is only supported on x86 targets")
+        # Keep the requested ISA independent of the machine running the build.
+        return [f"-march={target}"]
 
     mn = ["-march=native", "-mtune=native"]
     mc = ["-mcpu=native"]
@@ -162,6 +168,8 @@ class BuildExt(build_ext):
             for flag in native + ["-fvisibility=hidden"]:
                 if has_flag(self.compiler, flag):
                     opts.append(flag)
+                elif os.environ.get("MLANN_TARGET_ARCH") and flag.startswith("-march="):
+                    raise ValueError(f"Compiler does not support the requested target: {flag}")
 
             if sys.platform == "darwin":
                 opts.append("-mmacosx-version-min=11.0")

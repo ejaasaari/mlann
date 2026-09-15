@@ -1,8 +1,10 @@
 #pragma once
 
-#include "one-to-many.h"
-#include <vector>
 #include <algorithm>
+#include <vector>
+
+#include "miniselect/pdqselect.h"
+#include "one-to-many.h"
 
 namespace mlann_detail {
 // Same arithmetic and output buffers as the native scorer. Smaller batches and
@@ -13,7 +15,7 @@ namespace mlann_detail {
 struct NeighborOneToManyKernel {
  private:
   static MLANN_NEIGHBOR_INLINE __m512 multiply_add(const __m512 sum, const __m512 left,
-                                                     const __m512 right) {
+                                                   const __m512 right) {
 #if defined(__FMA__)
     return _mm512_fmadd_ps(left, right, sum);
 #else
@@ -23,7 +25,7 @@ struct NeighborOneToManyKernel {
 
   template <OneToManyMetric metric>
   static MLANN_NEIGHBOR_INLINE float run_one(const float *query, const float *row,
-                                               const std::size_t dim) {
+                                             const std::size_t dim) {
     __m512 sum = _mm512_setzero_ps();
     std::size_t j = 0;
     if constexpr (metric == OneToManyMetric::L2) {
@@ -53,12 +55,12 @@ struct NeighborOneToManyKernel {
  public:
   template <OneToManyMetric metric, typename Output>
   static MLANN_NEIGHBOR_INLINE void run(const float *query, const float *data,
-                                          const std::size_t dim, const std::uint32_t *indices,
-                                          const std::size_t count, Output output) {
+                                        const std::size_t dim, const std::uint32_t *indices,
+                                        const std::size_t count, Output output) {
     std::size_t candidate = 0;
     for (; count - candidate >= 4; candidate += 4) {
-      for (std::size_t future = candidate + 32;
-           future < count && future < candidate + 32 + 4; ++future) {
+      for (std::size_t future = candidate + 32; future < count && future < candidate + 32 + 4;
+           ++future) {
         const float *row = data + static_cast<std::size_t>(indices[future]) * dim;
         for (std::size_t j = 0; j < dim; j += 16) __builtin_prefetch(row + j, 0, 2);
       }
@@ -76,7 +78,7 @@ struct NeighborOneToManyKernel {
       if constexpr (metric == OneToManyMetric::L2) {
         for (; j + 16 <= dim; j += 16) {
           const __m512 query_vector = _mm512_loadu_ps(query + j);
-#define MLANN_NEIGHBOR_AVX512_L2(i)                                                     \
+#define MLANN_NEIGHBOR_AVX512_L2(i)                                                \
   const __m512 diff##i = _mm512_sub_ps(query_vector, _mm512_loadu_ps(row##i + j)); \
   sum##i = multiply_add(sum##i, diff##i, diff##i);
           MLANN_NEIGHBOR_REPEAT_4(MLANN_NEIGHBOR_AVX512_L2)
@@ -99,7 +101,7 @@ struct NeighborOneToManyKernel {
       if constexpr (metric == OneToManyMetric::L2) {
         for (; j < dim; ++j) {
           const float query_value = query[j];
-#define MLANN_NEIGHBOR_AVX512_TAIL_L2(i)              \
+#define MLANN_NEIGHBOR_AVX512_TAIL_L2(i)         \
   const float diff##i = query_value - row##i[j]; \
   scalar##i += diff##i * diff##i;
           MLANN_NEIGHBOR_REPEAT_4(MLANN_NEIGHBOR_AVX512_TAIL_L2)
@@ -133,9 +135,9 @@ struct NeighborOneToManyKernel {
 #endif
 
 template <typename Output>
-inline void compute_neighbor_one_to_many(const float *query, const float *data,
-                                         size_t dim, const uint32_t *indices,
-                                         size_t count, OneToManyMetric metric, Output output) {
+inline void compute_neighbor_one_to_many(const float *query, const float *data, size_t dim,
+                                         const uint32_t *indices, size_t count,
+                                         OneToManyMetric metric, Output output) {
 #if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__))
   if (metric == OneToManyMetric::L2)
     NeighborOneToManyKernel::run<OneToManyMetric::L2>(query, data, dim, indices, count, output);
@@ -146,9 +148,8 @@ inline void compute_neighbor_one_to_many(const float *query, const float *data,
 #endif
 }
 
-inline void compute_neighbor_scores(const float *query, const float *data,
-                                    size_t dim, const uint32_t *indices,
-                                    size_t count, OneToManyMetric metric,
+inline void compute_neighbor_scores(const float *query, const float *data, size_t dim,
+                                    const uint32_t *indices, size_t count, OneToManyMetric metric,
                                     StridedFloatOutput output) {
   compute_neighbor_one_to_many(query, data, dim, indices, count, metric, output);
 }
@@ -158,8 +159,10 @@ inline void compute_neighbor_scores(const float *query, const float *data,
 template <OneToManyMetric metric>
 struct NeighborTopKOrder {
   bool operator()(const ScoredCandidate &left, const ScoredCandidate &right) const {
-    if constexpr (metric == OneToManyMetric::IP) return left.score > right.score;
-    else return left.score < right.score;
+    if constexpr (metric == OneToManyMetric::IP)
+      return left.score > right.score;
+    else
+      return left.score < right.score;
   }
 };
 
@@ -203,15 +206,15 @@ struct NeighborTopKOutput {
 };
 
 template <OneToManyMetric metric>
-inline void compute_neighbor_topk_impl(const float *query, const float *data,
-                                       size_t dim, const uint32_t *indices, size_t count,
-                                       size_t k, ScoredCandidate *output) {
+inline void compute_neighbor_topk_impl(const float *query, const float *data, size_t dim,
+                                       const uint32_t *indices, size_t count, size_t k,
+                                       ScoredCandidate *output) {
   const size_t keep = std::min(k, count);
   if (!keep) return;
   NeighborTopKState<metric> state{output, indices, keep};
   compute_neighbor_one_to_many(query, data, dim, indices, count, metric,
                                NeighborTopKOutput<metric>{&state});
-  std::sort(output, output + keep, NeighborTopKOrder<metric>{});
+  miniselect::pdqsort_branchless(output, output + keep, NeighborTopKOrder<metric>{});
 }
 
 inline void compute_neighbor_topk(const float *query, const float *data, size_t dim,
@@ -225,10 +228,9 @@ inline void compute_neighbor_topk(const float *query, const float *data, size_t 
 
 // Leaf labels are unique. SIMD updates therefore preserve the original
 // per-label accumulation order across trees and the elected-candidate order.
-inline void accumulate_neighbor_votes(const std::vector<uint32_t> &labels,
-                                       const std::vector<float> &weights,
-                                       float *votes, float threshold,
-                                       std::vector<uint32_t> &elected) {
+template <bool unit_votes>
+inline void accumulate_leaf_votes(const std::vector<uint32_t> &labels, const float *weights,
+                                  float *votes, float threshold, std::vector<uint32_t> &elected) {
   size_t i = 0;
 #if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__))
   const __m512 limit = _mm512_set1_ps(threshold);
@@ -237,8 +239,8 @@ inline void accumulate_neighbor_votes(const std::vector<uint32_t> &labels,
     for (size_t j = i + 32; j < labels.size() && j < i + 48; ++j)
       __builtin_prefetch(votes + labels[j], 1, 1);
     const __m512i ids = _mm512_loadu_si512(labels.data() + i);
-    const __m512 updated = _mm512_add_ps(_mm512_i32gather_ps(ids, votes, 4),
-                                        _mm512_loadu_ps(weights.data() + i));
+    const __m512 weight = unit_votes ? _mm512_set1_ps(1.f) : _mm512_loadu_ps(weights + i);
+    const __m512 updated = _mm512_add_ps(_mm512_i32gather_ps(ids, votes, 4), weight);
     unsigned selected = _mm512_cmp_ps_mask(updated, limit, _CMP_GE_OQ);
     _mm512_i32scatter_ps(votes, ids, _mm512_mask_mov_ps(updated, selected, sentinel), 4);
     while (selected) {
@@ -252,10 +254,20 @@ inline void accumulate_neighbor_votes(const std::vector<uint32_t> &labels,
 #if defined(__GNUC__) || defined(__clang__)
     if (i + 32 < labels.size()) __builtin_prefetch(votes + labels[i + 32], 1, 1);
 #endif
-    if ((votes[labels[i]] += weights[i]) >= threshold) {
+    if ((votes[labels[i]] += (unit_votes ? 1.f : weights[i])) >= threshold) {
       elected.push_back(labels[i]);
       votes[labels[i]] = -9999999.f;
     }
   }
+}
+inline void accumulate_neighbor_votes(const std::vector<uint32_t> &labels,
+                                      const std::vector<float> &weights, float *votes,
+                                      float threshold, std::vector<uint32_t> &elected) {
+  accumulate_leaf_votes<false>(labels, weights.data(), votes, threshold, elected);
+}
+
+inline void accumulate_unit_votes(const std::vector<uint32_t> &ids, float *votes, float threshold,
+                                  std::vector<uint32_t> &elected) {
+  accumulate_leaf_votes<true>(ids, nullptr, votes, threshold, elected);
 }
 }  // namespace mlann_detail

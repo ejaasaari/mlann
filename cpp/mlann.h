@@ -6,9 +6,9 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include "distance.h"
+#include "detail/distance.h"
+#include "detail/one-to-many.h"
 #include "miniselect/pdqselect.h"
-#include "one-to-many.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
 typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> UIntRowMatrix;
@@ -24,6 +24,10 @@ class MLANN {
 
   virtual void grow(int n_trees_, int depth_, const Eigen::Ref<const UIntRowMatrix> &knn_,
                     const Eigen::Ref<const RowMatrix> &train_, float density_ = -1.0, int b_ = 1) {}
+
+  virtual void grow_unsupervised(int n_trees_, int depth_, float density_ = -1.0) {
+    throw std::invalid_argument("Unsupervised builds are supported only by KD, PCA and RP.");
+  }
 
   virtual void query(const float *data, int k, float vote_threshold, int *out, Distance dist = L2,
                      float *out_distances = nullptr, int *out_n_elected = nullptr) const {}
@@ -110,15 +114,14 @@ class MLANN {
   bool empty() const { return n_trees == 0; }
 
  protected:
-  using CandidateScoreKernel = void (*)(const float *, const float *, size_t,
-                                        const uint32_t *, size_t,
-                                        mlann_detail::OneToManyMetric,
+  using CandidateScoreKernel = void (*)(const float *, const float *, size_t, const uint32_t *,
+                                        size_t, mlann_detail::OneToManyMetric,
                                         mlann_detail::StridedFloatOutput);
 
   using ScoredCandidate = mlann_detail::ScoredCandidate;
-  using CandidateTopKKernel = void (*)(const float *, const float *, size_t,
-                                       const uint32_t *, size_t, size_t,
-                                       mlann_detail::OneToManyMetric, ScoredCandidate *);
+  using CandidateTopKKernel = void (*)(const float *, const float *, size_t, const uint32_t *,
+                                       size_t, size_t, mlann_detail::OneToManyMetric,
+                                       ScoredCandidate *);
 
   void exact_knn(const Eigen::Map<const Eigen::RowVectorXf> &q, int k,
                  const std::vector<uint32_t> &indices, int *out, Distance dist = L2,
@@ -145,8 +148,8 @@ class MLANN {
         score_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, metric, output);
       } else {
         mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
-                                          indices.data(), static_cast<std::size_t>(n_elected), metric,
-                                          distances.data());
+                                          indices.data(), static_cast<std::size_t>(n_elected),
+                                          metric, distances.data());
       }
       Eigen::MatrixXf::Index index;
 
@@ -168,18 +171,18 @@ class MLANN {
     // Both paths share this allocation; streaming ranking only needs k records.
     scored.resize(topk_kernel ? n_to_sort : n_elected);
     if (topk_kernel) {
-      topk_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected,
-                   n_to_sort, metric, scored.data());
+      topk_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, n_to_sort, metric,
+                  scored.data());
     } else {
       for (int i = 0; i < n_elected; ++i) scored[i].label = indices[i];
-      const mlann_detail::StridedFloatOutput scores{reinterpret_cast<unsigned char *>(scored.data()),
-                                                    sizeof(ScoredCandidate)};
+      const mlann_detail::StridedFloatOutput scores{
+          reinterpret_cast<unsigned char *>(scored.data()), sizeof(ScoredCandidate)};
       if (score_kernel) {
         score_kernel(q.data(), corpus.data(), dim, indices.data(), n_elected, metric, scores);
       } else {
         mlann_detail::compute_one_to_many(q.data(), corpus.data(), static_cast<std::size_t>(dim),
-                                          indices.data(), static_cast<std::size_t>(n_elected), metric,
-                                          scores);
+                                          indices.data(), static_cast<std::size_t>(n_elected),
+                                          metric, scores);
       }
 
       if (dist == L2) {
