@@ -48,17 +48,35 @@ class IVF : public MLANN {
         const RowMatrix projected_corpus = project(corpus, new_rotation);
         const RowMatrix projected_train = project(train, new_rotation);
         std::vector<Partition> new_partitions(n_trees_);
+        std::exception_ptr error;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
         for (int tree = 0; tree < n_trees_; ++tree) {
-            auto& partition = new_partitions[tree];
-            const Eigen::Index offset = Eigen::Index(tree) * subspace_dim;
-            partition.centroids = mlann_detail::KMeans::fit(
-                projected_corpus.middleCols(offset, subspace_dim), seeds, partition.iterations
-            );
-            partition.norms = partition.centroids.rowwise().squaredNorm();
-            const auto assignments = mlann_detail::KMeans::assign(
-                projected_train.middleCols(offset, subspace_dim), partition.centroids
-            );
-            make_cells(partition, assignments, knn);
+            try {
+                auto& partition = new_partitions[tree];
+                const Eigen::Index offset = Eigen::Index(tree) * subspace_dim;
+                partition.centroids = mlann_detail::KMeans::fit(
+                    projected_corpus.middleCols(offset, subspace_dim), seeds, partition.iterations
+                );
+                partition.norms = partition.centroids.rowwise().squaredNorm();
+                const auto assignments = mlann_detail::KMeans::assign(
+                    projected_train.middleCols(offset, subspace_dim), partition.centroids
+                );
+                make_cells(partition, assignments, knn);
+            } catch (...) {
+#ifdef _OPENMP
+#pragma omp critical(ivf_build_error)
+#endif
+                {
+                    if (!error) {
+                        error = std::current_exception();
+                    }
+                }
+            }
+        }
+        if (error) {
+            std::rethrow_exception(error);
         }
 
         rotation = std::move(new_rotation);

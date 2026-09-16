@@ -591,8 +591,7 @@ class CraftML : public MLANN {
             scratch.assignment,
             scratch.sizes,
             true,
-            options.iterations,
-            false
+            options.iterations
         );
     }
 

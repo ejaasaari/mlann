@@ -369,8 +369,25 @@ inline RowMatrix neighbor_means(
 // Fit the query direction from its cross-covariance with neighbor means.
 inline Eigen::VectorXf pls(const Sample& sample, const Matrix& targets) {
     QueryBasis query_basis(sample.x);
-    const Eigen::MatrixXf cross = (query_basis.get(sample.x).transpose() * targets) / sample.n();
-    return query_basis.expand(leading((cross * cross.transpose())));
+    Eigen::MatrixXf cross;
+    if (query_basis.reduced) {
+        const int size = sample.n();
+        cross.resize(size, targets.cols());
+        // Columns before each diagonal block are zero in the transposed QR factor.
+        for (int first = 0; first < size; first += 32) {
+            const int rows = std::min(32, size - first);
+            cross.middleRows(first, rows).noalias() =
+                query_basis.coordinates.transpose().block(first, first, rows, size - first) *
+                targets.bottomRows(size - first);
+        }
+        cross /= size;
+    } else {
+        cross = (sample.x.transpose() * targets) / sample.n();
+    }
+    Eigen::MatrixXf gram = Eigen::MatrixXf::Zero(cross.rows(), cross.rows());
+    gram.selfadjointView<Eigen::Lower>().rankUpdate(cross);
+    gram.triangularView<Eigen::StrictlyUpper>() = gram.transpose();
+    return query_basis.expand(leading(gram));
 }
 
 inline float clogc(int count) {
@@ -793,6 +810,11 @@ class PLS : public MLANN {
             const int row = begin[sampled_rows[i]];
             sampled_queries.x.row(i) = train.row(row);
             for (int j = 0; j < sampled_queries.k; ++j) {
+#if defined(__GNUC__) || defined(__clang__)
+                if (j + 16 < sampled_queries.k) {
+                    __builtin_prefetch(&scratch.label_map[knn(row, j + 16)], 1, 1);
+                }
+#endif
                 const auto label = knn(row, j);
                 if (!scratch.label_map[label]) {
                     scratch.touched_ids.push_back(label);
