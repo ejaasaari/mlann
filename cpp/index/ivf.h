@@ -85,21 +85,6 @@ class IVF : public MLANN {
         n_trees = n_trees_;
     }
 
-    std::vector<LabelScore> predict(const float* q) const {
-        auto& scratch = query_scratch();
-        accumulate(q, scratch);
-        std::vector<LabelScore> result;
-        result.reserve(scratch.touched.size());
-        for (uint32_t id : scratch.touched) {
-            result.push_back({id, scratch.votes[id]});
-        }
-
-        miniselect::pdqsort_branchless(
-            result.begin(), result.end(), [](const auto& a, const auto& b) { return a.id < b.id; }
-        );
-        return result;
-    }
-
     using MLANN::query;
 
     void query(

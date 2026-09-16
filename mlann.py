@@ -261,16 +261,6 @@ class MLANNIndex(object):
             raise ValueError("Features must be finite float32 vectors with the corpus dimension")
         return np.require(q, dtype=np.float32, requirements=["C", "A"])
 
-    def candidate_scores(self, q):
-        """Return sparse (corpus IDs, probabilities) for one IVF or CraftML query."""
-        if not self.built:
-            raise RuntimeError("Cannot query before building index")
-        if self.index_type == "IVF":
-            return self.index.ivf_scores(self._distribution_features(q))
-        if self.index_type != "CRAFTML":
-            raise ValueError("candidate_scores is available for CraftML and IVF")
-        return self.index.craftml_scores(self._distribution_features(q))
-
     def exact_search(self, q, k, dist=mlannlib.L2, return_distances=False):
         """
         Performs an exact nearest neighbor query for a single query several queries in parallel. The queries are

@@ -170,20 +170,6 @@ class CraftML : public MLANN {
         );
     }
 
-    // Unpruned forest probabilities in original corpus-ID space, sorted by ID.
-    std::vector<LabelScore> predict(const float* q) const {
-        auto& scratch = query_scratch();
-        accumulate(q, scratch, nullptr);
-        std::vector<LabelScore> result;
-        result.reserve(scratch.touched.size());
-        for (uint32_t id : scratch.touched)
-            result.push_back({id, scratch.votes[id] / n_trees});
-        miniselect::pdqsort_branchless(
-            result.begin(), result.end(), [](const auto& a, const auto& b) { return a.id < b.id; }
-        );
-        return result;
-    }
-
     using MLANN::query;
 
     void query(

@@ -297,40 +297,25 @@ inline Eigen::VectorXf leading(const Eigen::MatrixXf& matrix, LeadingEigenStats*
 // When N < dim, every nonzero spectral direction lies in this row space.
 struct QueryBasis {
     Eigen::HouseholderQR<Eigen::MatrixXf> qr;
-    Eigen::MatrixXf basis;
     Matrix coordinates;
     bool reduced = false;
 
-    explicit QueryBasis(const Matrix& queries, bool implicit = true) {
+    explicit QueryBasis(const Matrix& queries) {
         if (queries.rows() < queries.cols()) {
             reduced = true;
-            if (implicit) {
-                // Keep the reflectors and apply them only to the fitted direction.
-                qr.compute(queries.transpose());
-                coordinates = qr.matrixQR()
-                                  .topRows(queries.rows())
-                                  .template triangularView<Eigen::Upper>()
-                                  .transpose();
-            } else {
-                Eigen::HouseholderQR<Eigen::MatrixXf> explicit_qr(queries.transpose());
-                basis = explicit_qr.householderQ() *
-                        Eigen::MatrixXf::Identity(queries.cols(), queries.rows());
-                coordinates = explicit_qr.matrixQR()
-                                  .topRows(queries.rows())
-                                  .template triangularView<Eigen::Upper>()
-                                  .transpose();
-            }
+            // Keep the reflectors and apply them only to the fitted direction.
+            qr.compute(queries.transpose());
+            coordinates = qr.matrixQR()
+                              .topRows(queries.rows())
+                              .template triangularView<Eigen::Upper>()
+                              .transpose();
         }
     }
-
-    const Matrix& get(const Matrix& queries) const { return reduced ? coordinates : queries; }
 
     Eigen::VectorXf expand(const Eigen::VectorXf& direction) const {
         Eigen::VectorXf result;
         if (!reduced) {
             result = direction;
-        } else if (basis.size()) {
-            result = basis * direction;
         } else {
             Eigen::VectorXf padded = Eigen::VectorXf::Zero(qr.rows());
             padded.head(direction.size()) = direction;
