@@ -8,43 +8,14 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 #include "../detail/huge-buffer.h"
 #include "../detail/neighbor-query.h"
 #include "../mlann.h"
 #include "../utils.h"
-
-struct SplitEntry {
-    float key;
-    int index;
-};
-
-struct SplitScratch {
-    std::vector<int> votes;
-    std::vector<int> compact_votes;
-    std::vector<uint16_t> compact_votes_16;
-    std::vector<int> ids;
-    std::vector<uint32_t> local;
-    std::vector<SplitEntry> order;
-    std::vector<float> left_ent;
-    std::vector<uint32_t> sampled_labels;
-    std::vector<size_t> sampled_offsets;
-    std::vector<size_t> label_counts;
-    std::vector<uint32_t> touched_ids;
-
-    void ensure_corpus(std::size_t n_corpus) {
-        if (votes.size() != n_corpus)
-            votes.assign(n_corpus, 0);
-    }
-    void ensure_n(int n) {
-        if ((int) ids.size() < n) {
-            ids.resize(n);
-            order.resize(n);
-            left_ent.resize(n);
-        }
-    }
-};
 
 class RF : public MLANN {
   public:
@@ -77,7 +48,7 @@ class RF : public MLANN {
             throw std::out_of_range("The number of trees must be positive.");
         }
 
-        int n_train = train_.rows();
+        const int n_train = train_.rows();
         if (depth_ <= 0 || depth_ > std::log2(n_train) || depth_ > 29) {
             throw std::out_of_range(
                 "The depth must belong to the set {1, ... , min(log2(n_train), 29)}."
@@ -124,16 +95,16 @@ class RF : public MLANN {
 
 #pragma omp parallel
         {
-            SplitScratch scratch;
+            TreeScratch scratch;
             scratch.ensure_corpus(n_corpus);
             std::vector<int> indices(n_train);
 
             // Release each worker's scratch as soon as its last tree finishes.
             // The parallel-region barrier still waits for all trees.
 #pragma omp for schedule(dynamic, 1) nowait
-            for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
-                labels_all[n_tree] = std::vector<std::vector<uint32_t>>(n_leaves);
-                votes_all[n_tree] = std::vector<std::vector<float>>(n_leaves);
+            for (int tree = 0; tree < n_trees; ++tree) {
+                labels_all[tree] = std::vector<std::vector<uint32_t>>(n_leaves);
+                votes_all[tree] = std::vector<std::vector<float>>(n_leaves);
 
                 std::iota(indices.begin(), indices.end(), 0);
 
@@ -142,12 +113,12 @@ class RF : public MLANN {
                     indices.end(),
                     0,
                     0,
-                    n_tree,
-                    labels_all[n_tree],
-                    votes_all[n_tree],
+                    tree,
+                    labels_all[tree],
+                    votes_all[tree],
                     train,
                     knn,
-                    random_dims_all[n_tree],
+                    random_dims_all[tree],
                     n_subsample,
                     scratch
                 );
@@ -173,12 +144,12 @@ class RF : public MLANN {
         std::fill_n(votes_total.data(), n_corpus, 0.f);
         elected.clear();
 
-        std::array<int, routing_batch_size> found_leaves;
+        std::array<int, routing_batch_size> leaves;
         for (int first = 0; first < n_trees; first += routing_batch_size) {
             const int count = std::min(routing_batch_size, n_trees - first);
-            route_batch(data, first, count, found_leaves.data());
+            route_batch(data, first, count, leaves.data());
             for (int t = 0; t < count; ++t) {
-                const int leaf = found_leaves[t];
+                const int leaf = leaves[t];
                 mlann_detail::accumulate_neighbor_votes(
                     labels_all[first + t][leaf],
                     votes_all[first + t][leaf],
@@ -204,47 +175,55 @@ class RF : public MLANN {
     }
 
   private:
+    using IndexIterator = std::vector<int>::iterator;
     static constexpr int routing_batch_size = 64;
-
-    // Advance independent trees together while preserving their leaf-vote order.
-    void route_batch(const float* query, int first, int count, int* leaves) const {
-        std::array<int, routing_batch_size> nodes{}, active;
-        std::iota(active.begin(), active.begin() + count, 0);
-        int remaining = count;
-        for (int level = 0; level < depth && remaining; ++level) {
-            int next = 0;
-            for (int i = 0; i < remaining; ++i) {
-                const int t = active[i];
-                const int node = nodes[t];
-                const uint32_t dimension = split_dimensions(node, first + t);
-                if (dimension == UINT32_MAX) {
-                    leaves[t] = (1 << (depth - level)) * (node + 1) - 1 - n_inner_nodes;
-                    continue;
-                }
-                nodes[t] = 2 * node + 1 + !(query[dimension] <= split_points(node, first + t));
-                if (level + 1 == depth) {
-                    leaves[t] = nodes[t] - n_inner_nodes;
-                } else {
-                    active[next++] = t;
-                }
-            }
-            remaining = next;
-        }
-    }
-
     std::vector<float> log2_tbl;
     std::vector<float> t_tbl;
+    int n_subsample = 300;
+    float tol = 0.001;
+
+    struct SplitEntry {
+        float key;
+        int index;
+    };
+
+    struct TreeScratch {
+        std::vector<int> votes;
+        std::vector<int> compact_votes;
+        std::vector<uint16_t> compact_votes_16;
+        std::vector<int> ids;
+        std::vector<uint32_t> local;
+        std::vector<SplitEntry> order;
+        std::vector<float> left_ent;
+        std::vector<uint32_t> sampled_labels;
+        std::vector<size_t> sampled_offsets;
+        std::vector<size_t> label_counts;
+        std::vector<uint32_t> touched_ids;
+
+        void ensure_corpus(std::size_t n_corpus) {
+            if (votes.size() != n_corpus)
+                votes.assign(n_corpus, 0);
+        }
+
+        void ensure_n(int n) {
+            if ((int) ids.size() < n) {
+                ids.resize(n);
+                order.resize(n);
+                left_ent.resize(n);
+            }
+        }
+    };
 
     std::tuple<int, float, float> split(
-        const std::vector<int>::iterator& begin,
-        const std::vector<int>::iterator& end,
+        const IndexIterator& begin,
+        const IndexIterator& end,
         const std::vector<uint32_t>& random_dims,
         const Eigen::Ref<const RowMatrix>& train,
         const Eigen::Ref<const UIntRowMatrix>& knn,
         float tol,
         int n_corpus,
         int n_subsample,
-        SplitScratch& scratch
+        TreeScratch& scratch
     ) {
         int n = int(end - begin);
         int max_dim = -1;
@@ -410,20 +389,20 @@ class RF : public MLANN {
     std::vector<std::vector<std::vector<uint32_t>>> generate_random_directions() {
         const int n_random_dim = density * dim;
         std::vector<std::vector<std::vector<uint32_t>>> dims_all(n_trees);
-        for (int n_tree = 0; n_tree < n_trees; ++n_tree) {
+        for (int tree = 0; tree < n_trees; ++tree) {
             for (int tree_level = 0; tree_level < depth; ++tree_level) {
                 std::vector<uint32_t> dims = mlann_detail::sample_unique(dim, n_random_dim);
-                dims_all[n_tree].push_back(dims);
+                dims_all[tree].push_back(dims);
             }
         }
         return dims_all;
     }
 
     std::pair<std::vector<uint32_t>, std::vector<float>> count_votes(
-        std::vector<int>::iterator leaf_begin,
-        std::vector<int>::iterator leaf_end,
+        IndexIterator leaf_begin,
+        IndexIterator leaf_end,
         const Eigen::Ref<const UIntRowMatrix>& knn,
-        SplitScratch& scratch
+        TreeScratch& scratch
     ) {
         const int k_build = knn.cols();
         const size_t L = static_cast<size_t>(leaf_end - leaf_begin);
@@ -472,18 +451,18 @@ class RF : public MLANN {
     }
 
     void grow_subtree(
-        std::vector<int>::iterator begin,
-        std::vector<int>::iterator end,
+        IndexIterator begin,
+        IndexIterator end,
         int tree_level,
         int i,
-        int n_tree,
+        int tree,
         std::vector<std::vector<uint32_t>>& labels_tree,
         std::vector<std::vector<float>>& votes_tree,
         const Eigen::Ref<const RowMatrix>& train,
         const Eigen::Ref<const UIntRowMatrix>& knn,
         const std::vector<std::vector<uint32_t>>& random_dims,
         int n_subsample,
-        SplitScratch& scratch
+        TreeScratch& scratch
     ) {
         if (tree_level == depth) {
             const int index_leaf = i - n_inner_nodes;
@@ -500,7 +479,7 @@ class RF : public MLANN {
         const float max_split = std::get<1>(s);
 
         if (max_dim == -1) {
-            split_dimensions(i, n_tree) = UINT32_MAX;
+            split_dimensions(i, tree) = UINT32_MAX;
             const int levels2leaf = depth - tree_level;
             const int index_leaf = (1 << levels2leaf) * (i + 1) - 1 - n_inner_nodes;
             auto ret = count_votes(begin, end, knn, scratch);
@@ -517,8 +496,8 @@ class RF : public MLANN {
             return data[offset] <= max_split;
         });
 
-        split_points(i, n_tree) = max_split;
-        split_dimensions(i, n_tree) = static_cast<uint32_t>(max_dim);
+        split_points(i, tree) = max_split;
+        split_dimensions(i, tree) = static_cast<uint32_t>(max_dim);
 
         const int idx_left = 2 * i + 1;
         const int idx_right = idx_left + 1;
@@ -527,7 +506,7 @@ class RF : public MLANN {
             mid,
             tree_level + 1,
             idx_left,
-            n_tree,
+            tree,
             labels_tree,
             votes_tree,
             train,
@@ -541,7 +520,7 @@ class RF : public MLANN {
             end,
             tree_level + 1,
             idx_right,
-            n_tree,
+            tree,
             labels_tree,
             votes_tree,
             train,
@@ -552,6 +531,29 @@ class RF : public MLANN {
         );
     }
 
-    int n_subsample = 300;
-    float tol = 0.001;
+    // Advance independent trees together while preserving their leaf-vote order.
+    void route_batch(const float* query, int first, int count, int* leaves) const {
+        std::array<int, routing_batch_size> nodes{}, active;
+        std::iota(active.begin(), active.begin() + count, 0);
+        int remaining = count;
+        for (int level = 0; level < depth && remaining; ++level) {
+            int next = 0;
+            for (int i = 0; i < remaining; ++i) {
+                const int t = active[i];
+                const int node = nodes[t];
+                const uint32_t dimension = split_dimensions(node, first + t);
+                if (dimension == UINT32_MAX) {
+                    leaves[t] = (1 << (depth - level)) * (node + 1) - 1 - n_inner_nodes;
+                    continue;
+                }
+                nodes[t] = 2 * node + 1 + !(query[dimension] <= split_points(node, first + t));
+                if (level + 1 == depth) {
+                    leaves[t] = nodes[t] - n_inner_nodes;
+                } else {
+                    active[next++] = t;
+                }
+            }
+            remaining = next;
+        }
+    }
 };

@@ -485,7 +485,7 @@ class PLS : public MLANN {
         int depth_,
         const Eigen::Ref<const UIntRowMatrix>& knn,
         const Eigen::Ref<const RowMatrix>& train,
-        float density_ = -1,
+        float density_ = -1.0,
         int b_ = 1
     ) override {
         validate_training(n_trees_, depth_, knn, train, b_);
@@ -496,8 +496,8 @@ class PLS : public MLANN {
         depth = depth_;
         b = b_;
 
-        forests_.resize(n_trees_);
-        leaves_.resize(n_trees_);
+        forests.resize(n_trees_);
+        leaves_all.resize(n_trees_);
         std::vector<std::vector<float>> tree_projections(n_trees_);
         const pls_detail::PALTables tables(std::min<int>(n_subsample, train.rows()), knn.cols());
 
@@ -512,13 +512,13 @@ class PLS : public MLANN {
             for (int t = 0; t < n_trees_; ++t) {
                 std::vector<int> rows(train.rows());
                 std::iota(rows.begin(), rows.end(), 0);
-                forests_[t].reserve(
+                forests[t].reserve(
                     std::min<size_t>((size_t(1) << (depth + 1)) - 1, 2 * train.rows())
                 );
                 scratch.projections.clear();
                 grow_subtree(rows.begin(), rows.end(), 0, t, train, knn, targets, tables, scratch);
-                forests_[t].shrink_to_fit();
-                leaves_[t].shrink_to_fit();
+                forests[t].shrink_to_fit();
+                leaves_all[t].shrink_to_fit();
                 tree_projections[t] = std::move(scratch.projections);
             }
         }
@@ -550,7 +550,7 @@ class PLS : public MLANN {
             const int count = std::min(routing_batch_size, n_trees - first);
             route_batch(data, first, count, leaves.data());
             for (int t = 0; t < count; ++t) {
-                const auto& leaf = leaves_[first + t][leaves[t]];
+                const auto& leaf = leaves_all[first + t][leaves[t]];
                 mlann_detail::accumulate_neighbor_votes(
                     leaf.labels, leaf.votes, votes_total.data(), vote_threshold, elected
                 );
@@ -586,9 +586,9 @@ class PLS : public MLANN {
         std::vector<float> votes;
     };
 
-    std::vector<std::vector<Node>> forests_;
-    std::vector<std::vector<Leaf>> leaves_;
-    RowMatrix projections_;
+    std::vector<std::vector<Node>> forests;
+    std::vector<std::vector<Leaf>> leaves_all;
+    RowMatrix projections;
     static constexpr int routing_batch_size = 64;
 
     void route_batch(const float* query, int first, int count, int* leaves) const {
@@ -598,7 +598,7 @@ class PLS : public MLANN {
         std::array<float, routing_batch_size> scores;
         int remaining = 0;
         for (int t = 0; t < count; ++t) {
-            if (forests_[first + t][0].leaf < 0) {
+            if (forests[first + t][0].leaf < 0) {
                 active[remaining++] = t;
             }
         }
@@ -606,12 +606,12 @@ class PLS : public MLANN {
         while (remaining) {
             for (int i = 0; i < remaining; ++i) {
                 const int t = active[i];
-                rows[i] = forests_[first + t][nodes[t]].projection;
+                rows[i] = forests[first + t][nodes[t]].projection;
             }
 
             mlann_detail::compute_neighbor_one_to_many(
                 query,
-                projections_.data(),
+                projections.data(),
                 dim,
                 rows.data(),
                 remaining,
@@ -622,9 +622,9 @@ class PLS : public MLANN {
             int next = 0;
             for (int i = 0; i < remaining; ++i) {
                 const int t = active[i];
-                const auto& node = forests_[first + t][nodes[t]];
+                const auto& node = forests[first + t][nodes[t]];
                 nodes[t] = scores[i] <= node.threshold ? node.left : node.right;
-                if (forests_[first + t][nodes[t]].leaf < 0) {
+                if (forests[first + t][nodes[t]].leaf < 0) {
                     active[next++] = t;
                 }
             }
@@ -632,12 +632,13 @@ class PLS : public MLANN {
         }
 
         for (int t = 0; t < count; ++t) {
-            leaves[t] = forests_[first + t][nodes[t]].leaf;
+            leaves[t] = forests[first + t][nodes[t]].leaf;
         }
     }
 
   private:
     using IndexIterator = std::vector<int>::iterator;
+    int n_subsample = 300;
 
     struct TreeScratch {
         std::vector<int> label_map;
@@ -703,13 +704,13 @@ class PLS : public MLANN {
             throw std::length_error("Too many oblique projections");
         }
 
-        projections_.resize(rows, dim);
+        projections.resize(rows, dim);
         size_t offset = 0;
         for (int t = 0; t < n_trees; ++t) {
             auto& values = trees[t];
             if (!values.empty()) {
-                std::copy(values.begin(), values.end(), projections_.data() + offset * dim);
-                for (auto& node : forests_[t]) {
+                std::copy(values.begin(), values.end(), projections.data() + offset * dim);
+                for (auto& node : forests[t]) {
                     if (node.leaf < 0) {
                         node.projection += uint32_t(offset);
                     }
@@ -739,9 +740,9 @@ class PLS : public MLANN {
         const Eigen::Ref<const UIntRowMatrix>& knn,
         TreeScratch& scratch
     ) {
-        node.leaf = leaves_[tree].size();
-        leaves_[tree].emplace_back();
-        auto& output = leaves_[tree].back();
+        node.leaf = leaves_all[tree].size();
+        leaves_all[tree].emplace_back();
+        auto& output = leaves_all[tree].back();
 
         scratch.touched_ids.reserve(std::min<size_t>(n_corpus, size_t(end - begin) * knn.cols()));
         for (auto it = begin; it != end; ++it) {
@@ -836,13 +837,13 @@ class PLS : public MLANN {
         neighbor_targets.rowwise() -= neighbor_targets.colwise().mean().eval();
 
         Eigen::VectorXf normal = pls_detail::pls(sampled_queries, neighbor_targets);
-        Eigen::VectorXf projections(n_sampled);
+        Eigen::VectorXf scores(n_sampled);
         for (int i = 0; i < n_sampled; ++i) {
-            projections[i] = project(normal, train.row(begin[sampled_rows[i]]).data());
+            scores[i] = project(normal, train.row(begin[sampled_rows[i]]).data());
         }
 
         const pls_detail::Split split =
-            pls_detail::threshold(sampled_queries, projections, tables, scratch.threshold_scratch);
+            pls_detail::threshold(sampled_queries, scores, tables, scratch.threshold_scratch);
         return {std::move(normal), split};
     }
 
@@ -857,13 +858,13 @@ class PLS : public MLANN {
         const pls_detail::PALTables& tables,
         TreeScratch& scratch
     ) {
-        const int index = forests_[tree].size();
-        forests_[tree].emplace_back();
+        const int index = forests[tree].size();
+        forests[tree].emplace_back();
         Node node;
 
         const auto finish_leaf = [&]() {
             make_leaf(node, tree, begin, end, knn, scratch);
-            forests_[tree][index] = node;
+            forests[tree][index] = node;
             return index;
         };
 
@@ -897,9 +898,7 @@ class PLS : public MLANN {
         );
 
         // Recursive growth can reallocate the forest, so retain the index, not a reference.
-        forests_[tree][index] = node;
+        forests[tree][index] = node;
         return index;
     }
-
-    int n_subsample = 300;
 };
