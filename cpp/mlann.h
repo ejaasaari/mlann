@@ -33,7 +33,9 @@ class MLANN {
     ) {}
 
     virtual void grow_unsupervised(int n_trees_, int depth_, float density_ = -1.0) {
-        throw std::invalid_argument("Unsupervised builds are supported only by KD, SparsePCA, PCA and RP.");
+        throw std::invalid_argument(
+            "Unsupervised builds are supported only by KD, SparsePCA, PCA and RP."
+        );
     }
 
     virtual void query(

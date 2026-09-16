@@ -12,9 +12,9 @@
 #include <stdexcept>
 #include <vector>
 
-#include "detail/huge-buffer.h"
-#include "detail/neighbor-query.h"
-#include "mlann.h"
+#include "../detail/huge-buffer.h"
+#include "../detail/neighbor-query.h"
+#include "../mlann.h"
 
 namespace pca_detail {
 
@@ -216,7 +216,8 @@ class SparsePCA : public MLANN {
         // This bound includes duplicate IDs within a training row. Larger raw
         // counts retain float storage, avoiding truncation at the uint16 limit.
         const uint64_t max_leaf_rows = (uint64_t(n_train) + n_leaves - 1) / n_leaves;
-        compact_leaf_votes = !corpus_leaves &&
+        compact_leaf_votes =
+            !corpus_leaves &&
             max_leaf_rows <= std::numeric_limits<uint16_t>::max() / uint64_t(knn.cols());
         if (compact_leaf_votes)
             votes16_all.resize(n_trees);
@@ -305,8 +306,11 @@ class SparsePCA : public MLANN {
                     );
                 } else if (compact_leaf_votes) {
                     mlann_detail::accumulate_neighbor_votes(
-                        labels_all[first + t][leaf], votes16_all[first + t][leaf],
-                        votes_total.data(), vote_threshold, elected
+                        labels_all[first + t][leaf],
+                        votes16_all[first + t][leaf],
+                        votes_total.data(),
+                        vote_threshold,
+                        elected
                     );
                 } else {
                     mlann_detail::accumulate_neighbor_votes(
@@ -591,7 +595,9 @@ class PCA : public SparsePCA {
         if (!empty())
             throw std::logic_error("The index has already been grown.");
         if (n_subsample_ < 0 || n_subsample_ == 1)
-            throw std::invalid_argument("PCA n_subsample must be 0 or at least 2; 0 uses all node rows.");
+            throw std::invalid_argument(
+                "PCA n_subsample must be 0 or at least 2; 0 uses all node rows."
+            );
         n_subsample = n_subsample_;
     }
 };

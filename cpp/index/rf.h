@@ -10,10 +10,10 @@
 #include <stdexcept>
 #include <utility>
 
-#include "detail/huge-buffer.h"
-#include "detail/neighbor-query.h"
-#include "mlann.h"
-#include "utils.h"
+#include "../detail/huge-buffer.h"
+#include "../detail/neighbor-query.h"
+#include "../mlann.h"
+#include "../utils.h"
 
 struct SplitEntry {
     float key;

@@ -1,6 +1,5 @@
 #pragma once
 
-// PLS projections with label-entropy split selection.
 #include <Eigen/Dense>
 #include <algorithm>
 #include <array>
@@ -13,10 +12,10 @@
 #include <utility>
 #include <vector>
 
-#include "detail/huge-buffer.h"
-#include "detail/neighbor-query.h"
-#include "mlann.h"
-#include "utils.h"
+#include "../detail/huge-buffer.h"
+#include "../detail/neighbor-query.h"
+#include "../mlann.h"
+#include "../utils.h"
 
 namespace pls_detail {
 
@@ -466,24 +465,17 @@ inline Split threshold(const Sample& sample, const Eigen::VectorXf& projection) 
 
 class PLS : public MLANN {
   public:
-    struct Options {
-        int n_subsample = 300;
-        uint64_t seed = 17;
-    };
-
-    PLS(const float* corpus_, int n_corpus_, int dim_) : PLS(corpus_, n_corpus_, dim_, Options{}) {}
-
-    PLS(const float* corpus_, int n_corpus_, int dim_, Options options)
-        : MLANN(corpus_, n_corpus_, dim_), options_(options) {
-        configure(options.n_subsample);
+    PLS(const float* corpus_, int n_corpus_, int dim_, int n_subsample_ = 300)
+        : MLANN(corpus_, n_corpus_, dim_) {
+        configure(n_subsample_);
     }
 
-    void configure(int n_subsample) {
+    void configure(int n_subsample_) {
         if (!empty())
             throw std::logic_error("The index has already been grown.");
-        if (n_subsample < 2)
+        if (n_subsample_ < 2)
             throw std::invalid_argument("n_subsample must be >= 2");
-        options_.n_subsample = n_subsample;
+        n_subsample = n_subsample_;
     }
 
     using MLANN::query;
@@ -507,9 +499,7 @@ class PLS : public MLANN {
         forests_.resize(n_trees_);
         leaves_.resize(n_trees_);
         std::vector<std::vector<float>> tree_projections(n_trees_);
-        const pls_detail::PALTables tables(
-            std::min<int>(options_.n_subsample, train.rows()), knn.cols()
-        );
+        const pls_detail::PALTables tables(std::min<int>(n_subsample, train.rows()), knn.cols());
 
         // Compute neighbor means once and release them after fitting the forest.
         RowMatrix targets = pls_detail::neighbor_means(corpus, knn);
@@ -526,9 +516,6 @@ class PLS : public MLANN {
                     std::min<size_t>((size_t(1) << (depth + 1)) - 1, 2 * train.rows())
                 );
                 scratch.projections.clear();
-                scratch.generator.seed(
-                    uint32_t(mlann_detail::mix(options_.seed ^ mlann_detail::mix(t)))
-                );
                 grow_subtree(rows.begin(), rows.end(), 0, t, train, knn, targets, tables, scratch);
                 forests_[t].shrink_to_fit();
                 leaves_[t].shrink_to_fit();
@@ -660,7 +647,8 @@ class PLS : public MLANN {
         std::vector<float> projections;
         pls_detail::ThresholdScratch threshold_scratch;
 
-        explicit TreeScratch(int n_corpus) : label_map(n_corpus, 0) {}
+        explicit TreeScratch(int n_corpus)
+            : label_map(n_corpus, 0), generator(std::random_device{}()) {}
 
         void reset() {
             for (auto id : touched_ids) {
@@ -836,7 +824,7 @@ class PLS : public MLANN {
         TreeScratch& scratch
     ) const {
         const int count = end - begin;
-        const int n_sampled = std::min(options_.n_subsample, count);
+        const int n_sampled = std::min(n_subsample, count);
         const auto sampled_rows = mlann_detail::sample(count, n_sampled, scratch.generator);
         const pls_detail::Sample sampled_queries =
             sample_queries(begin, sampled_rows, train, knn, scratch);
@@ -913,5 +901,5 @@ class PLS : public MLANN {
         return index;
     }
 
-    Options options_;
+    int n_subsample = 300;
 };

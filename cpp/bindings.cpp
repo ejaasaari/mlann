@@ -9,13 +9,13 @@
 #include <cstdlib>
 
 #include "Python.h"
-#include "craftml.h"
-#include "pls.h"
+#include "index/craftml.h"
+#include "index/pls.h"
 #include "numpy/arrayobject.h"
-#include "rf.h"
-#include "kd.h"
-#include "pca.h"
-#include "rp.h"
+#include "index/rf.h"
+#include "index/kd.h"
+#include "index/pca.h"
+#include "index/rp.h"
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
 typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> UIntRowMatrix;
