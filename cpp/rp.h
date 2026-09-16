@@ -86,7 +86,14 @@ class RP : public MLANN {
         initialize_projections();
         split_points.resize(n_inner_nodes, n_trees);
         labels_all.resize(n_trees);
-        if (!corpus_leaves)
+        // This bound includes duplicate IDs within a training row. Larger raw
+        // counts retain float storage, avoiding truncation at the uint16 limit.
+        const uint64_t max_leaf_rows = (uint64_t(n_train) + n_leaves - 1) / n_leaves;
+        compact_leaf_votes = !corpus_leaves &&
+            max_leaf_rows <= std::numeric_limits<uint16_t>::max() / uint64_t(knn.cols());
+        if (compact_leaf_votes)
+            votes16_all.resize(n_trees);
+        else if (!corpus_leaves)
             votes_all.resize(n_trees);
 
 #pragma omp parallel
@@ -97,7 +104,9 @@ class RP : public MLANN {
 #pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 labels_all[tree].resize(n_leaves);
-                if (!corpus_leaves)
+                if (compact_leaf_votes)
+                    votes16_all[tree].resize(n_leaves);
+                else if (!corpus_leaves)
                     votes_all[tree].resize(n_leaves);
                 std::iota(scratch.rows.begin(), scratch.rows.end(), 0);
                 if (density < 1) {
@@ -172,6 +181,11 @@ class RP : public MLANN {
                     mlann_detail::accumulate_unit_votes(
                         labels_all[first + t][leaf], votes_total.data(), vote_threshold, elected
                     );
+                } else if (compact_leaf_votes) {
+                    mlann_detail::accumulate_neighbor_votes(
+                        labels_all[first + t][leaf], votes16_all[first + t][leaf],
+                        votes_total.data(), vote_threshold, elected
+                    );
                 } else {
                     mlann_detail::accumulate_neighbor_votes(
                         labels_all[first + t][leaf],
@@ -196,6 +210,10 @@ class RP : public MLANN {
             mlann_detail::compute_neighbor_topk
         );
     }
+
+  protected:
+    bool compact_leaf_votes = false;
+    std::vector<std::vector<std::vector<uint16_t>>> votes16_all;
 
   private:
     using IndexIterator = std::vector<int>::iterator;
@@ -289,17 +307,23 @@ class RP : public MLANN {
             }
         }
         auto& labels = labels_all[tree][leaf];
-        auto& votes = votes_all[tree][leaf];
-        labels.reserve(scratch.touched_ids.size());
-        votes.reserve(scratch.touched_ids.size());
-        for (const auto label : scratch.touched_ids) {
-            const int count = scratch.votes[label];
-            scratch.votes[label] = 0;
-            if (count >= b) {
-                labels.push_back(label);
-                votes.push_back(static_cast<float>(count));
+        const auto store_votes = [&](auto& votes) {
+            labels.reserve(scratch.touched_ids.size());
+            votes.reserve(scratch.touched_ids.size());
+            for (const auto label : scratch.touched_ids) {
+                const int count = scratch.votes[label];
+                scratch.votes[label] = 0;
+                if (count >= b) {
+                    labels.push_back(label);
+                    // Conversion back to float during query preserves raw counts.
+                    votes.push_back(count);
+                }
             }
-        }
+        };
+        if (compact_leaf_votes)
+            store_votes(votes16_all[tree][leaf]);
+        else
+            store_votes(votes_all[tree][leaf]);
     }
 
     template <class ProjectionMatrix>

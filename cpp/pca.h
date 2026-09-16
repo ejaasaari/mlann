@@ -25,8 +25,7 @@ struct FitStats {
 
 // Sparse PCA solves in the smaller feature or sample space. Double precision
 // keeps the direction accurate when the leading eigenvalues are close together.
-inline Eigen::VectorXf direct_direction(const Eigen::MatrixXf& centered) {
-    const Eigen::MatrixXd points = centered.cast<double>();
+inline Eigen::VectorXf direct_direction(const Eigen::MatrixXd& points) {
     const bool dual = points.cols() < points.rows();
     Eigen::MatrixXd covariance;
     if (dual) {
@@ -50,7 +49,7 @@ inline Eigen::VectorXf direct_direction(const Eigen::MatrixXf& centered) {
     return (direction / norm).cast<float>();
 }
 
-// PCAFull trades exact convergence for bounded build cost. Apply the covariance
+// PCA trades exact convergence for bounded build cost. Apply the covariance
 // through the samples, with no dense covariance matrix or eigensolver fallback.
 inline Eigen::VectorXf power_direction(
     const Eigen::MatrixXf& centered,
@@ -88,17 +87,19 @@ inline Eigen::VectorXf power_direction(
     return direction;
 }
 
-// Points are columns. Center and scale in double precision so input units and
-// large constant offsets do not hide the variance before fitting in float.
+// Points are columns. Sparse PCA centers and solves directly in double precision,
+// avoiding float rescaling and an extra full feature matrix. PCA still scales
+// its centered samples before the bounded float power iteration.
 inline Eigen::VectorXf principal_direction(
     const Eigen::Ref<const Eigen::MatrixXf>& points,
     Eigen::VectorXf initial,
     bool approximate,
-    FitStats* stats = nullptr
+    FitStats* stats = nullptr,
+    bool points_validated = false
 ) {
     if (stats)
         *stats = {};
-    if (points.rows() == 0 || points.cols() < 2 || !points.allFinite()) {
+    if (points.rows() == 0 || points.cols() < 2 || (!points_validated && !points.allFinite())) {
         throw std::invalid_argument("PCA requires finite points and at least two samples");
     }
     if (initial.size() != points.rows() || !initial.allFinite() || initial.stableNorm() == 0) {
@@ -106,6 +107,17 @@ inline Eigen::VectorXf principal_direction(
     }
     initial /= initial.cwiseAbs().maxCoeff();
     initial /= initial.norm();
+
+    if (!approximate) {
+        Eigen::MatrixXd centered = points.cast<double>();
+        const Eigen::VectorXd mean = centered.rowwise().mean();
+        centered.colwise() -= mean;
+        // Finite float inputs and an int-sized row count cannot overflow or
+        // underflow double covariance products, so no intermediate scaling is needed.
+        if (centered.isZero(0))
+            return initial;
+        return direct_direction(centered);
+    }
 
     const Eigen::VectorXd mean = points.cast<double>().rowwise().mean();
     double scale = 0;
@@ -121,19 +133,17 @@ inline Eigen::VectorXf principal_direction(
     }
     centered /= centered.norm();
 
-    if (!approximate)
-        return direct_direction(centered);
-
     return power_direction(centered, initial, stats);
 }
 
 } // namespace pca_detail
 
-// Median-split PCA forest. Sparse PCA samples coordinates with replacement;
-// PCAFull fits on at most 300 rows and uses every coordinate.
-class PCA : public MLANN {
+// Median-split PCA forest. SparsePCA samples coordinates with replacement;
+// PCA uses every coordinate and caps fitting rows with n_subsample (default 300).
+class SparsePCA : public MLANN {
   public:
-    PCA(const float* corpus_, int n_corpus_, int dim_) : PCA(corpus_, n_corpus_, dim_, false) {}
+    SparsePCA(const float* corpus_, int n_corpus_, int dim_)
+        : SparsePCA(corpus_, n_corpus_, dim_, false) {}
 
     void grow(
         int n_trees_,
@@ -203,20 +213,29 @@ class PCA : public MLANN {
         if (!full_dimensions)
             projection_dims.resize(node_count, support);
         labels_all.resize(n_trees);
-        if (!corpus_leaves)
+        // This bound includes duplicate IDs within a training row. Larger raw
+        // counts retain float storage, avoiding truncation at the uint16 limit.
+        const uint64_t max_leaf_rows = (uint64_t(n_train) + n_leaves - 1) / n_leaves;
+        compact_leaf_votes = !corpus_leaves &&
+            max_leaf_rows <= std::numeric_limits<uint16_t>::max() / uint64_t(knn.cols());
+        if (compact_leaf_votes)
+            votes16_all.resize(n_trees);
+        else if (!corpus_leaves)
             votes_all.resize(n_trees);
         std::exception_ptr error;
 
 #pragma omp parallel
         {
-            TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train);
+            TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, n_subsample);
             // Release each worker's scratch as soon as its last tree finishes.
             // The parallel-region barrier still waits for all trees.
 #pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 try {
                     labels_all[tree].resize(n_leaves);
-                    if (!corpus_leaves)
+                    if (compact_leaf_votes)
+                        votes16_all[tree].resize(n_leaves);
+                    else if (!corpus_leaves)
                         votes_all[tree].resize(n_leaves);
                     std::iota(scratch.rows.begin(), scratch.rows.end(), 0);
 
@@ -247,6 +266,7 @@ class PCA : public MLANN {
             n_trees = 0;
             labels_all.clear();
             votes_all.clear();
+            votes16_all.clear();
             projections.resize(0, 0);
             projection_dims.resize(0, 0);
             split_points.resize(0, 0);
@@ -283,6 +303,11 @@ class PCA : public MLANN {
                     mlann_detail::accumulate_unit_votes(
                         labels_all[first + t][leaf], votes_total.data(), vote_threshold, elected
                     );
+                } else if (compact_leaf_votes) {
+                    mlann_detail::accumulate_neighbor_votes(
+                        labels_all[first + t][leaf], votes16_all[first + t][leaf],
+                        votes_total.data(), vote_threshold, elected
+                    );
                 } else {
                     mlann_detail::accumulate_neighbor_votes(
                         labels_all[first + t][leaf],
@@ -309,14 +334,17 @@ class PCA : public MLANN {
     }
 
   protected:
-    PCA(const float* corpus_, int n_corpus_, int dim_, bool full_dimensions_)
+    int n_subsample = 300;
+    bool compact_leaf_votes = false;
+    std::vector<std::vector<std::vector<uint16_t>>> votes16_all;
+
+    SparsePCA(const float* corpus_, int n_corpus_, int dim_, bool full_dimensions_)
         : MLANN(corpus_, n_corpus_, dim_), full_dimensions(full_dimensions_) {}
 
   private:
     using IndexIterator = std::vector<int>::iterator;
     static constexpr int routing_batch_size = 64;
     bool corpus_leaves = false;
-    static constexpr int fit_sample = 300;
     const bool full_dimensions;
     int support = 0;
     RowMatrix projections;
@@ -330,9 +358,9 @@ class PCA : public MLANN {
         std::vector<float> row_scores;
         Eigen::MatrixXf fit;
 
-        TreeScratch(int corpus_size, int train_size)
+        TreeScratch(int corpus_size, int train_size, int n_subsample)
             : rows(train_size), votes(corpus_size, 0), row_scores(train_size) {
-            sampled_rows.reserve(fit_sample);
+            sampled_rows.reserve(std::min(n_subsample, train_size));
         }
     };
 
@@ -391,27 +419,63 @@ class PCA : public MLANN {
             return;
         }
         int fit_count = count;
-        if (full_dimensions && count > fit_sample) {
+        if (full_dimensions && n_subsample > 0 && count > n_subsample) {
             scratch.sampled_rows.clear();
             std::sample(
-                begin, end, std::back_inserter(scratch.sampled_rows), fit_sample, generator
+                begin, end, std::back_inserter(scratch.sampled_rows), n_subsample, generator
             );
-            fit_count = fit_sample;
+            fit_count = n_subsample;
             gather_points(scratch.sampled_rows.begin(), fit_count, row, train, scratch.fit);
         } else {
             gather_points(begin, fit_count, row, train, scratch.fit);
         }
 
         const auto points = scratch.fit.leftCols(fit_count);
+        // grow_impl validates all training values before fitting any node.
         const Eigen::VectorXf direction = pca_detail::principal_direction(
-            points, projections.row(row).transpose(), full_dimensions
+            points, projections.row(row).transpose(), full_dimensions, nullptr, full_dimensions
         );
         projections.row(row) = direction.transpose();
 
-        // Route the complete node without gathering another feature matrix. Use the
-        // same arithmetic as query routing, including repeated sparse coordinates.
-        for (auto it = begin; it != end; ++it) {
-            scratch.row_scores[*it] = project(train.row(*it).data(), row);
+        // Sparse fits already contain every row. Full fits may be sampled, so
+        // they still project the complete node from the original training data.
+        if (!full_dimensions) {
+            // Sparse fitting already gathered every row, including repeated coordinates.
+            // Reuse those contiguous coordinates for the projection.
+            for (int i = 0; i < count; ++i) {
+                const float* point = scratch.fit.col(i).data();
+                float score = 0.f;
+                for (int j = 0; j < support; ++j)
+                    score += point[j] * projections(row, j);
+                scratch.row_scores[begin[i]] = score;
+            }
+        } else {
+            // Interleave four rows to reuse weights and overlap independent sums,
+            // preserving each row's feature accumulation order.
+            int i = 0;
+            for (; i + 4 <= count; i += 4) {
+                const float* p0 = train.row(begin[i + 0]).data();
+                float s0 = 0.f;
+                const float* p1 = train.row(begin[i + 1]).data();
+                float s1 = 0.f;
+                const float* p2 = train.row(begin[i + 2]).data();
+                float s2 = 0.f;
+                const float* p3 = train.row(begin[i + 3]).data();
+                float s3 = 0.f;
+                for (int j = 0; j < support; ++j) {
+                    const float weight = projections(row, j);
+                    s0 += p0[j] * weight;
+                    s1 += p1[j] * weight;
+                    s2 += p2[j] * weight;
+                    s3 += p3[j] * weight;
+                }
+                scratch.row_scores[begin[i + 0]] = s0;
+                scratch.row_scores[begin[i + 1]] = s1;
+                scratch.row_scores[begin[i + 2]] = s2;
+                scratch.row_scores[begin[i + 3]] = s3;
+            }
+            for (; i < count; ++i)
+                scratch.row_scores[begin[i]] = project(train.row(begin[i]).data(), row);
         }
     }
 
@@ -451,18 +515,23 @@ class PCA : public MLANN {
             }
         }
         auto& labels = labels_all[tree][leaf];
-        auto& votes = votes_all[tree][leaf];
-        labels.reserve(scratch.touched_ids.size());
-        votes.reserve(scratch.touched_ids.size());
-        for (const auto label : scratch.touched_ids) {
-            const int count = scratch.votes[label];
-            scratch.votes[label] = 0;
-            if (count >= b) {
-                labels.push_back(label);
-                // PCA uses raw counts, unlike RF's normalized leaf votes.
-                votes.push_back(static_cast<float>(count));
+        const auto store_votes = [&](auto& votes) {
+            labels.reserve(scratch.touched_ids.size());
+            votes.reserve(scratch.touched_ids.size());
+            for (const auto label : scratch.touched_ids) {
+                const int count = scratch.votes[label];
+                scratch.votes[label] = 0;
+                if (count >= b) {
+                    labels.push_back(label);
+                    // Conversion back to float during query preserves raw counts.
+                    votes.push_back(count);
+                }
             }
-        }
+        };
+        if (compact_leaf_votes)
+            store_votes(votes16_all[tree][leaf]);
+        else
+            store_votes(votes_all[tree][leaf]);
     }
 
     void grow_subtree(
@@ -511,7 +580,18 @@ class PCA : public MLANN {
     }
 };
 
-class PCAFull : public PCA {
+class PCA : public SparsePCA {
   public:
-    PCAFull(const float* corpus_, int n_corpus_, int dim_) : PCA(corpus_, n_corpus_, dim_, true) {}
+    PCA(const float* corpus_, int n_corpus_, int dim_, int n_subsample_ = 300)
+        : SparsePCA(corpus_, n_corpus_, dim_, true) {
+        configure(n_subsample_);
+    }
+
+    void configure(int n_subsample_) {
+        if (!empty())
+            throw std::logic_error("The index has already been grown.");
+        if (n_subsample_ < 0 || n_subsample_ == 1)
+            throw std::invalid_argument("PCA n_subsample must be 0 or at least 2; 0 uses all node rows.");
+        n_subsample = n_subsample_;
+    }
 };

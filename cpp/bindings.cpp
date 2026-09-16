@@ -68,14 +68,18 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
     self->index = new CraftML(data, n, dim);
   else if (strcmp(index_type, "KD") == 0)
     self->index = new KD(data, n, dim);
+  else if (strcmp(index_type, "SparsePCA") == 0)
+    self->index = new SparsePCA(data, n, dim);
   else if (strcmp(index_type, "PCA") == 0)
     self->index = new PCA(data, n, dim);
-  else if (strcmp(index_type, "PCAFull") == 0)
-    self->index = new PCAFull(data, n, dim);
   else if (strcmp(index_type, "PLS") == 0)
     self->index = new PLS(data, n, dim);
-  else
+  else if (strcmp(index_type, "RF") == 0)
     self->index = new RF(data, n, dim);
+  else {
+    PyErr_Format(PyExc_ValueError, "Unrecognized index type '%s'.", index_type);
+    return -1;
+  }
 
   return 0;
 }
@@ -88,11 +92,10 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
   int n_knn, dim_knn;
 
   int n_trees, depth, b;
-  int top_variance_dims = 5;
-  int n_subsample = 200;
+  int top_variance_dims, n_subsample;
   float density;
 
-  if (!PyArg_ParseTuple(args, "O!iiO!iiiifi|ii", &PyArray_Type, &train_data, &n_train, &dim_train,
+  if (!PyArg_ParseTuple(args, "O!iiO!iiiifiii", &PyArray_Type, &train_data, &n_train, &dim_train,
                         &PyArray_Type, &knn_data, &n_knn, &dim_knn, &n_trees, &depth, &density, &b,
                         &top_variance_dims, &n_subsample))
     return NULL;
@@ -106,6 +109,8 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
   try {
     if (auto *kd = dynamic_cast<KD *>(self->index)) kd->configure(top_variance_dims);
     if (auto *rf = dynamic_cast<RF *>(self->index)) rf->configure(n_subsample);
+    if (auto *pca = dynamic_cast<PCA *>(self->index)) pca->configure(n_subsample);
+    if (auto *pls = dynamic_cast<PLS *>(self->index)) pls->configure(n_subsample);
     self->index->grow(n_trees, depth, knn, train, density, b);
     PyEval_RestoreThread(_save);
   } catch (const std::exception &e) {
@@ -118,13 +123,15 @@ static PyObject *build(mlannIndex *self, PyObject *args) {
 }
 
 static PyObject *build_unsupervised(mlannIndex *self, PyObject *args) {
-  int n_trees, depth, top_variance_dims = 5;
-  float density = -1.f;
-  if (!PyArg_ParseTuple(args, "ii|fi", &n_trees, &depth, &density, &top_variance_dims)) return NULL;
+  int n_trees, depth, top_variance_dims, n_subsample;
+  float density;
+  if (!PyArg_ParseTuple(args, "iifii", &n_trees, &depth, &density, &top_variance_dims,
+                        &n_subsample)) return NULL;
 
   PyThreadState *_save = PyEval_SaveThread();
   try {
     if (auto *kd = dynamic_cast<KD *>(self->index)) kd->configure(top_variance_dims);
+    if (auto *pca = dynamic_cast<PCA *>(self->index)) pca->configure(n_subsample);
     self->index->grow_unsupervised(n_trees, depth, density);
     PyEval_RestoreThread(_save);
   } catch (const std::exception &e) {

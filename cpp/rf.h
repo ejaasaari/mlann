@@ -48,7 +48,7 @@ struct SplitScratch {
 
 class RF : public MLANN {
   public:
-    RF(const float* corpus_, int n_corpus_, int dim_, int n_subsample_ = 200)
+    RF(const float* corpus_, int n_corpus_, int dim_, int n_subsample_ = 300)
         : MLANN(corpus_, n_corpus_, dim_) {
         configure(n_subsample_);
     }
@@ -552,6 +552,6 @@ class RF : public MLANN {
         );
     }
 
-    int n_subsample = 200;
+    int n_subsample = 300;
     float tol = 0.001;
 };

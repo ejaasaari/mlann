@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <type_traits>
 #include <vector>
 
 #include "miniselect/pdqselect.h"
@@ -274,10 +275,10 @@ inline void compute_neighbor_topk(
 
 // Leaf labels are unique. SIMD updates therefore preserve the original
 // per-label accumulation order across trees and the elected-candidate order.
-template <bool unit_votes>
+template <bool unit_votes, typename Weight = float>
 inline void accumulate_leaf_votes(
     const std::vector<uint32_t>& labels,
-    const float* weights,
+    const Weight* weights,
     float* votes,
     float threshold,
     std::vector<uint32_t>& elected
@@ -290,7 +291,16 @@ inline void accumulate_leaf_votes(
         for (size_t j = i + 32; j < labels.size() && j < i + 48; ++j)
             __builtin_prefetch(votes + labels[j], 1, 1);
         const __m512i ids = _mm512_loadu_si512(labels.data() + i);
-        const __m512 weight = unit_votes ? _mm512_set1_ps(1.f) : _mm512_loadu_ps(weights + i);
+        __m512 weight;
+        if constexpr (unit_votes) {
+            weight = _mm512_set1_ps(1.f);
+        } else if constexpr (std::is_same_v<Weight, uint16_t>) {
+            weight = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + i))
+            ));
+        } else {
+            weight = _mm512_loadu_ps(weights + i);
+        }
         const __m512 updated = _mm512_add_ps(_mm512_i32gather_ps(ids, votes, 4), weight);
         unsigned selected = _mm512_cmp_ps_mask(updated, limit, _CMP_GE_OQ);
         _mm512_i32scatter_ps(votes, ids, _mm512_mask_mov_ps(updated, selected, sentinel), 4);
@@ -312,9 +322,10 @@ inline void accumulate_leaf_votes(
         }
     }
 }
+template <typename Weight>
 inline void accumulate_neighbor_votes(
     const std::vector<uint32_t>& labels,
-    const std::vector<float>& weights,
+    const std::vector<Weight>& weights,
     float* votes,
     float threshold,
     std::vector<uint32_t>& elected
@@ -328,6 +339,6 @@ inline void accumulate_unit_votes(
     float threshold,
     std::vector<uint32_t>& elected
 ) {
-    accumulate_leaf_votes<true>(ids, nullptr, votes, threshold, elected);
+    accumulate_leaf_votes<true, float>(ids, nullptr, votes, threshold, elected);
 }
 } // namespace mlann_detail

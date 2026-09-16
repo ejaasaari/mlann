@@ -467,7 +467,7 @@ inline Split threshold(const Sample& sample, const Eigen::VectorXf& projection) 
 class PLS : public MLANN {
   public:
     struct Options {
-        int sample = 300;
+        int n_subsample = 300;
         uint64_t seed = 17;
     };
 
@@ -475,9 +475,15 @@ class PLS : public MLANN {
 
     PLS(const float* corpus_, int n_corpus_, int dim_, Options options)
         : MLANN(corpus_, n_corpus_, dim_), options_(options) {
-        if (options.sample < 2) {
-            throw std::invalid_argument("sample must be >= 2");
-        }
+        configure(options.n_subsample);
+    }
+
+    void configure(int n_subsample) {
+        if (!empty())
+            throw std::logic_error("The index has already been grown.");
+        if (n_subsample < 2)
+            throw std::invalid_argument("n_subsample must be >= 2");
+        options_.n_subsample = n_subsample;
     }
 
     using MLANN::query;
@@ -502,7 +508,7 @@ class PLS : public MLANN {
         leaves_.resize(n_trees_);
         std::vector<std::vector<float>> tree_projections(n_trees_);
         const pls_detail::PALTables tables(
-            std::min<int>(options_.sample, train.rows()), knn.cols()
+            std::min<int>(options_.n_subsample, train.rows()), knn.cols()
         );
 
         // Compute neighbor means once and release them after fitting the forest.
@@ -830,7 +836,7 @@ class PLS : public MLANN {
         TreeScratch& scratch
     ) const {
         const int count = end - begin;
-        const int n_sampled = std::min(options_.sample, count);
+        const int n_sampled = std::min(options_.n_subsample, count);
         const auto sampled_rows = mlann_detail::sample(count, n_sampled, scratch.generator);
         const pls_detail::Sample sampled_queries =
             sample_queries(begin, sampled_rows, train, knn, scratch);

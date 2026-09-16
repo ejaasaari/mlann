@@ -10,7 +10,7 @@ class MLANNIndex(object):
     An MLANN index object
     """
 
-    def __init__(self, data, index_type="PCA"):
+    def __init__(self, data, index_type="SparsePCA"):
         """
         Initializes an MLANN index object.
         :param data: Input data either as a NxDim numpy ndarray or as a filepath to a binary file containing the data.
@@ -46,15 +46,29 @@ class MLANNIndex(object):
             raise ValueError("Density should be in (0, 1]")
         return density
 
+    def _compute_n_subsample(self, n_subsample):
+        if n_subsample is None:
+            return 300
+        if self.index_type not in ("RF", "PCA", "PLS"):
+            raise ValueError("n_subsample is only supported by RF, PCA and PLS")
+        if (not isinstance(n_subsample, (int, np.integer))
+                or isinstance(n_subsample, (bool, np.bool_)) or n_subsample < 0):
+            raise ValueError("n_subsample must be a non-negative integer")
+        if self.index_type == "PCA" and n_subsample == 1:
+            raise ValueError("PCA n_subsample must be 0 or at least 2; 0 uses all node rows")
+        if self.index_type == "PLS" and n_subsample < 2:
+            raise ValueError("PLS n_subsample must be at least 2")
+        return n_subsample
+
     def build(
         self, train=None, knn=None, n_trees=None, depth=None, density="auto", b=1,
-        top_variance_dims=5, unsupervised=False, *, n_subsample=200, branching_factor=10,
+        top_variance_dims=5, unsupervised=False, *, n_subsample=None, branching_factor=10,
         leaf_size=32, label_dim=128, feature_dim=0, iterations=2,
         node_sample_size=1000, seed=42, dist=L2,
     ):
         """
         Builds a normal MLANN index.
-        :param unsupervised: Build KD/PCA/PCAFull/RP directly on the constructor's corpus,
+        :param unsupervised: Build KD/SparsePCA/PCA/RP directly on the constructor's corpus,
                              with one vote per point in each routed leaf. Omit train and knn;
                              b must be 1. Default False preserves supervised leaf votes.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
@@ -64,23 +78,20 @@ class MLANNIndex(object):
         :param top_variance_dims: Number of highest-variance dimensions KD chooses among
                                   at each node, capped at dim; positive integer, default 5.
                                   KD ignores density.
-        :param n_subsample: RF split-scoring sample size per node; non-negative integer,
-                            default 200. Use 0 for all node rows. Leaf votes use all rows.
+        :param n_subsample: Per-node fitting/split-scoring row cap for RF, PCA and PLS.
+                            None uses 300. RF/PCA accept 0 for all node rows; RF also
+                            accepts 1. PCA/PLS otherwise require an integer >= 2.
+                            Partitioning and leaf votes use all rows. Other indexes reject it.
         :return:
         """
         if self.built:
             raise RuntimeError("The index has already been built")
 
-        if self.index_type == "RF":
-            if (not isinstance(n_subsample, (int, np.integer))
-                    or isinstance(n_subsample, (bool, np.bool_)) or n_subsample < 0):
-                raise ValueError("n_subsample must be a non-negative integer; 0 uses all node rows")
-        elif n_subsample != 200:
-            raise ValueError("n_subsample is only supported by RF")
+        n_subsample = self._compute_n_subsample(n_subsample)
 
         if self.index_type == "CRAFTML":
             if unsupervised:
-                raise ValueError("unsupervised is only supported by KD, PCA, PCAFull and RP")
+                raise ValueError("unsupervised is only supported by KD, SparsePCA, PCA and RP")
             train = self._craft_features(train, matrix=True)
             knn = np.asarray(knn)
             if (knn.ndim != 2 or knn.shape[0] != train.shape[0] or knn.shape[1] == 0
@@ -112,13 +123,13 @@ class MLANNIndex(object):
             raise TypeError("n_trees and depth are required")
         density = self._compute_density(density)
         if unsupervised:
-            if self.index_type not in ("KD", "PCA", "PCAFull", "RP"):
-                raise ValueError("unsupervised is only supported by KD, PCA, PCAFull and RP")
+            if self.index_type not in ("KD", "SparsePCA", "PCA", "RP"):
+                raise ValueError("unsupervised is only supported by KD, SparsePCA, PCA and RP")
             if train is not None or knn is not None:
                 raise ValueError("Omit train and knn when unsupervised=True; trees use the corpus")
             if b != 1:
                 raise ValueError("b must be 1 when unsupervised=True; each leaf member gets one vote")
-            self.index.build_unsupervised(n_trees, depth, density, top_variance_dims)
+            self.index.build_unsupervised(n_trees, depth, density, top_variance_dims, n_subsample)
             self.built = True
             return
         if train is None or knn is None:
