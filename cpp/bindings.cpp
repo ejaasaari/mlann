@@ -7,9 +7,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 #include "Python.h"
 #include "index/craftml.h"
+#include "index/ivf.h"
 #include "index/pls.h"
 #include "numpy/arrayobject.h"
 #include "index/rf.h"
@@ -74,6 +76,8 @@ static int MLANN_init(mlannIndex *self, PyObject *args) {
     self->index = new PCA(data, n, dim);
   else if (strcmp(index_type, "PLS") == 0)
     self->index = new PLS(data, n, dim);
+  else if (strcmp(index_type, "IVF") == 0)
+    self->index = new IVF(data, n, dim);
   else if (strcmp(index_type, "RF") == 0)
     self->index = new RF(data, n, dim);
   else {
@@ -159,7 +163,11 @@ static void mlann_dealloc(mlannIndex *self) {
   Py_TYPE(self)->tp_free(reinterpret_cast<PyObject *>(self));
 }
 
+template <typename Index>
+static PyObject *ann_distribution(mlannIndex *self, PyObject *args);
+
 static PyObject *ann(mlannIndex *self, PyObject *args) {
+  if (dynamic_cast<IVF *>(self->index)) return ann_distribution<IVF>(self, args);
   PyArrayObject *v;
   int k, dim, n, return_distances;
   Distance dist;
@@ -362,16 +370,53 @@ static PyObject *build_craftml(mlannIndex *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
-static PyObject *ann_craftml(mlannIndex *self, PyObject *args) {
-  PyArrayObject *queries;
-  int k, budget, distance, return_distances;
-  float threshold;
-  if (!PyArg_ParseTuple(args, "O!iifii", &PyArray_Type, &queries, &k, &budget, &threshold,
-                        &distance, &return_distances))
+static PyObject *build_ivf(mlannIndex *self, PyObject *args) {
+  PyArrayObject *train, *knn;
+  int n_trees, n_clusters, subspace_dim, distance;
+  if (!PyArg_ParseTuple(args, "O!O!iiii", &PyArray_Type, &train, &PyArray_Type, &knn,
+                        &n_trees, &n_clusters, &subspace_dim, &distance))
     return nullptr;
-  auto *index = dynamic_cast<CraftML *>(self->index);
+  auto *index = dynamic_cast<IVF *>(self->index);
   if (!index) {
-    PyErr_SetString(PyExc_TypeError, "Expected CraftML index");
+    PyErr_SetString(PyExc_TypeError, "Expected IVF index");
+    return nullptr;
+  }
+  if (!craft_array(train, NPY_FLOAT32, 2, self->dim) || !craft_array(knn, NPY_UINT32, 2))
+    return nullptr;
+  PyThreadState *state = PyEval_SaveThread();
+  try {
+    index->build(Eigen::Map<const UIntRowMatrix>(static_cast<uint32_t *>(PyArray_DATA(knn)),
+                                                PyArray_DIM(knn, 0), PyArray_DIM(knn, 1)),
+                 Eigen::Map<const RowMatrix>(static_cast<float *>(PyArray_DATA(train)),
+                                            PyArray_DIM(train, 0), PyArray_DIM(train, 1)),
+                 n_trees, n_clusters, subspace_dim, static_cast<Distance>(distance));
+  } catch (const std::exception &error) {
+    PyEval_RestoreThread(state);
+    PyErr_SetString(PyExc_ValueError, error.what());
+    return nullptr;
+  }
+  PyEval_RestoreThread(state);
+  Py_RETURN_NONE;
+}
+
+template <typename Index>
+static PyObject *ann_distribution(mlannIndex *self, PyObject *args) {
+  PyArrayObject *queries;
+  int k, distance, return_distances;
+  int budget = -1;
+  float threshold;
+  if constexpr (std::is_same_v<Index, IVF>) {
+    if (!PyArg_ParseTuple(args, "O!ifii", &PyArray_Type, &queries, &k, &threshold,
+                          &distance, &return_distances))
+      return nullptr;
+  } else {
+    if (!PyArg_ParseTuple(args, "O!iifii", &PyArray_Type, &queries, &k, &budget, &threshold,
+                          &distance, &return_distances))
+      return nullptr;
+  }
+  auto *index = dynamic_cast<Index *>(self->index);
+  if (!index) {
+    PyErr_SetString(PyExc_TypeError, "Unexpected index type for distribution search");
     return nullptr;
   }
   const int ndim = PyArray_NDIM(queries);
@@ -408,11 +453,16 @@ static PyObject *ann_craftml(mlannIndex *self, PyObject *args) {
 #endif
   for (npy_intp i = 0; i < n; ++i) {
     try {
-      index->search(input + i * self->dim, k, budget, threshold, output + i * k,
-                    static_cast<Distance>(distance), scores ? scores + i * k : nullptr);
+      if constexpr (std::is_same_v<Index, IVF>) {
+        index->query(input + i * self->dim, k, threshold, output + i * k,
+                     static_cast<Distance>(distance), scores ? scores + i * k : nullptr);
+      } else {
+        index->search(input + i * self->dim, k, budget, threshold, output + i * k,
+                      static_cast<Distance>(distance), scores ? scores + i * k : nullptr);
+      }
     } catch (...) {
 #ifdef _OPENMP
-#pragma omp critical(craftml_query_error)
+#pragma omp critical(distribution_query_error)
 #endif
       {
         if (!error) error = std::current_exception();
@@ -434,16 +484,17 @@ static PyObject *ann_craftml(mlannIndex *self, PyObject *args) {
   return nearest;
 }
 
-static PyObject *craftml_scores(mlannIndex *self, PyObject *args) {
+template <typename Index>
+static PyObject *distribution_scores(mlannIndex *self, PyObject *args) {
   PyArrayObject *q;
   if (!PyArg_ParseTuple(args, "O!", &PyArray_Type, &q)) return nullptr;
-  auto *index = dynamic_cast<CraftML *>(self->index);
+  auto *index = dynamic_cast<Index *>(self->index);
   if (!index) {
-    PyErr_SetString(PyExc_TypeError, "Expected CraftML index");
+    PyErr_SetString(PyExc_TypeError, "Unexpected index type for distribution scores");
     return nullptr;
   }
   if (!craft_array(q, NPY_FLOAT32, 1, self->dim)) return nullptr;
-  std::vector<CraftML::LabelScore> prediction;
+  std::vector<typename Index::LabelScore> prediction;
   PyThreadState *state = PyEval_SaveThread();
   try {
     prediction = index->predict(static_cast<float *>(PyArray_DATA(q)));
@@ -471,9 +522,11 @@ static PyObject *craftml_scores(mlannIndex *self, PyObject *args) {
 }
 
 static PyMethodDef MLANNMethods[] = {
+    {"build_ivf", (PyCFunction)build_ivf, METH_VARARGS, "Build random-subspace ensemble IVF"},
+    {"ivf_scores", (PyCFunction)distribution_scores<IVF>, METH_VARARGS, "Sparse corpus-ID probabilities"},
     {"build_craftml", (PyCFunction)build_craftml, METH_VARARGS, "Build a CraftML forest"},
-    {"ann_craftml", (PyCFunction)ann_craftml, METH_VARARGS, "Search a CraftML forest"},
-    {"craftml_scores", (PyCFunction)craftml_scores, METH_VARARGS, "Sparse corpus-ID probabilities"},
+    {"ann_craftml", (PyCFunction)ann_distribution<CraftML>, METH_VARARGS, "Search a CraftML forest"},
+    {"craftml_scores", (PyCFunction)distribution_scores<CraftML>, METH_VARARGS, "Sparse corpus-ID probabilities"},
 
     {"ann", (PyCFunction)ann, METH_VARARGS, "Return approximate nearest neighbors"},
     {"exact_search", (PyCFunction)exact_search, METH_VARARGS, "Return exact nearest neighbors"},

@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "../detail/clustering.h"
 #include "../detail/huge-buffer.h"
 #include "../detail/neighbor-query.h"
 #include "../mlann.h"
@@ -300,8 +301,6 @@ class CraftML : public MLANN {
         std::vector<size_t> offsets;
         RowMatrix labels;
         RowMatrix centers;
-        RowMatrix sums;
-        RowMatrix similarity;
         RowMatrix classifier;
         RowMatrix projected;
         Eigen::VectorXf nearest;
@@ -534,7 +533,9 @@ class CraftML : public MLANN {
             for (int j = 0; j < knn.cols(); ++j) {
                 const uint64_t hash =
                     mlann_detail::mix(label_seed ^ uint64_t(knn(ids[begin + i], j)));
-                labels(i, hash % options.label_dim) += (hash >> 63) ? 1.0f : -1.0f;
+                // Arithmetic avoids a branch on the random sign bit.
+                const float sign = float(2 * int(hash >> 63) - 1);
+                labels(i, hash % options.label_dim) += sign;
             }
             labels.row(i).stableNormalize(); // Zero sketches remain zero.
         }
@@ -584,42 +585,15 @@ class CraftML : public MLANN {
     }
 
     void cluster_labels(TreeScratch& scratch) const {
-        const auto& labels = scratch.labels;
-        const int sample_size = labels.rows();
-
-        auto& centers = scratch.centers;
-        const int count = centers.rows();
-
-        auto& assignment = scratch.assignment;
-        auto& sizes = scratch.sizes;
-        assignment.resize(sample_size);
-        sizes.resize(count);
-
-        auto& sums = scratch.sums;
-        sums.resize(count, options.label_dim);
-        auto& similarity = scratch.similarity;
-        similarity.resize(sample_size, count);
-
-        for (int iteration = 0; iteration < options.iterations; ++iteration) {
-            sums.setZero();
-            std::fill(sizes.begin(), sizes.end(), 0);
-            similarity.noalias() = labels * centers.transpose();
-
-            for (int i = 0; i < sample_size; ++i) {
-                Eigen::Index cluster;
-                similarity.row(i).maxCoeff(&cluster);
-                assignment[i] = static_cast<int>(cluster);
-                ++sizes[cluster];
-                sums.row(cluster) += labels.row(i);
-            }
-
-            for (int c = 0; c < count; ++c) {
-                if (sizes[c]) {
-                    centers.row(c) = sums.row(c);
-                    centers.row(c).stableNormalize();
-                }
-            }
-        }
+        mlann_detail::KMeans::refine(
+            scratch.labels,
+            scratch.centers,
+            scratch.assignment,
+            scratch.sizes,
+            true,
+            options.iterations,
+            false
+        );
     }
 
     // Average query features within each label cluster to obtain routing centroids.
