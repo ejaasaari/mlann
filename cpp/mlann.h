@@ -170,7 +170,6 @@ class MLANN {
         );
     }
 
-    // Full-corpus and candidate searches share scoring, selection, and result formatting.
     static void exact_knn_impl(
         const float* q_data,
         const float* corpus_data,
@@ -238,7 +237,6 @@ class MLANN {
 
         int n_to_sort = n_elected > k ? k : n_elected;
         static thread_local std::vector<ScoredCandidate> scored;
-        // Both paths share this allocation; streaming ranking only needs k records.
         scored.resize(topk_kernel ? n_to_sort : n_elected);
         if (topk_kernel) {
             topk_kernel(
@@ -309,20 +307,19 @@ class MLANN {
         }
     }
 
-    const Eigen::Map<const RowMatrix> corpus; // corpus from which nearest neighbors are searched
-    Eigen::MatrixXf split_points;             // all split points in all the trees
-    Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
-        split_dimensions; // all split dimensions in all the trees
+    const Eigen::Map<const RowMatrix> corpus;
+    Eigen::MatrixXf split_points;
+    Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> split_dimensions;
     std::vector<std::vector<std::vector<uint32_t>>> labels_all;
     std::vector<std::vector<std::vector<float>>> votes_all;
 
-    const int n_corpus;   // size of corpus
-    const int dim;        // dimension of data
-    int n_trees = 0;      // number of RP-trees
-    int depth = 0;        // depth of an RP-tree with median split
-    float density = -1.0; // expected ratio of non-zero components in a projection matrix
-    int n_pool = 0;       // amount of random vectors needed for all the RP-trees
-    int n_array = 0;      // length of the one RP-tree as array
+    const int n_corpus;
+    const int dim;
+    int n_trees = 0;
+    int depth = 0;
+    float density = -1.0; // Expected fraction of nonzero components in a projection matrix.
+    int n_pool = 0;       // Projection vectors across all trees.
+    int n_array = 0;      // Nodes per tree in the flat representation.
     int b = 0;
     int n_inner_nodes = 0;
     int n_leaves = 0;

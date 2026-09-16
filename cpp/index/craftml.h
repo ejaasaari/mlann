@@ -25,7 +25,7 @@ struct CraftMLOptions {
     int branching_factor = 16;
     int leaf_size = 32;
     int label_dim = 512;
-    int feature_dim = 0; // Zero means A = I, including for raw L2 data.
+    int feature_dim = 0; // Zero disables feature projection.
     int iterations = 2;
     int node_sample_size = 1000;
     uint32_t seed = 42;
@@ -111,8 +111,6 @@ class CraftML : public MLANN {
 #endif
         {
             TreeScratch scratch(n_corpus, train.rows(), options_.max_depth);
-            // Release each worker's scratch as soon as its last tree finishes.
-            // The parallel-region barrier still waits for all trees.
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic, 1) nowait
 #endif
@@ -201,7 +199,7 @@ class CraftML : public MLANN {
     }
 
     // budget == -1 selects strict score > threshold; otherwise budget must be >= k.
-    // Too few supported candidates triggers exact full-corpus search, never short output.
+    // Fewer than k supported candidates triggers exact full-corpus search.
     void search(
         const float* q,
         int k,
@@ -265,7 +263,7 @@ class CraftML : public MLANN {
             scratch.candidates.resize(n_corpus);
             std::iota(scratch.candidates.begin(), scratch.candidates.end(), 0);
         }
-        // Sequential corpus access also makes the k=1 tie break agree with exact search.
+        // Corpus-ID order breaks ties deterministically.
         miniselect::pdqsort_branchless(scratch.candidates.begin(), scratch.candidates.end());
         const Eigen::Map<const Eigen::RowVectorXf> query(q, dim);
         MLANN::exact_knn(
@@ -329,7 +327,6 @@ class CraftML : public MLANN {
         }
 
         // Leaf IDs are unique and probabilities positive. Zero marks unseen IDs.
-        // Preserve the accumulation order across trees, including in SIMD batches.
         void add(const std::vector<LabelScore>& labels) {
             size_t i = 0;
 #if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__))
@@ -507,7 +504,6 @@ class CraftML : public MLANN {
         }
     }
 
-    // Sample query rows and hash their corpus-ID labels into normalized label vectors.
     void sample_labels(
         std::vector<int>& ids,
         size_t begin,
@@ -595,7 +591,6 @@ class CraftML : public MLANN {
         );
     }
 
-    // Average query features within each label cluster to obtain routing centroids.
     int fit_feature_centroids(
         const std::vector<int>& ids,
         size_t begin,
@@ -655,7 +650,6 @@ class CraftML : public MLANN {
         if (occupied < 2)
             return false;
 
-        // Store only nonempty children and their contiguous row ranges.
         node.centroids.resize(occupied, features.cols());
         node.children.resize(occupied);
         auto& boundaries = scratch.boundaries[level];
@@ -724,7 +718,6 @@ class CraftML : public MLANN {
             return make_node_leaf();
         }
 
-        // Only per-depth boundaries survive recursion; fitting buffers are shared.
         const auto& boundaries = scratch.boundaries[level];
         const int n_children = tree.nodes[node_id].children.size();
         for (int child = 0; child < n_children; ++child) {

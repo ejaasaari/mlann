@@ -99,8 +99,6 @@ class RF : public MLANN {
             scratch.ensure_corpus(n_corpus);
             std::vector<int> indices(n_train);
 
-            // Release each worker's scratch as soon as its last tree finishes.
-            // The parallel-region barrier still waits for all trees.
 #pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 labels_all[tree] = std::vector<std::vector<uint32_t>>(n_leaves);
@@ -365,7 +363,6 @@ class RF : public MLANN {
                     }
                 }
 
-                // Restore the compact vote counters for the next dimension.
                 const uint32_t* last_knn_ptr =
                     sampled_labels.data() + scratch.sampled_offsets[order[n - 1].index];
                 const size_t last_count = scratch.sampled_offsets[order[n - 1].index + 1] -
@@ -531,7 +528,6 @@ class RF : public MLANN {
         );
     }
 
-    // Advance independent trees together while preserving their leaf-vote order.
     void route_batch(const float* query, int first, int count, int* leaves) const {
         std::array<int, routing_batch_size> nodes{}, active;
         std::iota(active.begin(), active.begin() + count, 0);

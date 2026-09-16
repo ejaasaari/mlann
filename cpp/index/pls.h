@@ -22,15 +22,14 @@ namespace pls_detail {
 using Matrix = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
 struct Sample {
-    Matrix x;                // Centered queries, all input coordinates.
-    std::vector<int> labels; // Compact corpus IDs, row major N x K.
+    Matrix x;                // Centered queries with all input coordinates.
+    std::vector<int> labels; // Compact corpus IDs in row-major N x K order.
     std::vector<int> counts; // Occurrences of each compact label.
     int k = 0;
 
     int n() const { return x.rows(); }
 };
 
-// Single-precision fitting, including centering, products and spectral solves.
 inline Eigen::VectorXf leading_dense(const Eigen::MatrixXf& matrix) {
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXf> solver(matrix);
     if (solver.info() != Eigen::Success) {
@@ -92,9 +91,8 @@ inline float largest_eigenvalue_bound(
 }
 
 // Compute only the largest eigenpair: Householder tridiagonalization, Sturm
-// bisection, then inverse iteration. Never form the dense Householder Q or a
-// complete eigenvector basis. Small problems and failed checks use Eigen's
-// original solver. No random probes or fixed-budget approximate directions.
+// bisection, then inverse iteration. Small problems and failed residual checks
+// fall back to Eigen's full eigensolver.
 inline Eigen::VectorXf leading_bisect(
     const Eigen::MatrixXf& matrix,
     LeadingEigenStats* stats = nullptr
@@ -295,7 +293,7 @@ inline Eigen::VectorXf leading(const Eigen::MatrixXf& matrix, LeadingEigenStats*
     return result;
 }
 
-// An orthonormal change of basis, with no truncation or feature selection.
+// An orthonormal basis for the query row space.
 // When N < dim, every nonzero spectral direction lies in this row space.
 struct QueryBasis {
     Eigen::HouseholderQR<Eigen::MatrixXf> qr;
@@ -353,7 +351,6 @@ inline RowMatrix neighbor_means(
 #pragma omp parallel
     {
         Eigen::RowVectorXf sum(corpus.cols());
-        // Release worker-local storage before the parallel-region barrier.
 #pragma omp for schedule(static) nowait
         for (int i = 0; i < labels.rows(); ++i) {
             sum.setZero();
@@ -518,13 +515,10 @@ class PLS : public MLANN {
         std::vector<std::vector<float>> tree_projections(n_trees_);
         const pls_detail::PALTables tables(std::min<int>(n_subsample, train.rows()), knn.cols());
 
-        // Compute neighbor means once and release them after fitting the forest.
         RowMatrix targets = pls_detail::neighbor_means(corpus, knn);
 #pragma omp parallel
         {
             TreeScratch scratch(n_corpus);
-            // Release each worker's scratch as soon as its last tree finishes.
-            // The parallel-region barrier still waits for all trees.
 #pragma omp for schedule(dynamic, 1) nowait
             for (int t = 0; t < n_trees_; ++t) {
                 std::vector<int> rows(train.rows());
@@ -693,12 +687,10 @@ class PLS : public MLANN {
             throw std::invalid_argument("Invalid forest data or dimensions");
         }
 
-        // Reuse one sorting buffer per worker instead of allocating for every row.
         int duplicates = 0;
 #pragma omp parallel reduction(| : duplicates)
         {
             std::vector<uint32_t> ids(knn.cols());
-            // Release worker-local storage before the parallel-region barrier.
 #pragma omp for schedule(static) nowait
             for (int i = 0; i < knn.rows(); ++i) {
                 std::copy_n(knn.row(i).data(), knn.cols(), ids.begin());
@@ -899,7 +891,6 @@ class PLS : public MLANN {
             return finish_leaf();
         }
 
-        // Fit on the sample, then route every training row through the chosen split.
         node.threshold = fit.split.threshold;
         const auto split_position = std::partition(begin, end, [&](int row) {
             return project(fit.normal, train.row(row).data()) <= node.threshold;

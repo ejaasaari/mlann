@@ -100,8 +100,6 @@ class RP : public MLANN {
 #pragma omp parallel
         {
             TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, depth);
-            // Release each worker's scratch as soon as its last tree finishes.
-            // The parallel-region barrier still waits for all trees.
 #pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 labels_all[tree].resize(n_leaves);
@@ -237,10 +235,7 @@ class RP : public MLANN {
         std::vector<int> rows;
         std::vector<int> votes;
         std::vector<uint32_t> touched_ids;
-        // Partitioning repeatedly gathers projections by shuffled row ID. Use
-        // huge-page-backed scratch to reduce address-translation work on large
-        // training sets. Sparse products use contiguous rows; dense products
-        // use a column-major view of the same buffer to retain their arithmetic.
+        // Huge pages reduce translation overhead when gathering shuffled row IDs.
         mlann_detail::HugeBuffer<float> projection_storage;
         Eigen::Map<RowMatrix> projections;
 
@@ -266,8 +261,7 @@ class RP : public MLANN {
         if (density < 1) {
             std::uniform_real_distribution<float> uniform(0, 1);
             sparse_random_matrix.resize(n_pool, dim);
-            // Rows and coordinates arrive in sorted order; fill CSR directly instead
-            // of constructing and sorting a second collection of triplets.
+            // Sorted coordinates allow direct CSR insertion.
             for (int row = 0; row < n_pool; ++row) {
                 sparse_random_matrix.startVec(row);
                 for (int column = 0; column < dim; ++column) {
@@ -319,7 +313,6 @@ class RP : public MLANN {
                 scratch.votes[label] = 0;
                 if (count >= b) {
                     labels.push_back(label);
-                    // Conversion back to float during query preserves raw counts.
                     votes.push_back(count);
                 }
             }
@@ -348,9 +341,7 @@ class RP : public MLANN {
         const int count = end - begin;
         const auto mid = end - count / 2;
         if (count >= cached_selection_min_size) {
-            // Cache large nodes' comparison keys contiguously. This avoids
-            // repeatedly gathering projections through shuffled row IDs during
-            // selection; copying the resulting IDs back preserves leaf order.
+            // Contiguous keys avoid repeated shuffled gathers during selection.
             auto first = scratch.keys.begin();
             auto last = first + count;
             for (int i = 0; i < count; ++i)

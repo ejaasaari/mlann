@@ -103,8 +103,6 @@ class KD : public MLANN {
 #pragma omp parallel
         {
             TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, dim);
-            // Release each worker's scratch as soon as its last tree finishes.
-            // The parallel-region barrier still waits for all trees.
 #pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 labels_all[tree].resize(n_leaves);
@@ -280,7 +278,6 @@ class KD : public MLANN {
                 scratch.votes[label] = 0;
                 if (count >= b) {
                     labels.push_back(label);
-                    // Conversion back to float during query preserves raw counts.
                     votes.push_back(count);
                 }
             }

@@ -17,7 +17,7 @@ namespace mlann_detail {
 
 // Storage for trivial values. Linux allocations request transparent huge pages;
 // other platforms and failed mappings use ordinary vector storage. Resizing to
-// a different size discards contents. No process-wide memory policy is changed.
+// a different size discards contents.
 template <class T>
 class HugeBuffer {
     static_assert(std::is_trivial<T>::value, "HugeBuffer requires trivial values");
@@ -129,7 +129,6 @@ class HugeBuffer {
         const uintptr_t base = reinterpret_cast<uintptr_t>(raw);
         const uintptr_t aligned = (base + huge_page_size - 1) & ~uintptr_t(huge_page_size - 1);
 
-        // Release the unused spans before and after the aligned buffer.
         const size_t prefix = aligned - base;
         const size_t suffix = huge_page_size - prefix;
         if (prefix)
@@ -150,7 +149,6 @@ class HugeBuffer {
 };
 
 // Promote only complete huge-page spans inside the existing corpus allocation.
-// No corpus copy or index metadata is created; unsupported advice is harmless.
 inline void promote_existing_corpus_pages(const void* data, size_t bytes) {
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
     constexpr uintptr_t huge_page_size = 2 * 1024 * 1024;

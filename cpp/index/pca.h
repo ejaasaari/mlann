@@ -87,9 +87,8 @@ inline Eigen::VectorXf power_direction(
     return direction;
 }
 
-// Points are columns. Sparse PCA centers and solves directly in double precision,
-// avoiding float rescaling and an extra full feature matrix. PCA still scales
-// its centered samples before the bounded float power iteration.
+// Points are columns. SparsePCA fits in double precision; PCA scales centered
+// samples before float power iteration.
 inline Eigen::VectorXf principal_direction(
     const Eigen::Ref<const Eigen::MatrixXf>& points,
     Eigen::VectorXf initial,
@@ -139,7 +138,7 @@ inline Eigen::VectorXf principal_direction(
 } // namespace pca_detail
 
 // Median-split PCA forest. SparsePCA samples coordinates with replacement;
-// PCA uses every coordinate and caps fitting rows with n_subsample (default 300).
+// PCA uses every coordinate and caps fitting rows with n_subsample.
 class SparsePCA : public MLANN {
   public:
     SparsePCA(const float* corpus_, int n_corpus_, int dim_)
@@ -228,8 +227,6 @@ class SparsePCA : public MLANN {
 #pragma omp parallel
         {
             TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, n_subsample);
-            // Release each worker's scratch as soon as its last tree finishes.
-            // The parallel-region barrier still waits for all trees.
 #pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 try {
@@ -375,7 +372,6 @@ class SparsePCA : public MLANN {
     void initialize_projections(int tree, std::minstd_rand& generator) {
         std::uniform_int_distribution<int> coordinate(0, dim - 1);
         std::normal_distribution<float> normal(0, 1);
-        // Preserve per-tree random draw order, including initialization of every node.
         for (int node = 0; node < n_inner_nodes; ++node) {
             const auto row = projection_row(tree, node);
             if (!full_dimensions) {
@@ -441,11 +437,8 @@ class SparsePCA : public MLANN {
         );
         projections.row(row) = direction.transpose();
 
-        // Sparse fits already contain every row. Full fits may be sampled, so
-        // they still project the complete node from the original training data.
         if (!full_dimensions) {
-            // Sparse fitting already gathered every row, including repeated coordinates.
-            // Reuse those contiguous coordinates for the projection.
+            // Sparse fits contain every row, so their gathered coordinates can be reused.
             for (int i = 0; i < count; ++i) {
                 const float* point = scratch.fit.col(i).data();
                 float score = 0.f;
@@ -527,7 +520,6 @@ class SparsePCA : public MLANN {
                 scratch.votes[label] = 0;
                 if (count >= b) {
                     labels.push_back(label);
-                    // Conversion back to float during query preserves raw counts.
                     votes.push_back(count);
                 }
             }

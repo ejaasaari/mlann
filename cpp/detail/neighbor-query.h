@@ -8,8 +8,6 @@
 #include "one-to-many.h"
 
 namespace mlann_detail {
-// Same arithmetic and output buffers as the native scorer. Smaller batches and
-// look-ahead loads reduce stalls while reading full corpus vectors.
 #if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__))
 #define MLANN_NEIGHBOR_INLINE inline __attribute__((always_inline))
 #define MLANN_NEIGHBOR_REPEAT_4(OP) OP(0) OP(1) OP(2) OP(3)
@@ -178,8 +176,7 @@ inline void compute_neighbor_scores(
     compute_neighbor_one_to_many(query, data, dim, indices, count, metric, output);
 }
 
-// Score every elected vector with the same float kernel. Keeping a heap of the
-// best k scores avoids writing and selecting an entire candidate-score array.
+// A top-k heap bounds score storage independently of the candidate count.
 template <OneToManyMetric metric>
 struct NeighborTopKOrder {
     bool operator()(const ScoredCandidate& left, const ScoredCandidate& right) const {
@@ -273,8 +270,7 @@ inline void compute_neighbor_topk(
         );
 }
 
-// Leaf labels are unique. SIMD updates therefore preserve the original
-// per-label accumulation order across trees and the elected-candidate order.
+// Unique labels within each leaf allow SIMD updates without conflicting writes.
 template <bool unit_votes, typename Weight = float>
 inline void accumulate_leaf_votes(
     const std::vector<uint32_t>& labels,

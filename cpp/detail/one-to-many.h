@@ -32,7 +32,6 @@ namespace mlann_detail {
 
 enum class OneToManyMetric { IP, L2 };
 
-// Shared by full-score and streaming top-k ranking; the record layout is unchanged.
 struct ScoredCandidate {
     float score;
     std::uint32_t label;
