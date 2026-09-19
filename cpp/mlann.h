@@ -7,6 +7,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -138,6 +139,35 @@ class MLANN {
             throw std::logic_error("Enable tuning before growing the master");
         retain_membership = true;
         tuning_structure_only = structure_only;
+    }
+
+    void enable_view_cache() {
+        check_view(1, 1);
+        std::lock_guard<std::mutex> lock(view_cache_mutex);
+        cache_views = true;
+    }
+
+    void clear_view_cache() const {
+        std::lock_guard<std::mutex> lock(view_cache_mutex);
+        cached_payloads.clear();
+        cached_depth = 0;
+        // Weak entries retain no payloads and allow reuse from still-live subsets.
+    }
+
+    struct ViewCacheInfo {
+        int depth, trees;
+        size_t bytes, trees_built;
+    };
+
+    ViewCacheInfo view_cache_info() const {
+        std::lock_guard<std::mutex> lock(view_cache_mutex);
+        ViewCacheInfo info{cached_depth, 0, 0, payload_trees_built};
+        for (const auto& payload : cached_payloads)
+            if (payload) {
+                ++info.trees;
+                info.bytes += payload->bytes;
+            }
+        return info;
     }
 
     virtual std::unique_ptr<MLANN> make_view(int, int) const {
@@ -352,6 +382,9 @@ class MLANN {
     virtual size_t index_bytes() const {
         size_t bytes = sizeof(MLANN) + size_t(split_points.size()) * sizeof(float) +
                        size_t(split_dimensions.size()) * sizeof(uint32_t);
+        bytes += shared_payloads.capacity() * sizeof(std::shared_ptr<const TuningTreePayload>);
+        for (const auto& payload : shared_payloads)
+            bytes += payload->bytes;
         return bytes + payload_bytes(labels_all) + payload_bytes(votes_all);
     }
 
@@ -368,6 +401,8 @@ class MLANN {
     }
 
     bool compact_view_votes(bool unit, std::vector<std::vector<std::vector<uint16_t>>>& compact) {
+        if (!shared_payloads.empty())
+            return false; // Shared leaves are already stored in their final representation.
         if (!unit) {
             for (const auto& tree : votes_all)
                 for (const auto& leaf : tree)
@@ -386,6 +421,61 @@ class MLANN {
     }
 
     bool retain_membership = false;
+
+    struct TuningLeafPayload {
+        std::vector<uint32_t> labels;
+        std::vector<uint16_t> compact;
+        std::vector<float> weights;
+    };
+
+    struct TuningTreePayload {
+        std::vector<TuningLeafPayload> leaves;
+        size_t bytes = 0;
+        bool unit = false, probability = false;
+    };
+
+    std::vector<std::shared_ptr<const TuningTreePayload>> shared_payloads;
+    mutable std::mutex view_cache_mutex;
+    bool cache_views = false;
+    mutable int cached_depth = 0;
+    mutable size_t payload_trees_built = 0;
+    mutable std::vector<std::shared_ptr<const TuningTreePayload>> cached_payloads;
+    mutable std::unordered_map<int, std::vector<std::weak_ptr<const TuningTreePayload>>>
+        weak_payloads;
+
+    bool accumulate_tuning_votes(
+        int tree,
+        int leaf,
+        float* totals,
+        float threshold,
+        std::vector<uint32_t>& elected
+    ) const {
+        if (shared_payloads.empty())
+            return false;
+        const auto& payload = *shared_payloads[tree];
+        const auto& data = payload.leaves[leaf];
+        if (payload.unit) {
+            mlann_detail::accumulate_unit_votes(data.labels, totals, threshold, elected);
+        } else if (payload.probability) {
+            for (size_t j = 0; j < data.labels.size(); ++j) {
+                float& total = totals[data.labels[j]];
+                const float previous = total;
+                total += data.weights[j];
+                if (total / float(n_trees) >= threshold &&
+                    (previous / float(n_trees) < threshold || previous == 0))
+                    elected.push_back(data.labels[j]);
+            }
+        } else if (!data.compact.empty()) {
+            mlann_detail::accumulate_neighbor_votes(
+                data.labels, data.compact, totals, threshold, elected
+            );
+        } else {
+            mlann_detail::accumulate_neighbor_votes(
+                data.labels, data.weights, totals, threshold, elected
+            );
+        }
+        return true;
+    }
     bool tuning_structure_only = false;
     bool tuning_unit_labels = false;
     UIntRowMatrix tuning_labels;
@@ -504,8 +594,8 @@ class MLANN {
         const size_t entries = std::min(mass / size_t(b), leaves * size_t(n_corpus));
         return sizeof(MLANN) +
                config.trees *
-                   (2 * sizeof(std::vector<std::vector<float>>) +
-                    leaves * 2 * sizeof(std::vector<float>) + (leaves - 1) * 8 + entries * 8) +
+                   (sizeof(TuningTreePayload) + sizeof(std::shared_ptr<const TuningTreePayload>) +
+                    leaves * sizeof(TuningLeafPayload) + (leaves - 1) * 8 + entries * 8) +
                method_bytes;
     }
 
@@ -845,83 +935,179 @@ class MLANN {
             }
         }
     }
-    void initialize_view(MLANN& view, int trees, int d) const {
-        check_view(trees, d);
-        view.n_trees = trees;
-        view.depth = d;
-        view.n_leaves = 1 << d;
-        view.n_inner_nodes = view.n_leaves - 1;
-        view.n_array = 2 * view.n_leaves;
-        view.n_pool = trees * d;
-        view.b = b;
-        view.density = density;
-        view.split_points = split_points.topLeftCorner(view.n_inner_nodes, trees);
-        if (split_dimensions.size())
-            view.split_dimensions = split_dimensions.topLeftCorner(view.n_inner_nodes, trees);
-        view.labels_all.resize(trees);
-        view.votes_all.resize(trees);
+    virtual std::pair<int, int> tuning_children(int tree, int node) const {
+        const int left = 2 * node + 1;
+        if (tuning_intervals[tree][left].first < 0)
+            return {-1, -1};
+        return {left, left + 1};
+    }
+
+    virtual size_t tuning_leaf_slots(int, int d) const { return size_t(1) << d; }
+
+    virtual int tuning_leaf_slot(int node, int level, int d, int) const {
+        return (1 << (d - level)) * (node + 1) - (1 << d);
+    }
+
+    void fill_tuning_leaf(
+        TuningLeafPayload& leaf,
+        int tree,
+        int node,
+        std::vector<uint32_t>& counts,
+        std::vector<uint32_t>& touched
+    ) const {
+        if (tuning_unit_labels) {
+            const auto interval = tuning_intervals[tree][node];
+            const auto& rows = tuning_permutations[tree];
+            leaf.labels.assign(rows.begin() + interval.first, rows.begin() + interval.second);
+            return;
+        }
+        count_node(tree, node, counts, touched);
+        uint64_t mass = 0;
+        uint32_t maximum = 0;
+        size_t retained = 0;
+        for (auto id : touched)
+            if (counts[id] >= uint32_t(b)) {
+                mass += counts[id];
+                maximum = std::max(maximum, counts[id]);
+                ++retained;
+            }
+        const bool compact =
+            !probability_scores() && maximum <= std::numeric_limits<uint16_t>::max();
+        const float scale = probability_scores() && mass ? 1.f / float(mass) : 1.f;
+        leaf.labels.reserve(retained);
+        if (compact)
+            leaf.compact.reserve(retained);
+        else
+            leaf.weights.reserve(retained);
+        for (auto id : touched) {
+            if (counts[id] >= uint32_t(b)) {
+                leaf.labels.push_back(id);
+                if (compact)
+                    leaf.compact.push_back(uint16_t(counts[id]));
+                else
+                    leaf.weights.push_back(float(counts[id]) * scale);
+            }
+            counts[id] = 0;
+        }
+        touched.clear();
+    }
+
+    void fill_tuning_subtree(
+        TuningTreePayload& payload,
+        int tree,
+        int node,
+        int level,
+        int d,
+        int& cursor,
+        std::vector<uint32_t>& counts,
+        std::vector<uint32_t>& touched
+    ) const {
+        const auto children = level == d ? std::make_pair(-1, -1) : tuning_children(tree, node);
+        if (children.first < 0) {
+            fill_tuning_leaf(
+                payload.leaves[tuning_leaf_slot(node, level, d, cursor++)],
+                tree,
+                node,
+                counts,
+                touched
+            );
+        } else {
+            fill_tuning_subtree(
+                payload, tree, children.first, level + 1, d, cursor, counts, touched
+            );
+            fill_tuning_subtree(
+                payload, tree, children.second, level + 1, d, cursor, counts, touched
+            );
+        }
+    }
+
+    std::shared_ptr<const TuningTreePayload> make_tuning_payload(
+        int tree,
+        int d,
+        std::vector<uint32_t>& counts,
+        std::vector<uint32_t>& touched
+    ) const {
+        auto payload = std::make_shared<TuningTreePayload>();
+        payload->unit = tuning_unit_labels;
+        payload->probability = probability_scores();
+        payload->leaves.resize(tuning_leaf_slots(tree, d));
+        int cursor = 0;
+        fill_tuning_subtree(*payload, tree, 0, 0, d, cursor, counts, touched);
+        payload->bytes =
+            sizeof(TuningTreePayload) + payload->leaves.capacity() * sizeof(TuningLeafPayload);
+        for (const auto& leaf : payload->leaves)
+            payload->bytes += leaf.labels.capacity() * sizeof(uint32_t) +
+                              leaf.compact.capacity() * sizeof(uint16_t) +
+                              leaf.weights.capacity() * sizeof(float);
+        return payload;
+    }
+
+    void initialize_shared_payloads(MLANN& view, int trees, int d) const {
+        // Serialize cache updates, not queries: published tree payloads are immutable.
+        std::unique_lock<std::mutex> lock(view_cache_mutex, std::defer_lock);
+        if (cache_views)
+            lock.lock();
+        view.shared_payloads.resize(trees);
+        if (cache_views) {
+            if (cached_depth != d) {
+                cached_payloads.clear(); // Do not strongly cache every visited depth.
+                cached_depth = d;
+            }
+            auto& known = weak_payloads[d];
+            known.resize(std::max(known.size(), size_t(trees)));
+            for (int t = 0; t < trees; ++t)
+                view.shared_payloads[t] = known[t].lock();
+        }
+        std::vector<int> missing;
+        for (int t = 0; t < trees; ++t)
+            if (!view.shared_payloads[t])
+                missing.push_back(t);
         std::exception_ptr error;
+        if (!missing.empty()) {
 #pragma omp parallel
-        {
-            std::vector<uint32_t> counts(tuning_unit_labels ? 0 : n_corpus, 0), touched;
+            {
+                std::vector<uint32_t> counts(tuning_unit_labels ? 0 : n_corpus, 0), touched;
 #pragma omp for schedule(dynamic, 1)
-            for (int t = 0; t < trees; ++t) {
-                try {
-                    view.labels_all[t].resize(view.n_leaves);
-                    view.votes_all[t].resize(view.n_leaves);
-                    std::function<void(int, int)> visit = [&](int node, int level) {
-                        const bool terminal =
-                            level == depth || tuning_intervals[t][2 * node + 1].first < 0;
-                        if (level == d || terminal) {
-                            const int leaf =
-                                (1 << (d - level)) * (node + 1) - 1 - view.n_inner_nodes;
-                            if (tuning_unit_labels) {
-                                const auto interval = tuning_intervals[t][node];
-                                const auto& rows = tuning_permutations[t];
-                                view.labels_all[t][leaf].assign(
-                                    rows.begin() + interval.first, rows.begin() + interval.second
-                                );
-                                return;
-                            }
-                            count_node(t, node, counts, touched);
-                            uint64_t mass = 0;
-                            size_t retained = 0;
-                            for (uint32_t id : touched)
-                                if (counts[id] >= uint32_t(b)) {
-                                    mass += counts[id];
-                                    ++retained;
-                                }
-                            const float scale =
-                                probability_scores() && mass ? 1.f / float(mass) : 1.f;
-                            auto& labels = view.labels_all[t][leaf];
-                            auto& votes = view.votes_all[t][leaf];
-                            labels.reserve(retained);
-                            votes.reserve(retained);
-                            for (uint32_t id : touched) {
-                                if (counts[id] >= uint32_t(b)) {
-                                    labels.push_back(id);
-                                    votes.push_back(float(counts[id]) * scale);
-                                }
-                                counts[id] = 0;
-                            }
-                            touched.clear();
-                        } else {
-                            visit(2 * node + 1, level + 1);
-                            visit(2 * node + 2, level + 1);
-                        }
-                    };
-                    visit(0, 0);
-                } catch (...) {
+                for (size_t i = 0; i < missing.size(); ++i) {
+                    try {
+                        const int t = missing[i];
+                        view.shared_payloads[t] = make_tuning_payload(t, d, counts, touched);
+                    } catch (...) {
 #pragma omp critical(tuning_payload_error)
-                    {
-                        if (!error)
-                            error = std::current_exception();
+                        {
+                            if (!error)
+                                error = std::current_exception();
+                        }
                     }
                 }
             }
         }
         if (error)
             std::rethrow_exception(error);
+        if (cache_views) {
+            payload_trees_built += missing.size();
+            cached_payloads.resize(std::max(cached_payloads.size(), size_t(trees)));
+            for (int t = 0; t < trees; ++t) {
+                cached_payloads[t] = view.shared_payloads[t];
+                weak_payloads[d][t] = view.shared_payloads[t];
+            }
+        }
+    }
+
+    void initialize_view(MLANN& view, int trees, int d) const {
+        check_view(trees, d);
+        view.n_trees = trees;
+        view.depth = d;
+        view.n_leaves = 1 << d;
+        view.n_inner_nodes = view.n_leaves - 1;
+        view.n_array = 1 << (d + 1);
+        view.n_pool = trees * d;
+        view.b = b;
+        view.density = density;
+        view.split_points = split_points.topLeftCorner(view.n_inner_nodes, trees);
+        if (split_dimensions.size())
+            view.split_dimensions = split_dimensions.topLeftCorner(view.n_inner_nodes, trees);
+        initialize_shared_payloads(view, trees, d);
     }
     using CandidateScoreKernel = void (*)(
         const float*,

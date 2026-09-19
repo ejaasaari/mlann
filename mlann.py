@@ -180,6 +180,7 @@ class AutotuneProfile:
     """
 
     def __init__(self, master, configurations, timing_queries, options, query_counts, stages):
+        master.index._enable_view_cache()
         self._master = master
         self._configurations = tuple(replace(c) for c in configurations)
         self._timing_queries = timing_queries[:options.timing_sample_size].copy()
@@ -198,6 +199,18 @@ class AutotuneProfile:
 
     def close(self):
         self._master = None
+
+    def cache_info(self):
+        """Report the active depth's shared payload bytes and cumulative trees built."""
+        if self.closed:
+            raise RuntimeError("The autotuning profile is closed")
+        return self._master.index._view_cache_info()
+
+    def clear_cache(self):
+        """Release cached payloads without invalidating any existing subset."""
+        if self.closed:
+            raise RuntimeError("The autotuning profile is closed")
+        self._master.index._clear_view_cache()
 
     def __enter__(self):
         if self.closed:
@@ -242,7 +255,8 @@ class AutotuneProfile:
             query_counts=dict(self.query_counts), target_met=target_met,
             fallback_reason=None if target_met else "frontier_target_unreachable",
         )
-        # The native view owns its payloads/projections and retains the corpus.
+        # Native views share immutable payloads, own their routing projections,
+        # and retain the corpus independently of the profile.
         index = MLANNIndex(None)
         index._data = self._master._data
         index.index_type = self._master.index_type

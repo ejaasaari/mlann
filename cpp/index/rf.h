@@ -161,6 +161,10 @@ class RF : public MLANN {
             route_batch(data, first, count, leaves.data());
             for (int t = 0; t < count; ++t) {
                 const int leaf = leaves[t];
+                if (accumulate_tuning_votes(
+                        first + t, leaf, votes_total.data(), vote_threshold, elected
+                    ))
+                    continue;
                 if (unscaled_votes) {
                     // Same float sums and final divisor as calibration. Threshold
                     // crossings track election without destroying cumulative scores.

@@ -214,6 +214,10 @@ class RP : public MLANN {
             route_batch(projected.data(), first, count, leaves.data());
             for (int t = 0; t < count; ++t) {
                 const int leaf = leaves[t];
+                if (accumulate_tuning_votes(
+                        first + t, leaf, votes_total.data(), vote_threshold, elected
+                    ))
+                    continue;
                 if (corpus_leaves) {
                     mlann_detail::accumulate_unit_votes(
                         labels_all[first + t][leaf], votes_total.data(), vote_threshold, elected

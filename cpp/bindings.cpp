@@ -785,6 +785,38 @@ static PyObject* index_bytes(mlannIndex* self, PyObject*) {
     return PyLong_FromSize_t(self->index->index_bytes());
 }
 
+static PyObject* enable_view_cache(mlannIndex* self, PyObject*) {
+    try {
+        self->index->enable_view_cache();
+    } catch (const std::exception& e) {
+        PyErr_SetString(PyExc_ValueError, e.what());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* clear_view_cache(mlannIndex* self, PyObject*) {
+    PyThreadState* state = PyEval_SaveThread();
+    self->index->clear_view_cache();
+    PyEval_RestoreThread(state);
+    Py_RETURN_NONE;
+}
+
+static PyObject* view_cache_info(mlannIndex* self, PyObject*) {
+    const auto info = self->index->view_cache_info();
+    return Py_BuildValue(
+        "{s:i,s:i,s:K,s:K}",
+        "depth",
+        info.depth,
+        "trees",
+        info.trees,
+        "payload_bytes",
+        static_cast<unsigned long long>(info.bytes),
+        "trees_built",
+        static_cast<unsigned long long>(info.trees_built)
+    );
+}
+
 static PyObject* estimate_costs(mlannIndex* self, PyObject* args) {
     PyArrayObject *queries, *configurations, *sample;
     int k, dist;
@@ -932,6 +964,18 @@ static PyMethodDef MLANNMethods[] = {
      "Calibrate reusable recall-cost frontier"},
     {"_predict_recall", (PyCFunction) predict_recall, METH_VARARGS, "Per-query candidate recall"},
     {"_index_bytes", (PyCFunction) index_bytes, METH_NOARGS, "Owned deployed index storage"},
+    {"_enable_view_cache",
+     (PyCFunction) enable_view_cache,
+     METH_NOARGS,
+     "Share immutable tuning payloads"},
+    {"_clear_view_cache",
+     (PyCFunction) clear_view_cache,
+     METH_NOARGS,
+     "Release strongly cached payloads"},
+    {"_view_cache_info",
+     (PyCFunction) view_cache_info,
+     METH_NOARGS,
+     "Tuning payload cache statistics"},
     {"_query_threads", (PyCFunction) query_threads, METH_NOARGS, "OpenMP query thread limit"},
     {"build_ivf", (PyCFunction) build_ivf, METH_VARARGS, "Build random-subspace ensemble IVF"},
     {"build_craftml", (PyCFunction) build_craftml, METH_VARARGS, "Build a CraftML forest"},
