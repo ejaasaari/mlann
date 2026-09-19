@@ -89,6 +89,7 @@ class KD : public MLANN {
         split_points.resize(n_inner_nodes, n_trees);
         split_dimensions.resize(n_inner_nodes, n_trees);
         labels_all.resize(n_trees);
+        prepare_tuning(knn, unsupervised, n_train);
         // This bound includes duplicate IDs within a training row. Larger raw
         // counts retain float storage, avoiding truncation at the uint16 limit.
         const uint64_t max_leaf_rows = (uint64_t(n_train) + n_leaves - 1) / n_leaves;
@@ -124,6 +125,7 @@ class KD : public MLANN {
                     generator,
                     scratch
                 );
+                finish_tuning_tree(tree, scratch.rows);
             }
         }
         mlann_detail::promote_existing_corpus_pages(
@@ -132,6 +134,18 @@ class KD : public MLANN {
     }
 
   public:
+    size_t index_bytes() const override {
+        return MLANN::index_bytes() + sizeof(KD) - sizeof(MLANN) + payload_bytes(votes16_all);
+    }
+
+    std::unique_ptr<MLANN> make_view(int trees, int d) const override {
+        auto view = std::make_unique<KD>(corpus.data(), n_corpus, dim, top_variance_dims);
+        initialize_view(*view, trees, d);
+        view->corpus_leaves = tuning_unit_labels;
+        view->compact_leaf_votes = view->compact_view_votes(tuning_unit_labels, view->votes16_all);
+        return view;
+    }
+
     void query(
         const float* data,
         int k,
@@ -191,6 +205,14 @@ class KD : public MLANN {
     }
 
   protected:
+    void tuning_path(const float* q, int tree, int* path) const override {
+        path[0] = 0;
+        for (int level = 0; level < depth; ++level) {
+            const int node = path[level];
+            path[level + 1] =
+                2 * node + (q[split_dimensions(node, tree)] <= split_points(node, tree) ? 1 : 2);
+        }
+    }
     bool compact_leaf_votes = false;
     std::vector<std::vector<std::vector<uint16_t>>> votes16_all;
 
@@ -255,6 +277,8 @@ class KD : public MLANN {
         const Eigen::Ref<const UIntRowMatrix>& knn,
         TreeScratch& scratch
     ) {
+        if (tuning_structure_only)
+            return;
         if (corpus_leaves) {
             labels_all[tree][leaf].assign(begin, end);
             return;
@@ -300,9 +324,11 @@ class KD : public MLANN {
         TreeScratch& scratch
     ) {
         if (level == depth) {
+            record_tuning_node(tree, node, begin, end);
             make_leaf(begin, end, tree, node - n_inner_nodes, knn, scratch);
             return;
         }
+        record_tuning_node(tree, node, begin, end);
         const int dimension = choose_dimension(begin, end, train, generator, scratch);
         split_dimensions(node, tree) = dimension;
         for (auto it = begin; it != end; ++it)

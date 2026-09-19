@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -180,6 +181,8 @@ inline void compute_neighbor_scores(
 template <OneToManyMetric metric>
 struct NeighborTopKOrder {
     bool operator()(const ScoredCandidate& left, const ScoredCandidate& right) const {
+        if (left.score == right.score)
+            return left.label < right.label;
         if constexpr (metric == OneToManyMetric::IP)
             return left.score > right.score;
         else
@@ -282,7 +285,7 @@ inline void accumulate_leaf_votes(
     size_t i = 0;
 #if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__))
     const __m512 limit = _mm512_set1_ps(threshold);
-    const __m512 sentinel = _mm512_set1_ps(-9999999.f);
+    const __m512 sentinel = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
     for (; i + 16 <= labels.size(); i += 16) {
         for (size_t j = i + 32; j < labels.size() && j < i + 48; ++j)
             __builtin_prefetch(votes + labels[j], 1, 1);
@@ -314,7 +317,7 @@ inline void accumulate_leaf_votes(
 #endif
         if ((votes[labels[i]] += (unit_votes ? 1.f : weights[i])) >= threshold) {
             elected.push_back(labels[i]);
-            votes[labels[i]] = -9999999.f;
+            votes[labels[i]] = -std::numeric_limits<float>::infinity();
         }
     }
 }

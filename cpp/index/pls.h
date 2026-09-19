@@ -495,6 +495,13 @@ class PLS : public MLANN {
         depth = depth_;
         b = b_;
 
+        if (retain_membership) {
+            tuning_labels = knn;
+            tuning_permutations.resize(n_trees);
+            tuning_intervals.resize(n_trees);
+            tuning_begins.resize(n_trees);
+        }
+
         forests.resize(n_trees_);
         leaves_all.resize(n_trees_);
         std::vector<std::vector<float>> tree_projections(n_trees_);
@@ -513,6 +520,7 @@ class PLS : public MLANN {
                 );
                 scratch.projections.clear();
                 grow_subtree(rows.begin(), rows.end(), 0, t, train, knn, targets, tables, scratch);
+                finish_tuning_tree(t, rows);
                 forests[t].shrink_to_fit();
                 leaves_all[t].shrink_to_fit();
                 tree_projections[t] = std::move(scratch.projections);
@@ -524,6 +532,54 @@ class PLS : public MLANN {
         mlann_detail::promote_existing_corpus_pages(
             corpus.data(), size_t(corpus.size()) * sizeof(float)
         );
+    }
+
+    std::unique_ptr<MLANN> make_view(int trees, int d) const override {
+        check_view(trees, d);
+        auto view = std::make_unique<PLS>(corpus.data(), n_corpus, dim, n_subsample);
+        view->n_trees = trees;
+        view->depth = d;
+        view->b = b;
+        view->unscaled_votes = true;
+        view->forests.resize(trees);
+        view->leaves_all.resize(trees);
+        std::vector<std::vector<float>> normals(trees);
+        std::exception_ptr error;
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int tree = 0; tree < trees; ++tree) {
+            try {
+                std::vector<uint32_t> counts(n_corpus, 0), touched;
+                copy_tuning_subtree(*view, tree, 0, 0, normals[tree], counts, touched);
+                view->forests[tree].shrink_to_fit();
+                view->leaves_all[tree].shrink_to_fit();
+            } catch (...) {
+#pragma omp critical(pls_tuning_view_error)
+                {
+                    if (!error)
+                        error = std::current_exception();
+                }
+            }
+        }
+        if (error)
+            std::rethrow_exception(error);
+        view->pack_projections(normals);
+        return view;
+    }
+
+    size_t index_bytes() const override {
+        size_t bytes = MLANN::index_bytes() + sizeof(PLS) - sizeof(MLANN) +
+                       projections.size() * sizeof(float) +
+                       forests.capacity() * sizeof(std::vector<Node>) +
+                       leaves_all.capacity() * sizeof(std::vector<Leaf>);
+        for (const auto& tree : forests)
+            bytes += tree.capacity() * sizeof(Node);
+        for (const auto& tree : leaves_all) {
+            bytes += tree.capacity() * sizeof(Leaf);
+            for (const auto& leaf : tree)
+                bytes += leaf.labels.capacity() * sizeof(uint32_t) +
+                         leaf.votes.capacity() * sizeof(float);
+        }
+        return bytes;
     }
 
     void query(
@@ -547,6 +603,17 @@ class PLS : public MLANN {
             route_batch(data, first, count, leaves.data());
             for (int t = 0; t < count; ++t) {
                 const auto& leaf = leaves_all[first + t][leaves[t]];
+                if (unscaled_votes) {
+                    for (size_t j = 0; j < leaf.labels.size(); ++j) {
+                        float& total = votes_total[leaf.labels[j]];
+                        const float previous = total;
+                        total += leaf.votes[j];
+                        if (total / float(n_trees) >= vote_threshold &&
+                            (previous / float(n_trees) < vote_threshold || previous == 0))
+                            elected.push_back(leaf.labels[j]);
+                    }
+                    continue;
+                }
                 mlann_detail::accumulate_neighbor_votes(
                     leaf.labels, leaf.votes, votes_total.data(), vote_threshold, elected
                 );
@@ -569,6 +636,31 @@ class PLS : public MLANN {
     }
 
   protected:
+    bool probability_scores() const override { return true; }
+
+    void tuning_path(const float* query, int tree, int* path) const override {
+        int node = 0;
+        path[0] = node;
+        for (int level = 0; level < depth; ++level) {
+            const auto& current = forests[tree][node];
+            if (current.leaf < 0) {
+                float score;
+                mlann_detail::compute_neighbor_one_to_many(
+                    query,
+                    projections.data(),
+                    dim,
+                    &current.projection,
+                    1,
+                    mlann_detail::OneToManyMetric::IP,
+                    &score
+                );
+                node = score <= current.threshold ? current.left : current.right;
+            }
+            // Early terminals represent the same region at all deeper depths.
+            path[level + 1] = node;
+        }
+    }
+
     struct Node {
         uint32_t projection = 0;
         float threshold = 0;
@@ -635,6 +727,58 @@ class PLS : public MLANN {
   private:
     using IndexIterator = std::vector<int>::iterator;
     int n_subsample = 300;
+    bool unscaled_votes = false;
+
+    int copy_tuning_subtree(
+        PLS& view,
+        int tree,
+        int source,
+        int level,
+        std::vector<float>& normals,
+        std::vector<uint32_t>& counts,
+        std::vector<uint32_t>& touched
+    ) const {
+        const int index = view.forests[tree].size();
+        view.forests[tree].emplace_back();
+        Node node;
+        const auto& original = forests[tree][source];
+        if (level == view.depth || original.leaf >= 0) {
+            node.leaf = view.leaves_all[tree].size();
+            view.leaves_all[tree].emplace_back();
+            auto& leaf = view.leaves_all[tree].back();
+            count_node(tree, source, counts, touched);
+            uint64_t mass = 0;
+            size_t retained = 0;
+            for (auto id : touched)
+                if (counts[id] >= uint32_t(b)) {
+                    mass += counts[id];
+                    ++retained;
+                }
+            leaf.labels.reserve(retained);
+            leaf.votes.reserve(retained);
+            const float scale = mass ? 1.f / float(mass) : 1.f;
+            for (auto id : touched) {
+                if (counts[id] >= uint32_t(b)) {
+                    leaf.labels.push_back(id);
+                    leaf.votes.push_back(float(counts[id]) * scale);
+                }
+                counts[id] = 0;
+            }
+            touched.clear();
+        } else {
+            node.threshold = original.threshold;
+            node.projection = normals.size() / dim;
+            const float* normal = projections.row(original.projection).data();
+            normals.insert(normals.end(), normal, normal + dim);
+            node.left =
+                copy_tuning_subtree(view, tree, original.left, level + 1, normals, counts, touched);
+            node.right = copy_tuning_subtree(
+                view, tree, original.right, level + 1, normals, counts, touched
+            );
+        }
+        view.forests[tree][index] = node;
+        return index;
+    }
 
     struct TreeScratch {
         std::vector<int> label_map;
@@ -737,6 +881,8 @@ class PLS : public MLANN {
         node.leaf = leaves_all[tree].size();
         leaves_all[tree].emplace_back();
         auto& output = leaves_all[tree].back();
+        if (tuning_structure_only)
+            return;
 
         scratch.touched_ids.reserve(std::min<size_t>(n_corpus, size_t(end - begin) * knn.cols()));
         for (auto it = begin; it != end; ++it) {
@@ -859,6 +1005,10 @@ class PLS : public MLANN {
     ) {
         const int index = forests[tree].size();
         forests[tree].emplace_back();
+        if (retain_membership) {
+            tuning_intervals[tree].emplace_back(-1, -1);
+            record_tuning_node(tree, index, begin, end);
+        }
         Node node;
 
         const auto finish_leaf = [&]() {

@@ -1,8 +1,173 @@
+from __future__ import annotations
+
 import numpy as np
 import mlannlib
+from dataclasses import dataclass, field, replace
+from contextlib import contextmanager
+from time import perf_counter
 
 IP = mlannlib.IP
 L2 = mlannlib.L2
+
+
+@dataclass
+class AutotuneConfiguration:
+    n_trees: int
+    depth: int
+    votes_required: float
+    tuning_recall: float
+    latency_seconds: float | None = None
+    index_bytes: int = 0
+    estimated_latency_seconds: float | None = None
+    estimated_candidates: float | None = None
+    estimated_votes: float | None = None
+    index_bytes_upper_bound: int = 0
+
+
+@dataclass
+class AutotuneResult:
+    """A completed run installs an index; target_met reports recall separately."""
+
+    status: str
+    target_recall: float
+    b: int
+    selected: AutotuneConfiguration | None = None
+    configurations: list = field(default_factory=list)
+    shortlist: list = field(default_factory=list)
+    tuning_seconds: float = 0.0
+    query_threads: int = 1
+    batch_size: int = 1
+    stage_seconds: dict = field(default_factory=dict)
+    query_counts: dict = field(default_factory=dict)
+    target_met: bool = False
+    fallback_reason: str | None = None
+
+    @property
+    def success(self):
+        return self.selected is not None
+
+    @property
+    def n_trees(self):
+        return None if self.selected is None else self.selected.n_trees
+
+    @property
+    def depth(self):
+        return None if self.selected is None else self.selected.depth
+
+    @property
+    def votes_required(self):
+        return None if self.selected is None else self.selected.votes_required
+
+    @property
+    def tuning_recall(self):
+        return None if self.selected is None else self.selected.tuning_recall
+
+    @property
+    def latency_seconds(self):
+        return None if self.selected is None else self.selected.latency_seconds
+
+    @property
+    def index_bytes(self):
+        return None if self.selected is None else self.selected.index_bytes
+
+
+def _recalls(found, truth):
+    # A missing (-1) result is a miss; the denominator is always k.
+    return np.array([np.count_nonzero(np.isin(g, f)) / len(g)
+                     for f, g in zip(found, truth)], dtype=np.float64)
+
+
+def _mean_recall(recalls, k):
+    # Recover integer hits to avoid rejecting an exact target such as 9/10
+    # merely because averaging per-query fractions rounded down by one ULP.
+    return float(np.rint(recalls * k).sum() / (len(recalls) * k))
+
+
+def _positive_integer(name, value):
+    if (not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_))
+            or value < 1):
+        raise ValueError(f"{name} must be a positive integer")
+
+
+def _autotune_split(n_rows, minimum_fit_rows, rng):
+    """Reserve up to 256 calibration rows; use all other rows for fitting."""
+    available = n_rows - minimum_fit_rows
+    if available < 1:
+        raise ValueError("training_queries needs at least one hold-out row in addition "
+                         "to the rows required by depth_min")
+    tuning_count = min(256, available, max(1, n_rows // 5)) if minimum_fit_rows else min(256, available)
+    held_out = rng.choice(n_rows, size=tuning_count, replace=False)
+    if minimum_fit_rows:
+        fit_mask = np.ones(n_rows, dtype=bool)
+        fit_mask[held_out] = False
+        fitting = np.flatnonzero(fit_mask)
+    else:
+        fitting = np.empty(0, dtype=np.intp)
+    return fitting, held_out
+
+
+@dataclass(frozen=True)
+class _AutotuneOptions:
+    k: int
+    target_recall: float
+    n_trees_max: int
+    depth_min: int
+    depth_max: int
+    density: str | float | None
+    b: int
+    top_variance_dims: int
+    n_subsample: int | None
+    unsupervised: bool
+    dist: int
+    memory_budget: int | None
+    initial_batch_size: int
+    batch_size: int
+    timing_repeats: int
+    cost_sample_size: int
+    timing_sample_size: int
+
+
+@dataclass(frozen=True)
+class _AutotuneTraining:
+    fitting: np.ndarray | None
+    labels: np.ndarray | None
+    calibration: np.ndarray
+    depth_max: int
+    query_counts: dict
+
+
+@contextmanager
+def _autotune_stage(stages, name):
+    started = perf_counter()
+    yield
+    stages[name] = perf_counter() - started
+
+
+def _estimate_autotune_costs(master, configurations, queries, sample, k, dist):
+    """Return cost-annotated configurations without modifying the input records."""
+    triples = np.asarray([(c.n_trees, c.depth, c.votes_required)
+                          for c in configurations], dtype=np.float64)
+    costs = master.index._estimate_costs(queries, triples, sample, k, dist)
+    return [
+        replace(config, estimated_votes=votes, estimated_candidates=candidates,
+                estimated_latency_seconds=seconds, index_bytes_upper_bound=bound)
+        for config, (votes, candidates, seconds, bound) in zip(configurations, costs)
+    ]
+
+
+def _measure_autotune_latency(deployed, queries, selected, options):
+    """Time only the selected index, after one warmup batch."""
+    count = min(options.timing_sample_size, len(queries))
+    batches = [queries[i:min(i + options.batch_size, count)]
+               for i in range(0, count, options.batch_size)]
+    if options.batch_size == 1:
+        batches = [q[0] for q in batches]
+    deployed.ann(batches[0], options.k, selected.votes_required, options.dist, False)
+    started = perf_counter()
+    for _ in range(options.timing_repeats):
+        for batch in batches:
+            deployed.ann(batch, options.k, selected.votes_required, options.dist, False)
+    return (perf_counter() - started) / (count * options.timing_repeats)
 
 
 class MLANNIndex(object):
@@ -34,8 +199,201 @@ class MLANNIndex(object):
             self.index = mlannlib.MLANNIndex(data, n_samples, dim, index_type)
             self.dim = dim
             self.index_type = index_type
+            self._data = data
 
         self.built = False
+
+    def autotune(
+        self, training_queries, knn=None, *,
+        k, target_recall, n_trees_max, depth_max, depth_min=1,
+        density="auto", b=1, top_variance_dims=5,
+        n_subsample=None, unsupervised=False, dist=L2, memory_budget=None,
+        initial_batch_size=16, batch_size=1, timing_repeats=1, random_state=0,
+        cost_sample_size=4096, timing_sample_size=32,
+    ):
+        """Build one maximum forest; select and materialize one configuration.
+
+        Supply representative training_queries and their corpus-neighbor labels.
+        Up to 256 rows are reserved for calibration, excluded from supervised
+        fitting. Unsupervised trees use the whole corpus and require no labels.
+        random_state controls calibration/cost sampling, not tree construction.
+
+        Selection uses exact calibration recall and a sampled query-cost model.
+        There is no verification or post-selection threshold relaxation.
+        target_met describes calibration recall, not a guarantee on unseen data.
+        Recall misses still return a usable index with measured query latency.
+
+        memory_budget bounds owned deployed storage, excluding the corpus,
+        tuning workspace and query scratch. Invalid inputs, impossible budgets
+        and resource failures raise. See README.md for sampling/timing details.
+        """
+        started = perf_counter()
+        options = _AutotuneOptions(
+            k=k, target_recall=target_recall, n_trees_max=n_trees_max,
+            depth_min=depth_min, depth_max=depth_max, density=density, b=b,
+            top_variance_dims=top_variance_dims, n_subsample=n_subsample,
+            unsupervised=unsupervised, dist=dist, memory_budget=memory_budget,
+            initial_batch_size=initial_batch_size, batch_size=batch_size,
+            timing_repeats=timing_repeats, cost_sample_size=cost_sample_size,
+            timing_sample_size=timing_sample_size,
+        )
+        stages = {}
+        with _autotune_stage(stages, "validation"):
+            queries, labels = self._validate_autotune_input(training_queries, knn, options)
+            rng = np.random.default_rng(random_state)
+            training = self._prepare_autotune_training(queries, labels, options, rng)
+            tuning, query_counts = training.calibration, training.query_counts
+            del queries, labels
+        with _autotune_stage(stages, "structure_build"):
+            master = self._build_autotune_master(training, options)
+            del training  # Native construction has copied fitting rows/labels.
+        with _autotune_stage(stages, "recall_calibration"):
+            truth, configurations, fallback_reason = self._calibrate_autotune(master, tuning, options)
+        with _autotune_stage(stages, "cost_model"):
+            selected, configurations, budget_reason, timing_queries = self._select_autotune(
+                master, tuning, truth, configurations, options, rng)
+            fallback_reason = budget_reason or fallback_reason
+        query_threads = master.index._query_threads() if batch_size > 1 else 1
+        with _autotune_stage(stages, "materialization"):
+            deployed = self._materialize_autotune(master, selected, memory_budget)
+            del master  # Release maximum-forest storage before timing queries.
+        with _autotune_stage(stages, "selected_measurement"):
+            selected.latency_seconds = _measure_autotune_latency(
+                deployed, timing_queries, selected, options)
+
+        target_met = selected.tuning_recall >= target_recall
+        result = AutotuneResult(
+            status="observed" if target_met else "recall_below_target",
+            target_recall=target_recall, b=b, selected=selected,
+            configurations=configurations, shortlist=[selected],
+            tuning_seconds=perf_counter() - started, query_threads=query_threads,
+            batch_size=batch_size, stage_seconds=stages, query_counts=query_counts,
+            target_met=target_met, fallback_reason=fallback_reason,
+        )
+        # Commit only a fully constructed and timed index to the public object.
+        self.index, self.dist, self.votes_required = deployed, dist, selected.votes_required
+        self.autotune_result = result
+        self.built = True
+        return result
+
+    def _validate_autotune_input(self, training_queries, knn, options):
+        if self.built:
+            raise RuntimeError("The index has already been built")
+        if self.index_type not in ("KD", "RP", "SparsePCA", "PCA", "RF", "PLS"):
+            raise ValueError("Autotuning supports KD, RP, SparsePCA, PCA, RF and PLS only")
+        for name in ("k", "n_trees_max", "depth_min", "depth_max", "b",
+                     "initial_batch_size", "batch_size", "timing_repeats",
+                     "cost_sample_size", "timing_sample_size"):
+            _positive_integer(name, getattr(options, name))
+        if options.k > self.n_samples or options.dist not in (IP, L2):
+            raise ValueError("Invalid k or distance measure")
+        if not np.isfinite(self._data).all():
+            raise ValueError("Corpus must be finite")
+        if not np.isfinite(options.target_recall) or not 0 < options.target_recall <= 1:
+            raise ValueError("Require 0 < target_recall <= 1")
+        if options.memory_budget is not None:
+            _positive_integer("memory_budget", options.memory_budget)
+        training_queries = self._distribution_features(training_queries, matrix=True)
+        if options.unsupervised:
+            if self.index_type in ("RF", "PLS") or knn is not None or options.b != 1:
+                raise ValueError("Unsupervised tuning requires KD/RP/PCA, no knn and b=1")
+            rows = self.n_samples
+        else:
+            knn = np.asarray(knn)
+            if (knn.ndim != 2 or knn.shape[0] != len(training_queries) or knn.shape[1] == 0
+                    or not np.issubdtype(knn.dtype, np.integer)
+                    or np.any(knn < 0) or np.any(knn >= self.n_samples)):
+                raise ValueError("knn must contain valid integer corpus IDs, one row per query")
+            for first in range(0, len(knn), 16384):
+                sorted_labels = np.sort(knn[first:first + 16384], axis=1)
+                if np.any(sorted_labels[:, 1:] == sorted_labels[:, :-1]):
+                    raise ValueError("knn rows must have distinct labels")
+            del sorted_labels
+            knn = np.ascontiguousarray(knn, dtype=np.uint32)
+            rows = len(training_queries)
+        if not options.depth_min <= options.depth_max <= min(29, int(np.floor(np.log2(rows)))):
+            raise ValueError("Require 1 <= depth_min <= depth_max <= min(29, floor(log2(training rows)))")
+        # Validate build options before allocating the master.
+        self._compute_density(options.density)
+        self._compute_n_subsample(options.n_subsample)
+        return training_queries, knn
+
+    def _prepare_autotune_training(self, queries, labels, options, rng):
+        fitting_rows, tuning_rows = _autotune_split(
+            len(queries), 0 if options.unsupervised else 1 << options.depth_min, rng)
+        calibration = np.ascontiguousarray(queries[tuning_rows])
+        if options.unsupervised:
+            return _AutotuneTraining(
+                None, None, calibration, options.depth_max,
+                dict(fitting=self.n_samples, calibration=len(calibration)))
+        return _AutotuneTraining(
+            np.ascontiguousarray(queries[fitting_rows]),
+            np.ascontiguousarray(labels[fitting_rows]), calibration,
+            min(options.depth_max, len(fitting_rows).bit_length() - 1),
+            dict(fitting=len(fitting_rows), calibration=len(calibration)))
+
+    def _build_autotune_master(self, training, options):
+        master = MLANNIndex(self._data, self.index_type)
+        master.index._enable_tuning(True)
+        master.build(
+            training.fitting, training.labels, n_trees=options.n_trees_max,
+            depth=training.depth_max, density=options.density, b=options.b,
+            top_variance_dims=options.top_variance_dims,
+            n_subsample=options.n_subsample, unsupervised=options.unsupervised)
+        return master
+
+    def _autotune_fallback(self, master, tuning, truth, trees, options):
+        threshold = float(np.finfo(np.float32).tiny) if self.index_type in ("RF", "PLS") else 1.0
+        recalls = master.index._predict_recall(
+            tuning, truth, trees, options.depth_min, threshold)
+        return AutotuneConfiguration(
+            trees, options.depth_min, threshold, _mean_recall(recalls, options.k))
+
+    def _calibrate_autotune(self, master, tuning, options):
+        truth = np.ascontiguousarray(
+            master.exact_search(tuning, options.k, options.dist), dtype=np.uint32)
+        configurations = [
+            AutotuneConfiguration(*values)
+            for values in master.index._calibrate(
+                tuning, truth, options.depth_min, options.target_recall)
+        ]
+        if configurations:
+            return truth, configurations, None
+        fallback = self._autotune_fallback(master, tuning, truth, options.n_trees_max, options)
+        return truth, [fallback], "calibration_target_unreachable"
+
+    def _select_autotune(self, master, tuning, truth, configurations, options, rng):
+        timing_queries = np.ascontiguousarray(tuning[rng.permutation(len(tuning))])
+        cost_queries = timing_queries[:options.initial_batch_size]
+        sample = np.ascontiguousarray(rng.choice(
+            self.n_samples, size=min(options.cost_sample_size, self.n_samples),
+            replace=False), dtype=np.uint32)
+        configurations = _estimate_autotune_costs(
+            master, configurations, cost_queries, sample, options.k, options.dist)
+        feasible = [c for c in configurations if options.memory_budget is None or
+                    c.index_bytes_upper_bound <= options.memory_budget]
+        if feasible:
+            selected = min(feasible, key=lambda c: (
+                c.estimated_latency_seconds, c.index_bytes_upper_bound))
+            return selected, configurations, None, timing_queries
+
+        # Keep the same samples when costing a smaller, lower-recall fallback.
+        compact = self._autotune_fallback(master, tuning, truth, 1, options)
+        compact, = _estimate_autotune_costs(
+            master, [compact], cost_queries, sample, options.k, options.dist)
+        if compact.index_bytes_upper_bound > options.memory_budget:
+            raise ValueError("memory_budget is too small for the conservative storage "
+                             "bound of a single tree at depth_min")
+        return (compact, configurations + [compact],
+                "recall_configuration_exceeds_memory_budget", timing_queries)
+
+    @staticmethod
+    def _materialize_autotune(master, selected, memory_budget):
+        deployed = master.index._make_view(selected.n_trees, selected.depth)
+        selected.index_bytes = deployed._index_bytes()
+        if memory_budget is not None and selected.index_bytes > memory_budget:
+            raise RuntimeError("Materialized index exceeded its conservative size bound")
+        return deployed
 
     def _compute_density(self, density):
         if density == "auto":
@@ -80,7 +438,7 @@ class MLANNIndex(object):
                              IVF fits all corpus rows to Lloyd convergence; train/knn
                              supply cell neighbor probabilities under dist.
         :param density: Feature density for legacy methods; PLS uses all input dimensions.
-        :param b: Minimum vote threshold for candidates to be included in the linear search phase.
+        :param b: Minimum raw label count retained in a node (fixed build-time pruning).
         :param top_variance_dims: Number of highest-variance dimensions KD chooses among
                                   at each node, capped at dim; positive integer, default 5.
                                   KD ignores density.
@@ -247,11 +605,13 @@ class MLANNIndex(object):
         if candidate_budget is not None:
             raise ValueError("candidate_budget is available for CraftML")
         if votes_required is None:
-            raise ValueError("votes_required is required")
+            votes_required = getattr(self, "votes_required", None)
+            if votes_required is None:
+                raise ValueError("votes_required is required")
         if q.dtype != np.float32:
             raise ValueError("The query matrix should have type float32")
 
-        return self.index.ann(q, k, votes_required, L2 if dist is None else dist, return_distances)
+        return self.index.ann(q, k, votes_required, getattr(self, "dist", L2) if dist is None else dist, return_distances)
 
     def _distribution_features(self, q, matrix=False):
         q = np.asarray(q)

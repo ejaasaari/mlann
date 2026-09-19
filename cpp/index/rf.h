@@ -72,12 +72,11 @@ class RF : public MLANN {
         const Eigen::Map<const UIntRowMatrix> knn(knn_.data(), knn_.rows(), knn_.cols());
         const Eigen::Map<const RowMatrix> train(train_.data(), train_.rows(), train_.cols());
 
-        split_points = Eigen::MatrixXf(n_inner_nodes, n_trees);
-        split_dimensions = Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(
-            n_inner_nodes, n_trees
-        );
+        split_points = Eigen::MatrixXf::Zero(n_inner_nodes, n_trees);
+        split_dimensions = UIntRowMatrix::Zero(n_inner_nodes, n_trees);
         labels_all = std::vector<std::vector<std::vector<uint32_t>>>(n_trees);
         votes_all = std::vector<std::vector<std::vector<float>>>(n_trees);
+        prepare_tuning(knn, false, n_train);
 
         const auto random_dims_all = generate_random_directions();
 
@@ -120,11 +119,23 @@ class RF : public MLANN {
                     n_subsample,
                     scratch
                 );
+                finish_tuning_tree(tree, indices);
             }
         }
         mlann_detail::promote_existing_corpus_pages(
             corpus.data(), size_t(corpus.size()) * sizeof(float)
         );
+    }
+
+    std::unique_ptr<MLANN> make_view(int trees, int d) const override {
+        auto view = std::make_unique<RF>(corpus.data(), n_corpus, dim, n_subsample);
+        initialize_view(*view, trees, d);
+        view->unscaled_votes = true;
+        return view;
+    }
+
+    size_t index_bytes() const override {
+        return MLANN::index_bytes() + sizeof(RF) - sizeof(MLANN);
     }
 
     void query(
@@ -141,6 +152,8 @@ class RF : public MLANN {
         votes_total.resize(n_corpus);
         std::fill_n(votes_total.data(), n_corpus, 0.f);
         elected.clear();
+        const auto& query_labels = labels_all;
+        const auto& query_votes = votes_all;
 
         std::array<int, routing_batch_size> leaves;
         for (int first = 0; first < n_trees; first += routing_batch_size) {
@@ -148,6 +161,21 @@ class RF : public MLANN {
             route_batch(data, first, count, leaves.data());
             for (int t = 0; t < count; ++t) {
                 const int leaf = leaves[t];
+                if (unscaled_votes) {
+                    // Same float sums and final divisor as calibration. Threshold
+                    // crossings track election without destroying cumulative scores.
+                    const auto& labels = query_labels[first + t][leaf];
+                    const auto& weights = query_votes[first + t][leaf];
+                    for (size_t j = 0; j < labels.size(); ++j) {
+                        float& total = votes_total[labels[j]];
+                        const float previous = total;
+                        total += weights[j];
+                        if (total / float(n_trees) >= vote_threshold &&
+                            (previous / float(n_trees) < vote_threshold || previous == 0))
+                            elected.push_back(labels[j]);
+                    }
+                    continue;
+                }
                 mlann_detail::accumulate_neighbor_votes(
                     labels_all[first + t][leaf],
                     votes_all[first + t][leaf],
@@ -172,7 +200,24 @@ class RF : public MLANN {
         );
     }
 
+  protected:
+    bool probability_scores() const override { return true; }
+    void tuning_path(const float* q, int tree, int* path) const override {
+        path[0] = 0;
+        bool terminal = false;
+        for (int level = 0; level < depth; ++level) {
+            const int node = path[level];
+            terminal = terminal || split_dimensions(node, tree) == UINT32_MAX;
+            path[level + 1] =
+                terminal
+                    ? node
+                    : 2 * node +
+                          (q[split_dimensions(node, tree)] <= split_points(node, tree) ? 1 : 2);
+        }
+    }
+
   private:
+    bool unscaled_votes = false;
     using IndexIterator = std::vector<int>::iterator;
     static constexpr int routing_batch_size = 64;
     std::vector<float> log2_tbl;
@@ -462,12 +507,17 @@ class RF : public MLANN {
         TreeScratch& scratch
     ) {
         if (tree_level == depth) {
+            record_tuning_node(tree, i, begin, end);
+            if (tuning_structure_only)
+                return;
             const int index_leaf = i - n_inner_nodes;
             auto ret = count_votes(begin, end, knn, scratch);
             labels_tree[index_leaf] = std::move(ret.first);
             votes_tree[index_leaf] = std::move(ret.second);
             return;
         }
+
+        record_tuning_node(tree, i, begin, end);
 
         const auto s = split(
             begin, end, random_dims[tree_level], train, knn, tol, n_corpus, n_subsample, scratch
@@ -477,6 +527,8 @@ class RF : public MLANN {
 
         if (max_dim == -1) {
             split_dimensions(i, tree) = UINT32_MAX;
+            if (tuning_structure_only)
+                return;
             const int levels2leaf = depth - tree_level;
             const int index_leaf = (1 << levels2leaf) * (i + 1) - 1 - n_inner_nodes;
             auto ret = count_votes(begin, end, knn, scratch);

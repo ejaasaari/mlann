@@ -212,6 +212,7 @@ class SparsePCA : public MLANN {
         if (!full_dimensions)
             projection_dims.resize(node_count, support);
         labels_all.resize(n_trees);
+        prepare_tuning(knn, unsupervised, n_train);
         // This bound includes duplicate IDs within a training row. Larger raw
         // counts retain float storage, avoiding truncation at the uint16 limit.
         const uint64_t max_leaf_rows = (uint64_t(n_train) + n_leaves - 1) / n_leaves;
@@ -251,6 +252,7 @@ class SparsePCA : public MLANN {
                         generator,
                         scratch
                     );
+                    finish_tuning_tree(tree, scratch.rows);
                 } catch (...) {
 #pragma omp critical(pca_build_error)
                     {
@@ -276,6 +278,34 @@ class SparsePCA : public MLANN {
     }
 
   public:
+    std::unique_ptr<MLANN> make_view(int trees, int d) const override {
+        auto view = std::unique_ptr<SparsePCA>(
+            new SparsePCA(corpus.data(), n_corpus, dim, full_dimensions)
+        );
+        initialize_view(*view, trees, d);
+        view->corpus_leaves = tuning_unit_labels;
+        view->compact_leaf_votes = view->compact_view_votes(tuning_unit_labels, view->votes16_all);
+        view->support = support;
+        view->n_subsample = n_subsample;
+        view->projections.resize(Eigen::Index(trees) * view->n_inner_nodes, support);
+        if (!full_dimensions)
+            view->projection_dims.resize(view->projections.rows(), support);
+        for (int t = 0; t < trees; ++t) {
+            view->projections.middleRows(view->projection_row(t, 0), view->n_inner_nodes) =
+                projections.middleRows(projection_row(t, 0), view->n_inner_nodes);
+            if (!full_dimensions)
+                view->projection_dims.middleRows(view->projection_row(t, 0), view->n_inner_nodes) =
+                    projection_dims.middleRows(projection_row(t, 0), view->n_inner_nodes);
+        }
+        return view;
+    }
+
+    size_t index_bytes() const override {
+        return MLANN::index_bytes() + sizeof(SparsePCA) - sizeof(MLANN) +
+               payload_bytes(votes16_all) + size_t(projections.size()) * sizeof(float) +
+               size_t(projection_dims.size()) * sizeof(uint32_t);
+    }
+
     void query(
         const float* data,
         int k,
@@ -335,6 +365,14 @@ class SparsePCA : public MLANN {
     }
 
   protected:
+    void tuning_path(const float* q, int tree, int* path) const override {
+        path[0] = 0;
+        for (int level = 0; level < depth; ++level) {
+            const int node = path[level];
+            const float score = project(q, projection_row(tree, node));
+            path[level + 1] = 2 * node + (score <= split_points(node, tree) ? 1 : 2);
+        }
+    }
     int n_subsample = 300;
     bool compact_leaf_votes = false;
     std::vector<std::vector<std::vector<uint16_t>>> votes16_all;
@@ -497,6 +535,8 @@ class SparsePCA : public MLANN {
         const Eigen::Ref<const UIntRowMatrix>& knn,
         TreeScratch& scratch
     ) {
+        if (tuning_structure_only)
+            return;
         if (corpus_leaves) {
             labels_all[tree][leaf].assign(begin, end);
             return;
@@ -542,9 +582,11 @@ class SparsePCA : public MLANN {
         TreeScratch& scratch
     ) {
         if (level == depth) {
+            record_tuning_node(tree, node, begin, end);
             make_leaf(begin, end, tree, node - n_inner_nodes, knn, scratch);
             return;
         }
+        record_tuning_node(tree, node, begin, end);
         const int count = end - begin;
         const auto mid = end - count / 2;
         fit_projection(begin, end, projection_row(tree, node), train, generator, scratch);

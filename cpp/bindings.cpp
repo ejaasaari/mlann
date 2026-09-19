@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <type_traits>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "Python.h"
 #include "index/craftml.h"
@@ -601,7 +604,256 @@ static PyObject* ann_distribution(mlannIndex* self, PyObject* args) {
     return nearest;
 }
 
+static PyObject* enable_tuning(mlannIndex* self, PyObject* args) {
+    int structure_only = 0;
+    if (!PyArg_ParseTuple(args, "|p", &structure_only))
+        return nullptr;
+    if (!(dynamic_cast<KD*>(self->index) || dynamic_cast<RP*>(self->index) ||
+          dynamic_cast<SparsePCA*>(self->index) || dynamic_cast<RF*>(self->index) ||
+          dynamic_cast<PLS*>(self->index))) {
+        PyErr_SetString(
+            PyExc_ValueError, "Autotuning supports KD, RP, SparsePCA, PCA, RF and PLS only"
+        );
+        return nullptr;
+    }
+    try {
+        self->index->enable_tuning(structure_only);
+    } catch (const std::exception& e) {
+        PyErr_SetString(PyExc_ValueError, e.what());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* tuning_view_impl(mlannIndex* self, PyObject* args, bool timing) {
+    int trees, depth;
+    if (!PyArg_ParseTuple(args, "ii", &trees, &depth))
+        return nullptr;
+    std::unique_ptr<MLANN> view;
+    PyThreadState* state = PyEval_SaveThread();
+    try {
+        view = timing ? self->index->make_timing_view(trees, depth)
+                      : self->index->make_view(trees, depth);
+    } catch (const std::exception& e) {
+        PyEval_RestoreThread(state);
+        PyErr_SetString(PyExc_ValueError, e.what());
+        return nullptr;
+    }
+    PyEval_RestoreThread(state);
+    auto* result = reinterpret_cast<mlannIndex*>(Py_TYPE(self)->tp_alloc(Py_TYPE(self), 0));
+    if (!result)
+        return nullptr;
+    result->index = view.release();
+    result->py_data = self->py_data;
+    Py_INCREF(result->py_data);
+    result->n = self->n;
+    result->dim = self->dim;
+    result->data = nullptr;
+    return reinterpret_cast<PyObject*>(result);
+}
+
+static PyObject* tuning_view(mlannIndex* self, PyObject* args) {
+    return tuning_view_impl(self, args, false);
+}
+
+static PyObject* timing_view(mlannIndex* self, PyObject* args) {
+    return tuning_view_impl(self, args, true);
+}
+
+static PyObject* calibrate(mlannIndex* self, PyObject* args) {
+    PyArrayObject *queries, *truth;
+    int min_depth;
+    double target;
+    if (!PyArg_ParseTuple(
+            args, "O!O!id", &PyArray_Type, &queries, &PyArray_Type, &truth, &min_depth, &target
+        ))
+        return nullptr;
+    if (!craft_array(queries, NPY_FLOAT32, 2, self->dim) || !craft_array(truth, NPY_UINT32, 2))
+        return nullptr;
+    std::vector<MLANN::Calibration> configurations;
+    PyThreadState* state = PyEval_SaveThread();
+    try {
+        configurations = self->index->calibrate(
+            Eigen::Map<const RowMatrix>(
+                static_cast<float*>(PyArray_DATA(queries)), PyArray_DIM(queries, 0), self->dim
+            ),
+            Eigen::Map<const UIntRowMatrix>(
+                static_cast<uint32_t*>(PyArray_DATA(truth)),
+                PyArray_DIM(truth, 0),
+                PyArray_DIM(truth, 1)
+            ),
+            min_depth,
+            target
+        );
+    } catch (const std::exception& e) {
+        PyEval_RestoreThread(state);
+        PyErr_SetString(PyExc_ValueError, e.what());
+        return nullptr;
+    }
+    PyEval_RestoreThread(state);
+    PyObject* result = PyList_New(configurations.size());
+    if (!result)
+        return nullptr;
+    for (size_t i = 0; i < configurations.size(); ++i) {
+        const auto& c = configurations[i];
+        PyObject* item = Py_BuildValue("iifd", c.trees, c.depth, c.threshold, c.recall);
+        if (!item) {
+            Py_DECREF(result);
+            return nullptr;
+        }
+        PyList_SET_ITEM(result, i, item);
+    }
+    return result;
+}
+
+static PyObject* index_bytes(mlannIndex* self, PyObject*) {
+    return PyLong_FromSize_t(self->index->index_bytes());
+}
+
+static PyObject* estimate_costs(mlannIndex* self, PyObject* args) {
+    PyArrayObject *queries, *configurations, *sample;
+    int k, dist;
+    if (!PyArg_ParseTuple(
+            args,
+            "O!O!O!ii",
+            &PyArray_Type,
+            &queries,
+            &PyArray_Type,
+            &configurations,
+            &PyArray_Type,
+            &sample,
+            &k,
+            &dist
+        ))
+        return nullptr;
+    if (!craft_array(queries, NPY_FLOAT32, 2, self->dim) ||
+        !craft_array(configurations, NPY_DOUBLE, 2, 3) || !craft_array(sample, NPY_UINT32, 1))
+        return nullptr;
+    std::vector<MLANN::Calibration> configs;
+    const auto* data = static_cast<double*>(PyArray_DATA(configurations));
+    for (npy_intp i = 0; i < PyArray_DIM(configurations, 0); ++i) {
+        if (!std::isfinite(data[3 * i]) || !std::isfinite(data[3 * i + 1]) || data[3 * i] < 1 ||
+            data[3 * i] > INT_MAX || data[3 * i + 1] < 1 || data[3 * i + 1] > 29) {
+            PyErr_SetString(PyExc_ValueError, "Invalid cost configuration");
+            return nullptr;
+        }
+        configs.push_back({int(data[3 * i]), int(data[3 * i + 1]), float(data[3 * i + 2]), 0.});
+    }
+    const auto* ids = static_cast<uint32_t*>(PyArray_DATA(sample));
+    std::vector<uint32_t> samples(ids, ids + PyArray_SIZE(sample));
+    std::vector<MLANN::CostEstimate> costs;
+    PyThreadState* state = PyEval_SaveThread();
+    try {
+        costs = self->index->estimate_costs(
+            Eigen::Map<const RowMatrix>(
+                static_cast<float*>(PyArray_DATA(queries)), PyArray_DIM(queries, 0), self->dim
+            ),
+            configs,
+            samples,
+            k,
+            static_cast<Distance>(dist)
+        );
+    } catch (const std::exception& e) {
+        PyEval_RestoreThread(state);
+        PyErr_SetString(PyExc_ValueError, e.what());
+        return nullptr;
+    }
+    PyEval_RestoreThread(state);
+    PyObject* result = PyList_New(costs.size());
+    if (!result)
+        return nullptr;
+    for (size_t i = 0; i < costs.size(); ++i) {
+        const auto& c = costs[i];
+        PyObject* item = Py_BuildValue(
+            "dddK",
+            c.votes,
+            c.candidates,
+            c.seconds,
+            static_cast<unsigned long long>(c.bytes_upper_bound)
+        );
+        if (!item) {
+            Py_DECREF(result);
+            return nullptr;
+        }
+        PyList_SET_ITEM(result, i, item);
+    }
+    return result;
+}
+
+static PyObject* predict_recall(mlannIndex* self, PyObject* args) {
+    PyArrayObject *queries, *truth;
+    int trees, depth;
+    float threshold;
+    if (!PyArg_ParseTuple(
+            args,
+            "O!O!iif",
+            &PyArray_Type,
+            &queries,
+            &PyArray_Type,
+            &truth,
+            &trees,
+            &depth,
+            &threshold
+        ))
+        return nullptr;
+    if (!craft_array(queries, NPY_FLOAT32, 2, self->dim) || !craft_array(truth, NPY_UINT32, 2))
+        return nullptr;
+    std::vector<double> recalls;
+    PyThreadState* state = PyEval_SaveThread();
+    try {
+        recalls = self->index->predict_recall(
+            Eigen::Map<const RowMatrix>(
+                static_cast<float*>(PyArray_DATA(queries)), PyArray_DIM(queries, 0), self->dim
+            ),
+            Eigen::Map<const UIntRowMatrix>(
+                static_cast<uint32_t*>(PyArray_DATA(truth)),
+                PyArray_DIM(truth, 0),
+                PyArray_DIM(truth, 1)
+            ),
+            trees,
+            depth,
+            threshold
+        );
+    } catch (const std::exception& e) {
+        PyEval_RestoreThread(state);
+        PyErr_SetString(PyExc_ValueError, e.what());
+        return nullptr;
+    }
+    PyEval_RestoreThread(state);
+    npy_intp size = recalls.size();
+    PyObject* result = PyArray_SimpleNew(1, &size, NPY_DOUBLE);
+    if (result)
+        std::copy(
+            recalls.begin(),
+            recalls.end(),
+            static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(result)))
+        );
+    return result;
+}
+
+static PyObject* query_threads(mlannIndex*, PyObject*) {
+#ifdef _OPENMP
+    return PyLong_FromLong(omp_get_max_threads());
+#else
+    return PyLong_FromLong(1);
+#endif
+}
+
 static PyMethodDef MLANNMethods[] = {
+    {"_enable_tuning", (PyCFunction) enable_tuning, METH_VARARGS, "Retain builder memberships"},
+    {"_estimate_costs",
+     (PyCFunction) estimate_costs,
+     METH_VARARGS,
+     "Sample query work without materializing forests"},
+    {"_make_timing_view", (PyCFunction) timing_view, METH_VARARGS, "Create a native timing view"},
+    {"_make_view",
+     (PyCFunction) tuning_view,
+     METH_VARARGS,
+     "Materialize a fixed forest prefix/depth"},
+    {"_calibrate", (PyCFunction) calibrate, METH_VARARGS, "Calibrate positive thresholds"},
+    {"_predict_recall", (PyCFunction) predict_recall, METH_VARARGS, "Per-query candidate recall"},
+    {"_index_bytes", (PyCFunction) index_bytes, METH_NOARGS, "Owned deployed index storage"},
+    {"_query_threads", (PyCFunction) query_threads, METH_NOARGS, "OpenMP query thread limit"},
     {"build_ivf", (PyCFunction) build_ivf, METH_VARARGS, "Build random-subspace ensemble IVF"},
     {"build_craftml", (PyCFunction) build_craftml, METH_VARARGS, "Build a CraftML forest"},
     {"ann_craftml",
