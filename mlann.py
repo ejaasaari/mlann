@@ -109,7 +109,7 @@ def _autotune_split(n_rows, minimum_fit_rows, rng):
 @dataclass(frozen=True)
 class _AutotuneOptions:
     k: int
-    target_recall: float
+    target_recall: float | None
     n_trees_max: int
     depth_min: int
     depth_max: int
@@ -170,6 +170,88 @@ def _measure_autotune_latency(deployed, queries, selected, options):
     return (perf_counter() - started) / (count * options.timing_repeats)
 
 
+class AutotuneProfile:
+    """Reusable maximum forest and empirical recall/cost frontier.
+
+    subset() creates an independent index without tree fitting, exact search,
+    calibration or cost estimation. close() frees the retained maximum forest;
+    previously created subsets remain usable. Memory budgets apply to each
+    deployed subset, not to this profile or to all simultaneously live subsets.
+    """
+
+    def __init__(self, master, configurations, timing_queries, options, query_counts, stages):
+        self._master = master
+        self._configurations = tuple(replace(c) for c in configurations)
+        self._timing_queries = timing_queries[:options.timing_sample_size].copy()
+        self._options = options
+        self.query_counts = dict(query_counts)
+        self.stage_seconds = dict(stages)
+        self.tuning_seconds = 0.0
+
+    def optimal_parameters(self):
+        """Return independent records, ordered by increasing calibration recall."""
+        return [replace(c) for c in self._configurations]
+
+    @property
+    def closed(self):
+        return self._master is None
+
+    def close(self):
+        self._master = None
+
+    def __enter__(self):
+        if self.closed:
+            raise RuntimeError("The autotuning profile is closed")
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def subset(self, target_recall, *, measure_latency=False):
+        """Select the fastest modeled configuration reaching target_recall.
+
+        If unreachable, return the highest-recall configuration. The target is
+        assessed on calibration queries only. Optional latency measurement never
+        changes the configuration or threshold; by default no queries are run.
+        """
+        if self.closed:
+            raise RuntimeError("The autotuning profile is closed")
+        if not np.isfinite(target_recall) or not 0 < target_recall <= 1:
+            raise ValueError("Require 0 < target_recall <= 1")
+        started = perf_counter()
+        feasible = [c for c in self._configurations if c.tuning_recall >= target_recall]
+        chosen = min(feasible, key=lambda c: (c.estimated_latency_seconds, c.index_bytes_upper_bound)) \
+            if feasible else self._configurations[-1]
+        selected = replace(chosen)
+        options = self._options
+        stages = {}
+        with _autotune_stage(stages, "materialization"):
+            deployed = MLANNIndex._materialize_autotune(self._master, selected, options.memory_budget)
+        if measure_latency:
+            with _autotune_stage(stages, "selected_measurement"):
+                selected.latency_seconds = _measure_autotune_latency(
+                    deployed, self._timing_queries, selected, options)
+        target_met = selected.tuning_recall >= target_recall
+        result = AutotuneResult(
+            status="observed" if target_met else "recall_below_target",
+            target_recall=target_recall, b=options.b, selected=selected,
+            configurations=[selected], shortlist=[selected],
+            tuning_seconds=perf_counter() - started,
+            query_threads=deployed._query_threads() if options.batch_size > 1 else 1,
+            batch_size=options.batch_size, stage_seconds=stages,
+            query_counts=dict(self.query_counts), target_met=target_met,
+            fallback_reason=None if target_met else "frontier_target_unreachable",
+        )
+        # The native view owns its payloads/projections and retains the corpus.
+        index = MLANNIndex(None)
+        index._data = self._master._data
+        index.index_type = self._master.index_type
+        index.n_samples, index.dim = self._master.n_samples, self._master.dim
+        index.index, index.dist, index.votes_required = deployed, options.dist, selected.votes_required
+        index.autotune_result, index.built = result, True
+        return index
+
+
 class MLANNIndex(object):
     """
     An MLANN index object
@@ -205,7 +287,7 @@ class MLANNIndex(object):
 
     def autotune(
         self, training_queries, knn=None, *,
-        k, target_recall, n_trees_max, depth_max, depth_min=1,
+        k, target_recall=None, n_trees_max, depth_max, depth_min=1,
         density="auto", b=1, top_variance_dims=5,
         n_subsample=None, unsupervised=False, dist=L2, memory_budget=None,
         initial_batch_size=16, batch_size=1, timing_repeats=1, random_state=0,
@@ -217,6 +299,11 @@ class MLANNIndex(object):
         Up to 256 rows are reserved for calibration, excluded from supervised
         fitting. Unsupervised trees use the whole corpus and require no labels.
         random_state controls calibration/cost sampling, not tree construction.
+
+        target_recall=None returns an AutotuneProfile retaining the maximum
+        forest and full empirical recall/cost frontier. Call profile.subset(r)
+        (or self.subset(r)) repeatedly without rebuilding or recalibrating.
+        The profile itself is not a queryable index; close it to release memory.
 
         Selection uses exact calibration recall and a sampled query-cost model.
         There is no verification or post-selection threshold relaxation.
@@ -247,6 +334,11 @@ class MLANNIndex(object):
         with _autotune_stage(stages, "structure_build"):
             master = self._build_autotune_master(training, options)
             del training  # Native construction has copied fitting rows/labels.
+        if target_recall is None:
+            profile = self._create_autotune_profile(master, tuning, options, rng, query_counts, stages)
+            profile.tuning_seconds = perf_counter() - started
+            self._autotune_profile = profile
+            return profile
         with _autotune_stage(stages, "recall_calibration"):
             truth, configurations, fallback_reason = self._calibrate_autotune(master, tuning, options)
         with _autotune_stage(stages, "cost_model"):
@@ -276,8 +368,35 @@ class MLANNIndex(object):
         self.built = True
         return result
 
+    def subset(self, target_recall, *, measure_latency=False):
+        """Create an index from an autotune(target_recall=None) profile."""
+        profile = getattr(self, "_autotune_profile", None)
+        if profile is None:
+            raise RuntimeError("Call autotune with target_recall=None before subsetting")
+        return profile.subset(target_recall, measure_latency=measure_latency)
+
+    def _create_autotune_profile(self, master, tuning, options, rng, query_counts, stages):
+        queries = np.ascontiguousarray(tuning[rng.permutation(len(tuning))])
+        sample = np.ascontiguousarray(rng.choice(
+            self.n_samples, size=min(options.cost_sample_size, self.n_samples),
+            replace=False), dtype=np.uint32)
+        with _autotune_stage(stages, "exact_ground_truth"):
+            truth = np.ascontiguousarray(master.exact_search(queries, options.k, options.dist), dtype=np.uint32)
+        with _autotune_stage(stages, "recall_cost_frontier"):
+            entries = master.index._calibrate_frontier(
+                queries, truth, options.depth_min, sample,
+                min(options.initial_batch_size, len(queries)), options.dist,
+                options.memory_budget or 0)
+        if not entries:
+            raise ValueError("memory_budget is too small for any conservative index storage bound")
+        configurations = [AutotuneConfiguration(
+            t, d, v, r, estimated_votes=votes, estimated_candidates=candidates,
+            estimated_latency_seconds=seconds, index_bytes_upper_bound=bound)
+            for t, d, v, r, votes, candidates, seconds, bound in entries]
+        return AutotuneProfile(master, configurations, queries, options, query_counts, stages)
+
     def _validate_autotune_input(self, training_queries, knn, options):
-        if self.built:
+        if self.built or getattr(self, "_autotune_profile", None) is not None:
             raise RuntimeError("The index has already been built")
         if self.index_type not in ("KD", "RP", "SparsePCA", "PCA", "RF", "PLS"):
             raise ValueError("Autotuning supports KD, RP, SparsePCA, PCA, RF and PLS only")
@@ -289,7 +408,8 @@ class MLANNIndex(object):
             raise ValueError("Invalid k or distance measure")
         if not np.isfinite(self._data).all():
             raise ValueError("Corpus must be finite")
-        if not np.isfinite(options.target_recall) or not 0 < options.target_recall <= 1:
+        if options.target_recall is not None and (
+                not np.isfinite(options.target_recall) or not 0 < options.target_recall <= 1):
             raise ValueError("Require 0 < target_recall <= 1")
         if options.memory_budget is not None:
             _positive_integer("memory_budget", options.memory_budget)
@@ -448,7 +568,7 @@ class MLANNIndex(object):
                             Partitioning and leaf votes use all rows. Other indexes reject it.
         :return:
         """
-        if self.built:
+        if self.built or getattr(self, "_autotune_profile", None) is not None:
             raise RuntimeError("The index has already been built")
 
         n_subsample = self._compute_n_subsample(n_subsample)

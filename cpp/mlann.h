@@ -198,6 +198,87 @@ class MLANN {
         size_t bytes_upper_bound = 0;
     };
 
+    struct FrontierConfiguration {
+        Calibration configuration{0, 0, 0, 0};
+        CostEstimate cost;
+    };
+
+    // Evaluate every empirical recall breakpoint, retaining at most m*k+1
+    // records regardless of the number of trees, depths or vote thresholds.
+    std::vector<FrontierConfiguration> calibrate_frontier(
+        const Eigen::Ref<const RowMatrix>& queries,
+        const Eigen::Ref<const UIntRowMatrix>& truth,
+        int min_depth,
+        const std::vector<uint32_t>& sample,
+        int cost_queries,
+        Distance dist,
+        size_t memory_budget = 0
+    ) const {
+        check_view(n_trees, min_depth);
+        if (queries.rows() == 0 || queries.cols() != dim || !queries.allFinite() ||
+            truth.rows() != queries.rows() || truth.cols() == 0 || truth.cols() > n_corpus ||
+            truth.maxCoeff() >= uint32_t(n_corpus) || sample.empty() || cost_queries < 1 ||
+            cost_queries > queries.rows() || (dist != L2 && dist != IP))
+            throw std::invalid_argument("Invalid frontier calibration data");
+        for (auto id : sample)
+            if (id >= uint32_t(n_corpus))
+                throw std::invalid_argument("Invalid sampled corpus ID");
+
+        std::vector<size_t> offsets(queries.rows() + 1, 0);
+        for (int q = 0; q < queries.rows(); ++q)
+            offsets[q + 1] = offsets[q] + truth.cols() + (q < cost_queries ? sample.size() : 0);
+        UIntRowMatrix ids(1, offsets.back());
+        for (int q = 0; q < queries.rows(); ++q) {
+            std::copy_n(truth.row(q).data(), truth.cols(), ids.data() + offsets[q]);
+            if (q < cost_queries)
+                std::copy(sample.begin(), sample.end(), ids.data() + offsets[q] + truth.cols());
+        }
+        const auto kernels =
+            benchmark_query_kernels(queries.topRows(cost_queries), truth.cols(), dist);
+        const size_t method_bytes = index_bytes() - MLANN::index_bytes();
+        std::vector<FrontierConfiguration> best(truth.size() + 1);
+        std::vector<float> scores(size_t(depth - min_depth + 1) * ids.size(), 0.f);
+        std::vector<double> votes(depth - min_depth + 1, 0.);
+        std::vector<float> neighbor_scores(truth.size()),
+            candidate_scores(cost_queries * sample.size());
+        stream_requested_scores(
+            queries, ids, offsets, min_depth, [&](int tree, const float* weights) {
+                const float divisor = probability_scores() ? float(tree + 1) : 1.f;
+                for (int d = min_depth; d <= depth; ++d) {
+                    const size_t base = size_t(d - min_depth) * ids.size();
+                    for (size_t j = 0; j < size_t(ids.size()); ++j)
+                        scores[base + j] += weights[base + j];
+                    for (int q = 0; q < queries.rows(); ++q) {
+                        for (int j = 0; j < truth.cols(); ++j)
+                            neighbor_scores[size_t(q) * truth.cols() + j] =
+                                scores[base + offsets[q] + j] / divisor;
+                        if (q < cost_queries)
+                            for (size_t j = 0; j < sample.size(); ++j) {
+                                const size_t pos = base + offsets[q] + truth.cols() + j;
+                                candidate_scores[size_t(q) * sample.size() + j] =
+                                    scores[pos] / divisor;
+                                votes[d - min_depth] += weights[pos] > 0;
+                            }
+                    }
+                    const size_t bound = tuning_storage_bound({tree + 1, d, 0, 0}, method_bytes);
+                    if (memory_budget && bound > memory_budget)
+                        continue;
+                    update_recall_frontier(
+                        best,
+                        neighbor_scores,
+                        candidate_scores,
+                        tree + 1,
+                        d,
+                        votes[d - min_depth],
+                        bound,
+                        kernels
+                    );
+                }
+            }
+        );
+        return compact_recall_frontier(best);
+    }
+
     // Uniform corpus-label sampling estimates work, not calibration recall.
     std::vector<CostEstimate> estimate_costs(
         const Eigen::Ref<const RowMatrix>& queries,
@@ -355,6 +436,61 @@ class MLANN {
     struct QueryKernelCosts {
         double route, vote, distance;
     };
+
+    static bool lower_cost(const CostEstimate& a, const CostEstimate& b) {
+        return a.seconds < b.seconds ||
+               (a.seconds == b.seconds && a.bytes_upper_bound < b.bytes_upper_bound);
+    }
+
+    void update_recall_frontier(
+        std::vector<FrontierConfiguration>& best,
+        std::vector<float>& neighbors,
+        std::vector<float>& candidates,
+        int trees,
+        int d,
+        double votes,
+        size_t bound,
+        const QueryKernelCosts& kernels
+    ) const {
+        std::sort(neighbors.begin(), neighbors.end(), std::greater<float>());
+        std::sort(candidates.begin(), candidates.end(), std::greater<float>());
+        const double scale = double(n_corpus) / candidates.size();
+        CostEstimate cost;
+        cost.votes = votes * scale;
+        cost.bytes_upper_bound = bound;
+        const double fixed_cost = trees * d * kernels.route + cost.votes * kernels.vote;
+        size_t hits = 0, elected = 0;
+        // Zero-support forests still contribute a usable best-effort entry.
+        do {
+            const float threshold =
+                hits < neighbors.size() && neighbors[hits] > 0
+                    ? neighbors[hits]
+                    : (probability_scores() ? std::numeric_limits<float>::min() : 1.f);
+            while (hits < neighbors.size() && neighbors[hits] >= threshold)
+                ++hits;
+            while (elected < candidates.size() && candidates[elected] >= threshold)
+                ++elected;
+            cost.candidates = elected * scale;
+            cost.seconds = fixed_cost + cost.candidates * kernels.distance;
+            auto& current = best[hits];
+            if (!current.configuration.trees || lower_cost(cost, current.cost))
+                current = {{trees, d, threshold, double(hits) / neighbors.size()}, cost};
+            if (hits == neighbors.size() || neighbors[hits] <= 0)
+                break;
+        } while (true);
+    }
+
+    static std::vector<FrontierConfiguration> compact_recall_frontier(
+        const std::vector<FrontierConfiguration>& best
+    ) {
+        std::vector<FrontierConfiguration> frontier;
+        for (auto it = best.rbegin(); it != best.rend(); ++it)
+            if (it->configuration.trees &&
+                (frontier.empty() || lower_cost(it->cost, frontier.back().cost)))
+                frontier.push_back(*it);
+        std::reverse(frontier.begin(), frontier.end());
+        return frontier;
+    }
 
     static double elapsed_seconds(std::chrono::steady_clock::time_point started) {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -581,6 +717,7 @@ class MLANN {
     void score_tuning_tree(
         const Eigen::Ref<const RowMatrix>& queries,
         const Eigen::Ref<const UIntRowMatrix>& ids,
+        const std::vector<size_t>& offsets,
         const TuningPostings& postings,
         int tree,
         int min_depth,
@@ -596,8 +733,7 @@ class MLANN {
                 const auto interval = tuning_intervals[tree][path[d]];
                 const float scale = tuning_node_scale(tree, path[d], mass_cache);
                 const size_t depth_offset = size_t(d - min_depth) * ids.size();
-                for (int j = 0; j < ids.cols(); ++j) {
-                    const size_t offset = size_t(q) * ids.cols() + j;
+                for (size_t offset = offsets[q]; offset < offsets[q + 1]; ++offset) {
                     const auto& list = positions[postings.keys[offset]];
                     const auto lo = std::lower_bound(list.begin(), list.end(), interval.first);
                     const auto hi = std::lower_bound(lo, list.end(), interval.second);
@@ -634,6 +770,24 @@ class MLANN {
         int last_tree = -1,
         int last_depth = -1
     ) const {
+        std::vector<size_t> offsets(queries.rows() + 1);
+        for (size_t q = 0; q < offsets.size(); ++q)
+            offsets[q] = q * ids.cols();
+        stream_requested_scores(queries, ids, offsets, min_depth, consume, last_tree, last_depth);
+    }
+
+    // Ragged requests let calibration neighbors and sampled candidates share
+    // one traversal without padding every query to the corpus-sample width.
+    template <class Consumer>
+    void stream_requested_scores(
+        const Eigen::Ref<const RowMatrix>& queries,
+        const Eigen::Ref<const UIntRowMatrix>& ids,
+        const std::vector<size_t>& offsets,
+        int min_depth,
+        Consumer consume,
+        int last_tree = -1,
+        int last_depth = -1
+    ) const {
         const int tree_count = last_tree < 0 ? n_trees : last_tree;
         const int max_depth = last_depth < 0 ? depth : last_depth;
         const auto postings = make_tuning_postings(ids);
@@ -649,6 +803,7 @@ class MLANN {
                     score_tuning_tree(
                         queries,
                         ids,
+                        offsets,
                         postings,
                         first + slot,
                         min_depth,
@@ -708,7 +863,7 @@ class MLANN {
         std::exception_ptr error;
 #pragma omp parallel
         {
-            std::vector<uint32_t> counts(n_corpus, 0), touched;
+            std::vector<uint32_t> counts(tuning_unit_labels ? 0 : n_corpus, 0), touched;
 #pragma omp for schedule(dynamic, 1)
             for (int t = 0; t < trees; ++t) {
                 try {
@@ -720,6 +875,14 @@ class MLANN {
                         if (level == d || terminal) {
                             const int leaf =
                                 (1 << (d - level)) * (node + 1) - 1 - view.n_inner_nodes;
+                            if (tuning_unit_labels) {
+                                const auto interval = tuning_intervals[t][node];
+                                const auto& rows = tuning_permutations[t];
+                                view.labels_all[t][leaf].assign(
+                                    rows.begin() + interval.first, rows.begin() + interval.second
+                                );
+                                return;
+                            }
                             count_node(t, node, counts, touched);
                             uint64_t mass = 0;
                             size_t retained = 0;

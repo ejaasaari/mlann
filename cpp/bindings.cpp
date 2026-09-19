@@ -706,6 +706,81 @@ static PyObject* calibrate(mlannIndex* self, PyObject* args) {
     return result;
 }
 
+static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
+    PyArrayObject *queries, *truth, *sample;
+    int min_depth, cost_queries, dist;
+    unsigned long long budget;
+    if (!PyArg_ParseTuple(
+            args,
+            "O!O!iO!iiK",
+            &PyArray_Type,
+            &queries,
+            &PyArray_Type,
+            &truth,
+            &min_depth,
+            &PyArray_Type,
+            &sample,
+            &cost_queries,
+            &dist,
+            &budget
+        ))
+        return nullptr;
+    if (!craft_array(queries, NPY_FLOAT32, 2, self->dim) || !craft_array(truth, NPY_UINT32, 2) ||
+        !craft_array(sample, NPY_UINT32, 1))
+        return nullptr;
+    const auto* ids = static_cast<uint32_t*>(PyArray_DATA(sample));
+    std::vector<uint32_t> samples(ids, ids + PyArray_SIZE(sample));
+    std::vector<MLANN::FrontierConfiguration> frontier;
+    PyThreadState* state = PyEval_SaveThread();
+    try {
+        frontier = self->index->calibrate_frontier(
+            Eigen::Map<const RowMatrix>(
+                static_cast<float*>(PyArray_DATA(queries)), PyArray_DIM(queries, 0), self->dim
+            ),
+            Eigen::Map<const UIntRowMatrix>(
+                static_cast<uint32_t*>(PyArray_DATA(truth)),
+                PyArray_DIM(truth, 0),
+                PyArray_DIM(truth, 1)
+            ),
+            min_depth,
+            samples,
+            cost_queries,
+            static_cast<Distance>(dist),
+            size_t(budget)
+        );
+    } catch (const std::exception& e) {
+        PyEval_RestoreThread(state);
+        PyErr_SetString(PyExc_ValueError, e.what());
+        return nullptr;
+    }
+    PyEval_RestoreThread(state);
+    PyObject* result = PyList_New(frontier.size());
+    if (!result)
+        return nullptr;
+    for (size_t i = 0; i < frontier.size(); ++i) {
+        const auto& entry = frontier[i];
+        const auto& c = entry.configuration;
+        const auto& cost = entry.cost;
+        PyObject* item = Py_BuildValue(
+            "iifddddK",
+            c.trees,
+            c.depth,
+            c.threshold,
+            c.recall,
+            cost.votes,
+            cost.candidates,
+            cost.seconds,
+            static_cast<unsigned long long>(cost.bytes_upper_bound)
+        );
+        if (!item) {
+            Py_DECREF(result);
+            return nullptr;
+        }
+        PyList_SET_ITEM(result, i, item);
+    }
+    return result;
+}
+
 static PyObject* index_bytes(mlannIndex* self, PyObject*) {
     return PyLong_FromSize_t(self->index->index_bytes());
 }
@@ -851,6 +926,10 @@ static PyMethodDef MLANNMethods[] = {
      METH_VARARGS,
      "Materialize a fixed forest prefix/depth"},
     {"_calibrate", (PyCFunction) calibrate, METH_VARARGS, "Calibrate positive thresholds"},
+    {"_calibrate_frontier",
+     (PyCFunction) calibrate_frontier,
+     METH_VARARGS,
+     "Calibrate reusable recall-cost frontier"},
     {"_predict_recall", (PyCFunction) predict_recall, METH_VARARGS, "Per-query candidate recall"},
     {"_index_bytes", (PyCFunction) index_bytes, METH_NOARGS, "Owned deployed index storage"},
     {"_query_threads", (PyCFunction) query_threads, METH_NOARGS, "OpenMP query thread limit"},
