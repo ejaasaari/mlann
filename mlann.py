@@ -90,12 +90,12 @@ def _positive_integer(name, value):
 
 
 def _autotune_split(n_rows, minimum_fit_rows, rng):
-    """Reserve up to 256 calibration rows; use all other rows for fitting."""
+    """Reserve up to 1,024 calibration rows; use all other rows for fitting."""
     available = n_rows - minimum_fit_rows
     if available < 1:
         raise ValueError("training_queries needs at least one hold-out row in addition "
                          "to the rows required by depth_min")
-    tuning_count = min(256, available, max(1, n_rows // 5)) if minimum_fit_rows else min(256, available)
+    tuning_count = min(1024, available, max(1, n_rows // 5)) if minimum_fit_rows else min(1024, available)
     held_out = rng.choice(n_rows, size=tuning_count, replace=False)
     if minimum_fit_rows:
         fit_mask = np.ones(n_rows, dtype=bool)
@@ -104,6 +104,22 @@ def _autotune_split(n_rows, minimum_fit_rows, rng):
     else:
         fitting = np.empty(0, dtype=np.intp)
     return fitting, held_out
+
+
+def _autotune_neighbors(truth, rng):
+    """Spread a bounded scoring budget across queries, not correlated neighbors.
+
+    Uniform sampling within each exact top-k set estimates recall@k without
+    favoring easier neighbor ranks. Small calibration sets retain every neighbor.
+    """
+    rows, k = truth.shape
+    width = min(k, max(1, 25600 // rows))
+    if width == k:
+        return truth
+    sampled = np.empty((rows, width), dtype=np.uint32)
+    for q in range(rows):
+        sampled[q] = truth[q, rng.choice(k, width, replace=False)]
+    return sampled
 
 
 @dataclass(frozen=True)
@@ -310,7 +326,7 @@ class MLANNIndex(object):
         """Build one maximum forest; select and materialize one configuration.
 
         Supply representative training_queries and their corpus-neighbor labels.
-        Up to 256 rows are reserved for calibration, excluded from supervised
+        Up to 1,024 rows are reserved for calibration, excluded from supervised
         fitting. Unsupervised trees use the whole corpus and require no labels.
         random_state controls calibration/cost sampling, not tree construction.
 
@@ -319,7 +335,8 @@ class MLANNIndex(object):
         (or self.subset(r)) repeatedly without rebuilding or recalibrating.
         The profile itself is not a queryable index; close it to release memory.
 
-        Selection uses exact calibration recall and a sampled query-cost model.
+        Recall is estimated from uniformly sampled exact top-k neighbors, with
+        at most 25,600 query-neighbor pairs. Query cost is also sampled.
         There is no verification or post-selection threshold relaxation.
         target_met describes calibration recall, not a guarantee on unseen data.
         Recall misses still return a usable index with measured query latency.
@@ -354,7 +371,7 @@ class MLANNIndex(object):
             self._autotune_profile = profile
             return profile
         with _autotune_stage(stages, "recall_calibration"):
-            truth, configurations, fallback_reason = self._calibrate_autotune(master, tuning, options)
+            truth, configurations, fallback_reason = self._calibrate_autotune(master, tuning, options, rng)
         with _autotune_stage(stages, "cost_model"):
             selected, configurations, budget_reason, timing_queries = self._select_autotune(
                 master, tuning, truth, configurations, options, rng)
@@ -396,11 +413,12 @@ class MLANNIndex(object):
             replace=False), dtype=np.uint32)
         with _autotune_stage(stages, "exact_ground_truth"):
             truth = np.ascontiguousarray(master.exact_search(queries, options.k, options.dist), dtype=np.uint32)
+            truth = _autotune_neighbors(truth, rng)
         with _autotune_stage(stages, "recall_cost_frontier"):
             entries = master.index._calibrate_frontier(
                 queries, truth, options.depth_min, sample,
                 min(options.initial_batch_size, len(queries)), options.dist,
-                options.memory_budget or 0)
+                options.memory_budget or 0, options.k)
         if not entries:
             raise ValueError("memory_budget is too small for any conservative index storage bound")
         configurations = [AutotuneConfiguration(
@@ -481,11 +499,12 @@ class MLANNIndex(object):
         recalls = master.index._predict_recall(
             tuning, truth, trees, options.depth_min, threshold)
         return AutotuneConfiguration(
-            trees, options.depth_min, threshold, _mean_recall(recalls, options.k))
+            trees, options.depth_min, threshold, _mean_recall(recalls, truth.shape[1]))
 
-    def _calibrate_autotune(self, master, tuning, options):
+    def _calibrate_autotune(self, master, tuning, options, rng):
         truth = np.ascontiguousarray(
             master.exact_search(tuning, options.k, options.dist), dtype=np.uint32)
+        truth = _autotune_neighbors(truth, rng)
         configurations = [
             AutotuneConfiguration(*values)
             for values in master.index._calibrate(

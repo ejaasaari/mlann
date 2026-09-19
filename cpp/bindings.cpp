@@ -709,10 +709,11 @@ static PyObject* calibrate(mlannIndex* self, PyObject* args) {
 static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
     PyArrayObject *queries, *truth, *sample;
     int min_depth, cost_queries, dist;
+    int query_k = 0;
     unsigned long long budget;
     if (!PyArg_ParseTuple(
             args,
-            "O!O!iO!iiK",
+            "O!O!iO!iiK|i",
             &PyArray_Type,
             &queries,
             &PyArray_Type,
@@ -722,7 +723,8 @@ static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
             &sample,
             &cost_queries,
             &dist,
-            &budget
+            &budget,
+            &query_k
         ))
         return nullptr;
     if (!craft_array(queries, NPY_FLOAT32, 2, self->dim) || !craft_array(truth, NPY_UINT32, 2) ||
@@ -746,7 +748,8 @@ static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
             samples,
             cost_queries,
             static_cast<Distance>(dist),
-            size_t(budget)
+            size_t(budget),
+            query_k
         );
     } catch (const std::exception& e) {
         PyEval_RestoreThread(state);

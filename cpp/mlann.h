@@ -242,11 +242,16 @@ class MLANN {
         const std::vector<uint32_t>& sample,
         int cost_queries,
         Distance dist,
-        size_t memory_budget = 0
+        size_t memory_budget = 0,
+        int query_k = 0
     ) const {
         check_view(n_trees, min_depth);
+        // Calibration may use a uniform subset of the requested top-k neighbors.
+        if (query_k == 0)
+            query_k = int(truth.cols());
         if (queries.rows() == 0 || queries.cols() != dim || !queries.allFinite() ||
             truth.rows() != queries.rows() || truth.cols() == 0 || truth.cols() > n_corpus ||
+            query_k < truth.cols() || query_k > n_corpus ||
             truth.maxCoeff() >= uint32_t(n_corpus) || sample.empty() || cost_queries < 1 ||
             cost_queries > queries.rows() || (dist != L2 && dist != IP))
             throw std::invalid_argument("Invalid frontier calibration data");
@@ -264,7 +269,7 @@ class MLANN {
                 std::copy(sample.begin(), sample.end(), ids.data() + offsets[q] + truth.cols());
         }
         const auto kernels =
-            benchmark_query_kernels(queries.topRows(cost_queries), truth.cols(), dist);
+            benchmark_query_kernels(queries.topRows(cost_queries), query_k, dist);
         const size_t method_bytes = index_bytes() - MLANN::index_bytes();
         std::vector<FrontierConfiguration> best(truth.size() + 1);
         std::vector<float> scores(size_t(depth - min_depth + 1) * ids.size(), 0.f);
@@ -1064,11 +1069,13 @@ class MLANN {
                 missing.push_back(t);
         std::exception_ptr error;
         if (!missing.empty()) {
+            // MSVC OpenMP requires a signed counter; missing.size() is bounded by trees (int).
+            const int missing_count = static_cast<int>(missing.size());
 #pragma omp parallel
             {
                 std::vector<uint32_t> counts(tuning_unit_labels ? 0 : n_corpus, 0), touched;
 #pragma omp for schedule(dynamic, 1)
-                for (size_t i = 0; i < missing.size(); ++i) {
+                for (int i = 0; i < missing_count; ++i) {
                     try {
                         const int t = missing[i];
                         view.shared_payloads[t] = make_tuning_payload(t, d, counts, touched);
