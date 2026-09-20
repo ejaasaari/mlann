@@ -545,8 +545,10 @@ static PyObject* calibrate(mlannIndex* self, PyObject* args) {
     PyArrayObject *queries, *truth;
     int min_depth;
     double target;
+    float fixed_threshold = 0;
     if (!PyArg_ParseTuple(
-            args, "O!O!id", &PyArray_Type, &queries, &PyArray_Type, &truth, &min_depth, &target
+            args, "O!O!id|f", &PyArray_Type, &queries, &PyArray_Type, &truth,
+            &min_depth, &target, &fixed_threshold
         ))
         return nullptr;
     if (!craft_array(queries, NPY_FLOAT32, 2, self->dim) || !craft_array(truth, NPY_UINT32, 2))
@@ -564,7 +566,8 @@ static PyObject* calibrate(mlannIndex* self, PyObject* args) {
                 PyArray_DIM(truth, 1)
             ),
             min_depth,
-            target
+            target,
+            fixed_threshold
         );
     } catch (const std::exception& e) {
         PyEval_RestoreThread(state);
@@ -591,10 +594,11 @@ static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
     PyArrayObject *queries, *truth, *sample;
     int min_depth, cost_queries, dist;
     int query_k = 0;
+    float fixed_threshold = 0;
     unsigned long long budget;
     if (!PyArg_ParseTuple(
             args,
-            "O!O!iO!iiK|i",
+            "O!O!iO!iiK|if",
             &PyArray_Type,
             &queries,
             &PyArray_Type,
@@ -605,7 +609,8 @@ static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
             &cost_queries,
             &dist,
             &budget,
-            &query_k
+            &query_k,
+            &fixed_threshold
         ))
         return nullptr;
     if (!craft_array(queries, NPY_FLOAT32, 2, self->dim) || !craft_array(truth, NPY_UINT32, 2) ||
@@ -630,7 +635,8 @@ static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
             cost_queries,
             static_cast<Distance>(dist),
             size_t(budget),
-            query_k
+            query_k,
+            fixed_threshold
         );
     } catch (const std::exception& e) {
         PyEval_RestoreThread(state);

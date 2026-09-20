@@ -139,6 +139,8 @@ class _AutotuneOptions:
     timing_repeats: int
     cost_sample_size: int
     timing_sample_size: int
+    votes_required: int | None = None
+    craftml_options: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -288,7 +290,7 @@ class MLANNIndex(object):
     def __init__(self, data, index_type="SparsePCA"):
         """
         Initializes an MLANN index object.
-        :param data: Input data either as a NxDim numpy ndarray or as a filepath to a binary file containing the data.
+        :param data: Input data as an NxDim float32 numpy ndarray.
         :return:
         """
         if isinstance(data, np.ndarray):
@@ -320,6 +322,8 @@ class MLANNIndex(object):
         unsupervised=False, dist=L2, memory_budget=None,
         initial_batch_size=16, batch_size=1, timing_repeats=1, random_state=0,
         cost_sample_size=4096, timing_sample_size=32,
+        branching_factor=16, leaf_size=32, label_dim=1024, feature_dim=0,
+        iterations=2, votes_required=None,
     ):
         """Build one maximum forest; select and materialize one configuration.
 
@@ -327,6 +331,13 @@ class MLANNIndex(object):
         Up to 1,024 rows are reserved for calibration, excluded from supervised
         fitting. Unsupervised trees use the whole corpus and require no labels.
         random_state controls calibration/cost sampling, not tree construction.
+        votes_required fixes a positive integer vote threshold for KD/RP/PCA
+        (including SparsePCA); None tunes the threshold as well. This applies
+        to both single targets and all subsets of a reusable profile.
+        CraftML also accepts its build-time branching/leaf/hash options;
+        these stay fixed while tree count, depth and probability threshold vary.
+        CraftML uses inclusive probability thresholds and pads insufficient
+        candidates with -1, matching the other tuned forests (no exact fallback).
 
         target_recall=None returns an AutotuneProfile retaining the maximum
         forest and full empirical recall/cost frontier. Call profile.subset(r)
@@ -350,7 +361,10 @@ class MLANNIndex(object):
             unsupervised=unsupervised, dist=dist, memory_budget=memory_budget,
             initial_batch_size=initial_batch_size, batch_size=batch_size,
             timing_repeats=timing_repeats, cost_sample_size=cost_sample_size,
-            timing_sample_size=timing_sample_size,
+            timing_sample_size=timing_sample_size, votes_required=votes_required,
+            craftml_options=dict(branching_factor=branching_factor, leaf_size=leaf_size,
+                                 label_dim=label_dim, feature_dim=feature_dim,
+                                 iterations=iterations),
         )
         stages = {}
         with _autotune_stage(stages, "validation"):
@@ -415,7 +429,7 @@ class MLANNIndex(object):
             entries = master.index._calibrate_frontier(
                 queries, truth, options.depth_min, sample,
                 min(options.initial_batch_size, len(queries)), options.dist,
-                options.memory_budget or 0, options.k)
+                options.memory_budget or 0, options.k, options.votes_required or 0)
         if not entries:
             raise ValueError("memory_budget is too small for any conservative index storage bound")
         configurations = [AutotuneConfiguration(
@@ -427,8 +441,14 @@ class MLANNIndex(object):
     def _validate_autotune_input(self, training_queries, knn, options):
         if self.built or getattr(self, "_autotune_profile", None) is not None:
             raise RuntimeError("The index has already been built")
-        if self.index_type not in ("KD", "RP", "SparsePCA", "PCA", "RF", "PLS"):
-            raise ValueError("Autotuning supports KD, RP, SparsePCA, PCA, RF and PLS only")
+        if self.index_type not in ("KD", "RP", "SparsePCA", "PCA", "RF", "PLS", "CRAFTML"):
+            raise ValueError("Autotuning supports KD, RP, SparsePCA, PCA, RF, PLS and CRAFTML only")
+        if options.votes_required is not None:
+            if self.index_type not in ("KD", "RP", "SparsePCA", "PCA"):
+                raise ValueError("Fixed votes_required is supported only for KD, RP, SparsePCA and PCA")
+            _positive_integer("votes_required", options.votes_required)
+            if options.votes_required > 2**24:
+                raise ValueError("votes_required must be <= 2**24 for exact float32 representation")
         for name in ("k", "n_trees_max", "depth_min", "depth_max", "b",
                      "initial_batch_size", "batch_size", "timing_repeats",
                      "cost_sample_size", "timing_sample_size"):
@@ -444,7 +464,7 @@ class MLANNIndex(object):
             _positive_integer("memory_budget", options.memory_budget)
         training_queries = self._distribution_features(training_queries, matrix=True)
         if options.unsupervised:
-            if self.index_type in ("RF", "PLS") or knn is not None or options.b != 1:
+            if self.index_type in ("RF", "PLS", "CRAFTML") or knn is not None or options.b != 1:
                 raise ValueError("Unsupervised tuning requires KD/RP/PCA, no knn and b=1")
             rows = self.n_samples
         else:
@@ -460,7 +480,12 @@ class MLANNIndex(object):
             del sorted_labels
             knn = np.ascontiguousarray(knn, dtype=np.uint32)
             rows = len(training_queries)
-        if not options.depth_min <= options.depth_max <= min(29, int(np.floor(np.log2(rows)))):
+        if self.index_type == "CRAFTML":
+            if not options.depth_min <= options.depth_max <= 64:
+                raise ValueError("Require 1 <= depth_min <= depth_max <= 64 for CraftML")
+            if options.density != "auto" or options.b != 1:
+                raise ValueError("CraftML uses feature_dim and unpruned leaves instead of density/b")
+        elif not options.depth_min <= options.depth_max <= min(29, int(np.floor(np.log2(rows)))):
             raise ValueError("Require 1 <= depth_min <= depth_max <= min(29, floor(log2(training rows)))")
         # Validate build options before allocating the master.
         self._compute_density(options.density)
@@ -468,7 +493,8 @@ class MLANNIndex(object):
 
     def _prepare_autotune_training(self, queries, labels, options, rng):
         fitting_rows, tuning_rows = _autotune_split(
-            len(queries), 0 if options.unsupervised else 1 << options.depth_min, rng)
+            len(queries), 0 if options.unsupervised else
+            (1 if self.index_type == "CRAFTML" else 1 << options.depth_min), rng)
         calibration = np.ascontiguousarray(queries[tuning_rows])
         if options.unsupervised:
             return _AutotuneTraining(
@@ -477,6 +503,7 @@ class MLANNIndex(object):
         return _AutotuneTraining(
             np.ascontiguousarray(queries[fitting_rows]),
             np.ascontiguousarray(labels[fitting_rows]), calibration,
+            options.depth_max if self.index_type == "CRAFTML" else
             min(options.depth_max, len(fitting_rows).bit_length() - 1),
             dict(fitting=len(fitting_rows), calibration=len(calibration)))
 
@@ -486,11 +513,14 @@ class MLANNIndex(object):
         master.build(
             training.fitting, training.labels, n_trees=options.n_trees_max,
             depth=training.depth_max, density=options.density, b=options.b,
-            unsupervised=options.unsupervised)
+            unsupervised=options.unsupervised, dist=options.dist,
+            **(options.craftml_options if self.index_type == "CRAFTML" else {}))
         return master
 
     def _autotune_fallback(self, master, tuning, truth, trees, options):
-        threshold = float(np.finfo(np.float32).tiny) if self.index_type in ("RF", "PLS") else 1.0
+        threshold = float(np.finfo(np.float32).tiny) if self.index_type in ("RF", "PLS", "CRAFTML") else 1.0
+        if options.votes_required is not None:
+            threshold = options.votes_required
         recalls = master.index._predict_recall(
             tuning, truth, trees, options.depth_min, threshold)
         return AutotuneConfiguration(
@@ -503,7 +533,8 @@ class MLANNIndex(object):
         configurations = [
             AutotuneConfiguration(*values)
             for values in master.index._calibrate(
-                tuning, truth, options.depth_min, options.target_recall)
+                tuning, truth, options.depth_min, options.target_recall,
+                options.votes_required or 0)
         ]
         if configurations:
             return truth, configurations, None
@@ -554,9 +585,9 @@ class MLANNIndex(object):
 
     def build(
         self, train=None, knn=None, n_trees=None, depth=None, density="auto", b=1,
-        unsupervised=False, *, branching_factor=10,
-        leaf_size=32, label_dim=128, feature_dim=0, iterations=2,
-        node_sample_size=1000, seed=None, dist=L2,
+        unsupervised=False, *, branching_factor=16,
+        leaf_size=32, label_dim=1024, feature_dim=0, iterations=2,
+        dist=L2,
     ):
         """
         Builds a normal MLANN index.
@@ -565,14 +596,13 @@ class MLANNIndex(object):
                              b must be 1. Default False preserves supervised leaf votes.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
         :param n_trees: The number of trees used in the index.
-        :param seed: CraftML random seed; None uses 42.
         :param density: Feature density; "auto" uses 1/sqrt(dim), None uses 1.
                         KD chooses among max(1, floor(density * dim)) highest-variance
                         dimensions per node; density=1 includes every dimension.
                         PLS uses all input dimensions.
         :param b: Minimum raw label count retained in a node (fixed build-time pruning).
         RF scores at most 400 sampled rows per node. PCA fits at most 100;
-        PLS fits and scores at most 100. These caps are fixed. Smaller nodes
+        PLS fits and scores at most 100; CraftML fits at most 200. These caps are fixed. Smaller nodes
         use all their rows. Partitioning and leaf votes always use all rows.
         :return:
         """
@@ -590,17 +620,13 @@ class MLANNIndex(object):
                 raise ValueError("knn must contain valid integer corpus IDs, one row per query")
             if dist not in (IP, L2):
                 raise ValueError("dist must be IP or L2")
-            if seed is None:
-                seed = 42
-            if not isinstance(seed, (int, np.integer)) or not 0 <= seed <= np.iinfo(np.uint32).max:
-                raise ValueError("seed must be an integer in [0, 2**32 - 1]")
             if density != "auto" or b != 1:
                 raise ValueError("CraftML uses feature_dim and unpruned leaves instead of density/b")
             self.index.build_craftml(
                 train, np.ascontiguousarray(knn, dtype=np.uint32),
                 10 if n_trees is None else n_trees, 20 if depth is None else depth,
                 branching_factor, leaf_size, label_dim, feature_dim,
-                iterations, node_sample_size, seed, dist,
+                iterations, dist,
             )
             self.dist = dist
             self.built = True
@@ -641,8 +667,9 @@ class MLANNIndex(object):
         Performs an approximate nearest neighbor query for a single query vector or multiple query vectors
         in parallel. The queries are given as a numpy vector or a numpy matrix where each row contains a query.
         :param candidate_budget: CraftML shortlist size (>= k), ranked by probability.
-                                 Alternatively, votes_required selects probability > tau;
-                                 fewer than k candidates triggers full-corpus exact search.
+                                 Probability thresholds are inclusive (>= tau).
+                                 Both ordinary and autotuned indices pad missing results
+                                 with -1; neither falls back to full-corpus search.
         :param q: The query object. Can be either a single query vector or a matrix with one query vector per row.
         :param k: The number of nearest neighbors to be returned.
         :param votes_required: Minimum vote threshold for exact reranking.
@@ -659,7 +686,9 @@ class MLANNIndex(object):
             if candidate_budget is not None and votes_required is not None:
                 raise ValueError("Specify candidate_budget or votes_required, not both")
             if candidate_budget is None and votes_required is None:
-                raise ValueError("Specify candidate_budget or votes_required")
+                votes_required = getattr(self, "votes_required", None)
+                if votes_required is None:
+                    raise ValueError("Specify candidate_budget or votes_required")
             if candidate_budget is not None and (
                     not isinstance(candidate_budget, (int, np.integer)) or candidate_budget < k):
                 raise ValueError("candidate_budget must be an integer >= k")

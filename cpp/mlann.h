@@ -188,13 +188,16 @@ class MLANN {
         const Eigen::Ref<const RowMatrix>& queries,
         const Eigen::Ref<const UIntRowMatrix>& truth,
         int min_depth,
-        double target
+        double target,
+        float fixed_threshold = 0
     ) const {
         check_view(n_trees, min_depth);
         if (queries.cols() != dim || queries.rows() == 0 || !queries.allFinite() ||
             truth.rows() != queries.rows() || truth.cols() == 0 ||
             truth.maxCoeff() >= uint32_t(n_corpus) || !(target > 0 && target <= 1))
             throw std::invalid_argument("Invalid calibration data or recall target");
+        if (!std::isfinite(fixed_threshold) || fixed_threshold < 0)
+            throw std::invalid_argument("Invalid fixed vote threshold");
         const size_t count = truth.size();
         const size_t h = size_t(std::ceil(target * count));
         std::vector<std::vector<float>> scores(
@@ -207,17 +210,21 @@ class MLANN {
                 auto& score = scores[d - min_depth];
                 for (size_t j = 0; j < count; ++j)
                     score[j] += weights[size_t(d - min_depth) * count + j];
-                auto scratch = score; // Never partition the live accumulator.
-                std::nth_element(
-                    scratch.begin(), scratch.begin() + h - 1, scratch.end(), std::greater<float>()
-                );
-                const float threshold = scratch[h - 1] / divisor;
+                float threshold = fixed_threshold;
+                if (threshold == 0) {
+                    auto scratch = score; // Never partition the live accumulator.
+                    std::nth_element(
+                        scratch.begin(), scratch.begin() + h - 1, scratch.end(), std::greater<float>()
+                    );
+                    threshold = scratch[h - 1] / divisor;
+                }
                 if (threshold <= 0)
                     continue;
                 size_t hits = 0;
                 for (float s : score)
                     hits += s / divisor >= threshold;
-                result.push_back({tree + 1, d, threshold, double(hits) / count});
+                if (hits >= h)
+                    result.push_back({tree + 1, d, threshold, double(hits) / count});
             }
         });
         return result;
@@ -243,9 +250,12 @@ class MLANN {
         int cost_queries,
         Distance dist,
         size_t memory_budget = 0,
-        int query_k = 0
+        int query_k = 0,
+        float fixed_threshold = 0
     ) const {
         check_view(n_trees, min_depth);
+        if (!std::isfinite(fixed_threshold) || fixed_threshold < 0)
+            throw std::invalid_argument("Invalid fixed vote threshold");
         // Calibration may use a uniform subset of the requested top-k neighbors.
         if (query_k == 0)
             query_k = int(truth.cols());
@@ -305,7 +315,8 @@ class MLANN {
                         d,
                         votes[d - min_depth],
                         bound,
-                        kernels
+                        kernels,
+                        fixed_threshold
                     );
                 }
             }
@@ -547,7 +558,8 @@ class MLANN {
         int d,
         double votes,
         size_t bound,
-        const QueryKernelCosts& kernels
+        const QueryKernelCosts& kernels,
+        float fixed_threshold
     ) const {
         std::sort(neighbors.begin(), neighbors.end(), std::greater<float>());
         std::sort(candidates.begin(), candidates.end(), std::greater<float>());
@@ -560,6 +572,7 @@ class MLANN {
         // Zero-support forests still contribute a usable best-effort entry.
         do {
             const float threshold =
+                fixed_threshold > 0 ? fixed_threshold :
                 hits < neighbors.size() && neighbors[hits] > 0
                     ? neighbors[hits]
                     : (probability_scores() ? std::numeric_limits<float>::min() : 1.f);
@@ -572,7 +585,7 @@ class MLANN {
             auto& current = best[hits];
             if (!current.configuration.trees || lower_cost(cost, current.cost))
                 current = {{trees, d, threshold, double(hits) / neighbors.size()}, cost};
-            if (hits == neighbors.size() || neighbors[hits] <= 0)
+            if (fixed_threshold > 0 || hits == neighbors.size() || neighbors[hits] <= 0)
                 break;
         } while (true);
     }
