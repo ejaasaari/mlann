@@ -464,18 +464,7 @@ inline Split threshold(const Sample& sample, const Eigen::VectorXf& projection) 
 
 class PLS : public MLANN {
   public:
-    PLS(const float* corpus_, int n_corpus_, int dim_, int n_subsample_ = 300)
-        : MLANN(corpus_, n_corpus_, dim_) {
-        configure(n_subsample_);
-    }
-
-    void configure(int n_subsample_) {
-        if (!empty())
-            throw std::logic_error("The index has already been grown.");
-        if (n_subsample_ < 2)
-            throw std::invalid_argument("n_subsample must be >= 2");
-        n_subsample = n_subsample_;
-    }
+    PLS(const float* corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
     using MLANN::query;
 
@@ -505,7 +494,9 @@ class PLS : public MLANN {
         forests.resize(n_trees_);
         leaves_all.resize(n_trees_);
         std::vector<std::vector<float>> tree_projections(n_trees_);
-        const pls_detail::PALTables tables(std::min<int>(n_subsample, train.rows()), knn.cols());
+        const pls_detail::PALTables tables(
+            std::min<int>(fitting_row_cap, train.rows()), knn.cols()
+        );
 
         RowMatrix targets = pls_detail::neighbor_means(corpus, knn);
 #pragma omp parallel
@@ -536,7 +527,7 @@ class PLS : public MLANN {
 
     std::unique_ptr<MLANN> make_view(int trees, int d) const override {
         check_view(trees, d);
-        auto view = std::make_unique<PLS>(corpus.data(), n_corpus, dim, n_subsample);
+        auto view = std::make_unique<PLS>(corpus.data(), n_corpus, dim);
         view->n_trees = trees;
         view->depth = d;
         view->b = b;
@@ -728,7 +719,7 @@ class PLS : public MLANN {
 
   private:
     using IndexIterator = std::vector<int>::iterator;
-    int n_subsample = 300;
+    static constexpr int fitting_row_cap = 100;
 
     int copy_tuning_subtree(
         PLS& view,
@@ -948,7 +939,7 @@ class PLS : public MLANN {
         TreeScratch& scratch
     ) const {
         const int count = end - begin;
-        const int n_sampled = std::min(n_subsample, count);
+        const int n_sampled = std::min(fitting_row_cap, count);
         const auto sampled_rows = mlann_detail::sample(count, n_sampled, scratch.generator);
         const pls_detail::Sample sampled_queries =
             sample_queries(begin, sampled_rows, train, knn, scratch);

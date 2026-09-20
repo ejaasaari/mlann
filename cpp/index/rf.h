@@ -19,18 +19,7 @@
 
 class RF : public MLANN {
   public:
-    RF(const float* corpus_, int n_corpus_, int dim_, int n_subsample_ = 300)
-        : MLANN(corpus_, n_corpus_, dim_) {
-        configure(n_subsample_);
-    }
-
-    void configure(int n_subsample_) {
-        if (!empty())
-            throw std::logic_error("The index has already been grown.");
-        if (n_subsample_ < 0)
-            throw std::invalid_argument("n_subsample must be non-negative; 0 uses all node rows.");
-        n_subsample = n_subsample_;
-    }
+    RF(const float* corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
     void grow(
         int n_trees_,
@@ -116,7 +105,6 @@ class RF : public MLANN {
                     train,
                     knn,
                     random_dims_all[tree],
-                    n_subsample,
                     scratch
                 );
                 finish_tuning_tree(tree, indices);
@@ -128,7 +116,7 @@ class RF : public MLANN {
     }
 
     std::unique_ptr<MLANN> make_view(int trees, int d) const override {
-        auto view = std::make_unique<RF>(corpus.data(), n_corpus, dim, n_subsample);
+        auto view = std::make_unique<RF>(corpus.data(), n_corpus, dim);
         initialize_view(*view, trees, d);
         view->unscaled_votes = true;
         return view;
@@ -226,7 +214,7 @@ class RF : public MLANN {
     static constexpr int routing_batch_size = 64;
     std::vector<float> log2_tbl;
     std::vector<float> t_tbl;
-    int n_subsample = 300;
+    static constexpr int split_scoring_row_cap = 400;
     float tol = 0.001;
 
     struct SplitEntry {
@@ -269,7 +257,6 @@ class RF : public MLANN {
         const Eigen::Ref<const UIntRowMatrix>& knn,
         float tol,
         int n_corpus,
-        int n_subsample,
         TreeScratch& scratch
     ) {
         int n = int(end - begin);
@@ -279,9 +266,9 @@ class RF : public MLANN {
             return std::make_tuple(max_dim, max_split, max_gain);
 
         auto& local = scratch.local;
-        if (n_subsample > 0 && n_subsample < n) {
-            mlann_detail::sample_unique(n, n_subsample, local);
-            n = n_subsample;
+        if (n > split_scoring_row_cap) {
+            mlann_detail::sample_unique(n, split_scoring_row_cap, local);
+            n = split_scoring_row_cap;
         } else {
             local.resize(n);
             std::iota(local.begin(), local.end(), 0);
@@ -507,7 +494,6 @@ class RF : public MLANN {
         const Eigen::Ref<const RowMatrix>& train,
         const Eigen::Ref<const UIntRowMatrix>& knn,
         const std::vector<std::vector<uint32_t>>& random_dims,
-        int n_subsample,
         TreeScratch& scratch
     ) {
         if (tree_level == depth) {
@@ -523,9 +509,8 @@ class RF : public MLANN {
 
         record_tuning_node(tree, i, begin, end);
 
-        const auto s = split(
-            begin, end, random_dims[tree_level], train, knn, tol, n_corpus, n_subsample, scratch
-        );
+        const auto s =
+            split(begin, end, random_dims[tree_level], train, knn, tol, n_corpus, scratch);
         const int max_dim = std::get<0>(s);
         const float max_split = std::get<1>(s);
 
@@ -565,7 +550,6 @@ class RF : public MLANN {
             train,
             knn,
             random_dims,
-            n_subsample,
             scratch
         );
         grow_subtree(
@@ -579,7 +563,6 @@ class RF : public MLANN {
             train,
             knn,
             random_dims,
-            n_subsample,
             scratch
         );
     }

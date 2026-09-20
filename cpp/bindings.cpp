@@ -7,14 +7,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <type_traits>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 #include "Python.h"
 #include "index/craftml.h"
-#include "index/ivf.h"
 #include "index/kd.h"
 #include "index/pca.h"
 #include "index/pls.h"
@@ -82,8 +80,6 @@ static int MLANN_init(mlannIndex* self, PyObject* args) {
         self->index = new PCA(data, n, dim);
     else if (strcmp(index_type, "PLS") == 0)
         self->index = new PLS(data, n, dim);
-    else if (strcmp(index_type, "IVF") == 0)
-        self->index = new IVF(data, n, dim);
     else if (strcmp(index_type, "RF") == 0)
         self->index = new RF(data, n, dim);
     else {
@@ -102,12 +98,11 @@ static PyObject* build(mlannIndex* self, PyObject* args) {
     int n_knn, dim_knn;
 
     int n_trees, depth, b;
-    int top_variance_dims, n_subsample;
     float density;
 
     if (!PyArg_ParseTuple(
             args,
-            "O!iiO!iiiifiii",
+            "O!iiO!iiiifi",
             &PyArray_Type,
             &train_data,
             &n_train,
@@ -119,9 +114,7 @@ static PyObject* build(mlannIndex* self, PyObject* args) {
             &n_trees,
             &depth,
             &density,
-            &b,
-            &top_variance_dims,
-            &n_subsample
+            &b
         ))
         return NULL;
 
@@ -134,14 +127,6 @@ static PyObject* build(mlannIndex* self, PyObject* args) {
 
     PyThreadState* _save = PyEval_SaveThread();
     try {
-        if (auto* kd = dynamic_cast<KD*>(self->index))
-            kd->configure(top_variance_dims);
-        if (auto* rf = dynamic_cast<RF*>(self->index))
-            rf->configure(n_subsample);
-        if (auto* pca = dynamic_cast<PCA*>(self->index))
-            pca->configure(n_subsample);
-        if (auto* pls = dynamic_cast<PLS*>(self->index))
-            pls->configure(n_subsample);
         self->index->grow(n_trees, depth, knn, train, density, b);
         PyEval_RestoreThread(_save);
     } catch (const std::exception& e) {
@@ -154,19 +139,13 @@ static PyObject* build(mlannIndex* self, PyObject* args) {
 }
 
 static PyObject* build_unsupervised(mlannIndex* self, PyObject* args) {
-    int n_trees, depth, top_variance_dims, n_subsample;
+    int n_trees, depth;
     float density;
-    if (!PyArg_ParseTuple(
-            args, "iifii", &n_trees, &depth, &density, &top_variance_dims, &n_subsample
-        ))
+    if (!PyArg_ParseTuple(args, "iif", &n_trees, &depth, &density))
         return NULL;
 
     PyThreadState* _save = PyEval_SaveThread();
     try {
-        if (auto* kd = dynamic_cast<KD*>(self->index))
-            kd->configure(top_variance_dims);
-        if (auto* pca = dynamic_cast<PCA*>(self->index))
-            pca->configure(n_subsample);
         self->index->grow_unsupervised(n_trees, depth, density);
         PyEval_RestoreThread(_save);
     } catch (const std::exception& e) {
@@ -194,12 +173,7 @@ static void mlann_dealloc(mlannIndex* self) {
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
 }
 
-template <typename Index>
-static PyObject* ann_distribution(mlannIndex* self, PyObject* args);
-
 static PyObject* ann(mlannIndex* self, PyObject* args) {
-    if (dynamic_cast<IVF*>(self->index))
-        return ann_distribution<IVF>(self, args);
     PyArrayObject* v;
     int k, dim, n, return_distances;
     Distance dist;
@@ -437,89 +411,26 @@ static PyObject* build_craftml(mlannIndex* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
-static PyObject* build_ivf(mlannIndex* self, PyObject* args) {
-    PyArrayObject *train, *knn;
-    int n_trees, n_clusters, subspace_dim, distance;
-    if (!PyArg_ParseTuple(
-            args,
-            "O!O!iiii",
-            &PyArray_Type,
-            &train,
-            &PyArray_Type,
-            &knn,
-            &n_trees,
-            &n_clusters,
-            &subspace_dim,
-            &distance
-        ))
-        return nullptr;
-    auto* index = dynamic_cast<IVF*>(self->index);
-    if (!index) {
-        PyErr_SetString(PyExc_TypeError, "Expected IVF index");
-        return nullptr;
-    }
-    if (!craft_array(train, NPY_FLOAT32, 2, self->dim) || !craft_array(knn, NPY_UINT32, 2))
-        return nullptr;
-    PyThreadState* state = PyEval_SaveThread();
-    try {
-        index->build(
-            Eigen::Map<const UIntRowMatrix>(
-                static_cast<uint32_t*>(PyArray_DATA(knn)), PyArray_DIM(knn, 0), PyArray_DIM(knn, 1)
-            ),
-            Eigen::Map<const RowMatrix>(
-                static_cast<float*>(PyArray_DATA(train)),
-                PyArray_DIM(train, 0),
-                PyArray_DIM(train, 1)
-            ),
-            n_trees,
-            n_clusters,
-            subspace_dim,
-            static_cast<Distance>(distance)
-        );
-    } catch (const std::exception& error) {
-        PyEval_RestoreThread(state);
-        PyErr_SetString(PyExc_ValueError, error.what());
-        return nullptr;
-    }
-    PyEval_RestoreThread(state);
-    Py_RETURN_NONE;
-}
-
-template <typename Index>
-static PyObject* ann_distribution(mlannIndex* self, PyObject* args) {
+static PyObject* ann_craftml(mlannIndex* self, PyObject* args) {
     PyArrayObject* queries;
     int k, distance, return_distances;
     int budget = -1;
     float threshold;
-    if constexpr (std::is_same_v<Index, IVF>) {
-        if (!PyArg_ParseTuple(
-                args,
-                "O!ifii",
-                &PyArray_Type,
-                &queries,
-                &k,
-                &threshold,
-                &distance,
-                &return_distances
-            ))
-            return nullptr;
-    } else {
-        if (!PyArg_ParseTuple(
-                args,
-                "O!iifii",
-                &PyArray_Type,
-                &queries,
-                &k,
-                &budget,
-                &threshold,
-                &distance,
-                &return_distances
-            ))
-            return nullptr;
-    }
-    auto* index = dynamic_cast<Index*>(self->index);
+    if (!PyArg_ParseTuple(
+            args,
+            "O!iifii",
+            &PyArray_Type,
+            &queries,
+            &k,
+            &budget,
+            &threshold,
+            &distance,
+            &return_distances
+        ))
+        return nullptr;
+    auto* index = dynamic_cast<CraftML*>(self->index);
     if (!index) {
-        PyErr_SetString(PyExc_TypeError, "Unexpected index type for distribution search");
+        PyErr_SetString(PyExc_TypeError, "Expected CraftML index");
         return nullptr;
     }
     const int ndim = PyArray_NDIM(queries);
@@ -558,29 +469,18 @@ static PyObject* ann_distribution(mlannIndex* self, PyObject* args) {
 #endif
     for (npy_intp i = 0; i < n; ++i) {
         try {
-            if constexpr (std::is_same_v<Index, IVF>) {
-                index->query(
-                    input + i * self->dim,
-                    k,
-                    threshold,
-                    output + i * k,
-                    static_cast<Distance>(distance),
-                    scores ? scores + i * k : nullptr
-                );
-            } else {
-                index->search(
-                    input + i * self->dim,
-                    k,
-                    budget,
-                    threshold,
-                    output + i * k,
-                    static_cast<Distance>(distance),
-                    scores ? scores + i * k : nullptr
-                );
-            }
+            index->search(
+                input + i * self->dim,
+                k,
+                budget,
+                threshold,
+                output + i * k,
+                static_cast<Distance>(distance),
+                scores ? scores + i * k : nullptr
+            );
         } catch (...) {
 #ifdef _OPENMP
-#pragma omp critical(distribution_query_error)
+#pragma omp critical(craftml_query_error)
 #endif
             {
                 if (!error)
@@ -980,12 +880,8 @@ static PyMethodDef MLANNMethods[] = {
      METH_NOARGS,
      "Tuning payload cache statistics"},
     {"_query_threads", (PyCFunction) query_threads, METH_NOARGS, "OpenMP query thread limit"},
-    {"build_ivf", (PyCFunction) build_ivf, METH_VARARGS, "Build random-subspace ensemble IVF"},
     {"build_craftml", (PyCFunction) build_craftml, METH_VARARGS, "Build a CraftML forest"},
-    {"ann_craftml",
-     (PyCFunction) ann_distribution<CraftML>,
-     METH_VARARGS,
-     "Search a CraftML forest"},
+    {"ann_craftml", (PyCFunction) ann_craftml, METH_VARARGS, "Search a CraftML forest"},
     {"ann", (PyCFunction) ann, METH_VARARGS, "Return approximate nearest neighbors"},
     {"exact_search", (PyCFunction) exact_search, METH_VARARGS, "Return exact nearest neighbors"},
     {"build", (PyCFunction) build, METH_VARARGS, "Build the index"},

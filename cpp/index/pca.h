@@ -138,7 +138,7 @@ inline Eigen::VectorXf principal_direction(
 } // namespace pca_detail
 
 // Median-split PCA forest. SparsePCA samples coordinates with replacement;
-// PCA uses every coordinate and caps fitting rows with n_subsample.
+// PCA uses every coordinate and fits at most 100 sampled rows per node.
 class SparsePCA : public MLANN {
   public:
     SparsePCA(const float* corpus_, int n_corpus_, int dim_)
@@ -227,7 +227,7 @@ class SparsePCA : public MLANN {
 
 #pragma omp parallel
         {
-            TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train, n_subsample);
+            TreeScratch scratch(corpus_leaves ? 0 : n_corpus, n_train);
 #pragma omp for schedule(dynamic, 1) nowait
             for (int tree = 0; tree < n_trees; ++tree) {
                 try {
@@ -286,7 +286,6 @@ class SparsePCA : public MLANN {
         view->corpus_leaves = tuning_unit_labels;
         view->compact_leaf_votes = view->compact_view_votes(tuning_unit_labels, view->votes16_all);
         view->support = support;
-        view->n_subsample = n_subsample;
         view->projections.resize(Eigen::Index(trees) * view->n_inner_nodes, support);
         if (!full_dimensions)
             view->projection_dims.resize(view->projections.rows(), support);
@@ -377,7 +376,6 @@ class SparsePCA : public MLANN {
             path[level + 1] = 2 * node + (score <= split_points(node, tree) ? 1 : 2);
         }
     }
-    int n_subsample = 300;
     bool compact_leaf_votes = false;
     std::vector<std::vector<std::vector<uint16_t>>> votes16_all;
 
@@ -387,6 +385,7 @@ class SparsePCA : public MLANN {
   private:
     using IndexIterator = std::vector<int>::iterator;
     static constexpr int routing_batch_size = 64;
+    static constexpr int fitting_row_cap = 100;
     bool corpus_leaves = false;
     const bool full_dimensions;
     int support = 0;
@@ -401,9 +400,9 @@ class SparsePCA : public MLANN {
         std::vector<float> row_scores;
         Eigen::MatrixXf fit;
 
-        TreeScratch(int corpus_size, int train_size, int n_subsample)
+        TreeScratch(int corpus_size, int train_size)
             : rows(train_size), votes(corpus_size, 0), row_scores(train_size) {
-            sampled_rows.reserve(std::min(n_subsample, train_size));
+            sampled_rows.reserve(std::min(fitting_row_cap, train_size));
         }
     };
 
@@ -461,12 +460,12 @@ class SparsePCA : public MLANN {
             return;
         }
         int fit_count = count;
-        if (full_dimensions && n_subsample > 0 && count > n_subsample) {
+        if (full_dimensions && count > fitting_row_cap) {
             scratch.sampled_rows.clear();
             std::sample(
-                begin, end, std::back_inserter(scratch.sampled_rows), n_subsample, generator
+                begin, end, std::back_inserter(scratch.sampled_rows), fitting_row_cap, generator
             );
-            fit_count = n_subsample;
+            fit_count = fitting_row_cap;
             gather_points(scratch.sampled_rows.begin(), fit_count, row, train, scratch.fit);
         } else {
             gather_points(begin, fit_count, row, train, scratch.fit);
@@ -624,18 +623,6 @@ class SparsePCA : public MLANN {
 
 class PCA : public SparsePCA {
   public:
-    PCA(const float* corpus_, int n_corpus_, int dim_, int n_subsample_ = 300)
-        : SparsePCA(corpus_, n_corpus_, dim_, true) {
-        configure(n_subsample_);
-    }
-
-    void configure(int n_subsample_) {
-        if (!empty())
-            throw std::logic_error("The index has already been grown.");
-        if (n_subsample_ < 0 || n_subsample_ == 1)
-            throw std::invalid_argument(
-                "PCA n_subsample must be 0 or at least 2; 0 uses all node rows."
-            );
-        n_subsample = n_subsample_;
-    }
+    PCA(const float* corpus_, int n_corpus_, int dim_)
+        : SparsePCA(corpus_, n_corpus_, dim_, true) {}
 };

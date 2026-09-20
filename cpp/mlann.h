@@ -268,8 +268,7 @@ class MLANN {
             if (q < cost_queries)
                 std::copy(sample.begin(), sample.end(), ids.data() + offsets[q] + truth.cols());
         }
-        const auto kernels =
-            benchmark_query_kernels(queries.topRows(cost_queries), query_k, dist);
+        const auto kernels = benchmark_query_kernels(queries.topRows(cost_queries), query_k, dist);
         const size_t method_bytes = index_bytes() - MLANN::index_bytes();
         std::vector<FrontierConfiguration> best(truth.size() + 1);
         std::vector<float> scores(size_t(depth - min_depth + 1) * ids.size(), 0.f);

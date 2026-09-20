@@ -14,22 +14,11 @@
 #include "../detail/neighbor-query.h"
 #include "../mlann.h"
 
-// Randomized k-d forest: choose uniformly among the top_variance_dims highest-variance
-// coordinates at each node, then split at the median.
+// Randomized k-d forest: density sets the number of highest-variance candidate
+// coordinates at each node; choose one uniformly, then split at the median.
 class KD : public MLANN {
   public:
-    KD(const float* corpus_, int n_corpus_, int dim_, int top_variance_dims_ = 5)
-        : MLANN(corpus_, n_corpus_, dim_) {
-        configure(top_variance_dims_);
-    }
-
-    void configure(int top_variance_dims_) {
-        if (!empty())
-            throw std::logic_error("The index has already been grown.");
-        if (top_variance_dims_ < 1)
-            throw std::invalid_argument("top_variance_dims must be positive.");
-        top_variance_dims = top_variance_dims_;
-    }
+    KD(const float* corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
     void grow(
         int n_trees_,
@@ -74,8 +63,11 @@ class KD : public MLANN {
              (knn.rows() != n_train || knn.cols() < 1 || knn.maxCoeff() >= uint32_t(n_corpus)))) {
             throw std::invalid_argument("Invalid forest data or dimensions.");
         }
-        // KD always ranks all input dimensions; density is accepted for API compatibility.
-        (void) density_;
+        if (!std::isfinite(density_) || density_ == 0.f || density_ > 1.f)
+            throw std::invalid_argument(
+                "Density must be in (0, 1], or negative for automatic density."
+            );
+        const float requested_density = density_ < 0 ? float(1.0 / std::sqrt(dim)) : density_;
 
         corpus_leaves = unsupervised;
         n_trees = n_trees_;
@@ -83,7 +75,9 @@ class KD : public MLANN {
         n_inner_nodes = (1 << depth) - 1;
         n_leaves = 1 << depth;
         n_array = 1 << (depth + 1);
-        density = 1.f;
+        density = requested_density;
+        // Match the float density used by the other forests; retain at least one candidate.
+        candidate_dims = density == 1.f ? dim : std::clamp(int(density * dim), 1, dim);
         b = b_;
 
         split_points.resize(n_inner_nodes, n_trees);
@@ -139,8 +133,9 @@ class KD : public MLANN {
     }
 
     std::unique_ptr<MLANN> make_view(int trees, int d) const override {
-        auto view = std::make_unique<KD>(corpus.data(), n_corpus, dim, top_variance_dims);
+        auto view = std::make_unique<KD>(corpus.data(), n_corpus, dim);
         initialize_view(*view, trees, d);
+        view->candidate_dims = candidate_dims;
         view->corpus_leaves = tuning_unit_labels;
         view->compact_leaf_votes = view->compact_view_votes(tuning_unit_labels, view->votes16_all);
         return view;
@@ -224,7 +219,7 @@ class KD : public MLANN {
     using IndexIterator = std::vector<int>::iterator;
     static constexpr int routing_batch_size = 64;
     bool corpus_leaves = false;
-    int top_variance_dims = 5;
+    int candidate_dims = 1;
 
     struct TreeScratch {
         std::vector<int> rows, dimensions, votes;
@@ -256,7 +251,7 @@ class KD : public MLANN {
         }
         // The common variance denominator cannot change the dimension ranking.
         std::iota(scratch.dimensions.begin(), scratch.dimensions.end(), 0);
-        const int count = std::min(top_variance_dims, dim);
+        const int count = candidate_dims;
         if (count < dim) {
             miniselect::pdqpartial_sort_branchless(
                 scratch.dimensions.begin(),
