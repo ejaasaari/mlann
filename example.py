@@ -20,7 +20,7 @@ training_data = X[30_000:60_000]
 
 q = X[-1]
 
-index = mlann.MLANNIndex(data, "PCA")  # one of RP, PCA, or RF
+index = mlann.MLANNIndex(data, "SparsePCA")  # one of RP, SparsePCA, PCA, or RF
 knn = index.exact_search(training_data, training_k, dist=dist)
 
 index.build(training_data, knn, n_trees, depth)

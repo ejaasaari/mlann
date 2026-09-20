@@ -1,12 +1,9 @@
 #define PY_SSIZE_T_CLEAN
 
-#include <sys/stat.h>
-#include <sys/types.h>
-
 #include <Eigen/Dense>
+#include <climits>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
+#include <cstring>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -26,7 +23,6 @@ typedef Eigen::Matrix<uint32_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
 typedef struct {
     PyObject_HEAD MLANN* index;
     PyArrayObject* py_data;
-    float* data;
     int n;
     int dim;
 } mlannIndex;
@@ -36,7 +32,6 @@ static PyObject* MLANN_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
 
     if (self != NULL) {
         self->index = NULL;
-        self->data = NULL;
         self->py_data = NULL;
     }
 
@@ -157,11 +152,6 @@ static PyObject* build_unsupervised(mlannIndex* self, PyObject* args) {
 }
 
 static void mlann_dealloc(mlannIndex* self) {
-    if (self->data) {
-        delete[] self->data;
-        self->data = NULL;
-    }
-
     if (self->index) {
         delete self->index;
         self->index = NULL;
@@ -186,8 +176,6 @@ static PyObject* ann(mlannIndex* self, PyObject* args) {
     PyObject* nearest;
 
     if (PyArray_NDIM(v) == 1) {
-        dim = PyArray_DIM(v, 0);
-
         npy_intp dims[1] = {k};
         nearest = PyArray_SimpleNew(1, dims, NPY_INT);
         int* outdata = reinterpret_cast<int*>(PyArray_DATA((PyArrayObject*) nearest));
@@ -219,7 +207,6 @@ static PyObject* ann(mlannIndex* self, PyObject* args) {
         int* outdata = reinterpret_cast<int*>(PyArray_DATA((PyArrayObject*) nearest));
 
         if (return_distances) {
-            npy_intp dims[2] = {n, k};
             PyObject* distances = PyArray_SimpleNew(2, dims, NPY_FLOAT32);
             float* distances_out =
                 reinterpret_cast<float*>(PyArray_DATA((PyArrayObject*) distances));
@@ -274,8 +261,6 @@ static PyObject* exact_search(mlannIndex* self, PyObject* args) {
     PyObject* nearest;
 
     if (PyArray_NDIM(v) == 1) {
-        dim = PyArray_DIM(v, 0);
-
         npy_intp dims[1] = {k};
         nearest = PyArray_SimpleNew(1, dims, NPY_INT);
         int* outdata = reinterpret_cast<int*>(PyArray_DATA((PyArrayObject*) nearest));
@@ -307,7 +292,6 @@ static PyObject* exact_search(mlannIndex* self, PyObject* args) {
         int* outdata = reinterpret_cast<int*>(PyArray_DATA((PyArrayObject*) nearest));
 
         if (return_distances) {
-            npy_intp dims[2] = {n, k};
             PyObject* distances = PyArray_SimpleNew(2, dims, NPY_FLOAT32);
             float* distances_out =
                 reinterpret_cast<float*>(PyArray_DATA((PyArrayObject*) distances));
@@ -364,7 +348,7 @@ static PyObject* build_craftml(mlannIndex* self, PyObject* args) {
     int distance;
     if (!PyArg_ParseTuple(
             args,
-            "O!O!iiiiiiiiIi",
+            "O!O!iiiiiiii",
             &PyArray_Type,
             &train,
             &PyArray_Type,
@@ -376,8 +360,6 @@ static PyObject* build_craftml(mlannIndex* self, PyObject* args) {
             &options.label_dim,
             &options.feature_dim,
             &options.iterations,
-            &options.node_sample_size,
-            &options.seed,
             &distance
         ))
         return nullptr;
@@ -414,7 +396,7 @@ static PyObject* build_craftml(mlannIndex* self, PyObject* args) {
 static PyObject* ann_craftml(mlannIndex* self, PyObject* args) {
     PyArrayObject* queries;
     int k, distance, return_distances;
-    int budget = -1;
+    int budget;
     float threshold;
     if (!PyArg_ParseTuple(
             args,
@@ -510,9 +492,9 @@ static PyObject* enable_tuning(mlannIndex* self, PyObject* args) {
         return nullptr;
     if (!(dynamic_cast<KD*>(self->index) || dynamic_cast<RP*>(self->index) ||
           dynamic_cast<SparsePCA*>(self->index) || dynamic_cast<RF*>(self->index) ||
-          dynamic_cast<PLS*>(self->index))) {
+          dynamic_cast<PLS*>(self->index) || dynamic_cast<CraftML*>(self->index))) {
         PyErr_SetString(
-            PyExc_ValueError, "Autotuning supports KD, RP, SparsePCA, PCA, RF and PLS only"
+            PyExc_ValueError, "Autotuning supports KD, RP, SparsePCA, PCA, RF, PLS and CRAFTML only"
         );
         return nullptr;
     }
@@ -548,7 +530,6 @@ static PyObject* tuning_view_impl(mlannIndex* self, PyObject* args, bool timing)
     Py_INCREF(result->py_data);
     result->n = self->n;
     result->dim = self->dim;
-    result->data = nullptr;
     return reinterpret_cast<PyObject*>(result);
 }
 
@@ -743,7 +724,7 @@ static PyObject* estimate_costs(mlannIndex* self, PyObject* args) {
     const auto* data = static_cast<double*>(PyArray_DATA(configurations));
     for (npy_intp i = 0; i < PyArray_DIM(configurations, 0); ++i) {
         if (!std::isfinite(data[3 * i]) || !std::isfinite(data[3 * i + 1]) || data[3 * i] < 1 ||
-            data[3 * i] > INT_MAX || data[3 * i + 1] < 1 || data[3 * i + 1] > 29) {
+            data[3 * i] > INT_MAX || data[3 * i + 1] < 1 || data[3 * i + 1] > (dynamic_cast<CraftML*>(self->index) ? 64 : 29)) {
             PyErr_SetString(PyExc_ValueError, "Invalid cost configuration");
             return nullptr;
         }

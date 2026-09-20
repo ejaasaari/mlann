@@ -488,6 +488,9 @@ class MLANN {
     std::vector<std::vector<int>::iterator> tuning_begins;
 
     virtual bool probability_scores() const { return false; }
+    virtual float tuning_node_score(uint32_t count, float scale, int) const {
+        return float(count) * scale;
+    }
     virtual void tuning_path(const float*, int, int*) const {
         throw std::logic_error("Unsupported tuning forest");
     }
@@ -591,7 +594,7 @@ class MLANN {
     }
 
     // Conservative owned-storage bound; excludes allocator and query scratch.
-    size_t tuning_storage_bound(const Calibration& config, size_t method_bytes) const {
+    virtual size_t tuning_storage_bound(const Calibration& config, size_t method_bytes) const {
         const size_t leaves = size_t(1) << config.depth;
         const size_t mass =
             size_t(tuning_permutations[0].size()) * (tuning_unit_labels ? 1 : tuning_labels.cols());
@@ -833,7 +836,8 @@ class MLANN {
                     const auto hi = std::lower_bound(lo, list.end(), interval.second);
                     const auto count = hi - lo;
                     if (count >= b)
-                        scores[depth_offset + offset] = float(count) * scale;
+                        scores[depth_offset + offset] = tuning_node_score(
+                            uint32_t(count), scale, interval.second - interval.first);
                 }
             }
         }
@@ -996,7 +1000,7 @@ class MLANN {
         touched.clear();
     }
 
-    void fill_tuning_subtree(
+    virtual void fill_tuning_subtree(
         TuningTreePayload& payload,
         int tree,
         int node,
