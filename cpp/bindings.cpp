@@ -547,8 +547,15 @@ static PyObject* calibrate(mlannIndex* self, PyObject* args) {
     double target;
     float fixed_threshold = 0;
     if (!PyArg_ParseTuple(
-            args, "O!O!id|f", &PyArray_Type, &queries, &PyArray_Type, &truth,
-            &min_depth, &target, &fixed_threshold
+            args,
+            "O!O!id|f",
+            &PyArray_Type,
+            &queries,
+            &PyArray_Type,
+            &truth,
+            &min_depth,
+            &target,
+            &fixed_threshold
         ))
         return nullptr;
     if (!craft_array(queries, NPY_FLOAT32, 2, self->dim) || !craft_array(truth, NPY_UINT32, 2))
@@ -730,7 +737,8 @@ static PyObject* estimate_costs(mlannIndex* self, PyObject* args) {
     const auto* data = static_cast<double*>(PyArray_DATA(configurations));
     for (npy_intp i = 0; i < PyArray_DIM(configurations, 0); ++i) {
         if (!std::isfinite(data[3 * i]) || !std::isfinite(data[3 * i + 1]) || data[3 * i] < 1 ||
-            data[3 * i] > INT_MAX || data[3 * i + 1] < 1 || data[3 * i + 1] > (dynamic_cast<CraftML*>(self->index) ? 64 : 29)) {
+            data[3 * i] > INT_MAX || data[3 * i + 1] < 1 ||
+            data[3 * i + 1] > (dynamic_cast<CraftML*>(self->index) ? 64 : 29)) {
             PyErr_SetString(PyExc_ValueError, "Invalid cost configuration");
             return nullptr;
         }

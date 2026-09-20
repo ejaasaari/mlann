@@ -214,7 +214,10 @@ class MLANN {
                 if (threshold == 0) {
                     auto scratch = score; // Never partition the live accumulator.
                     std::nth_element(
-                        scratch.begin(), scratch.begin() + h - 1, scratch.end(), std::greater<float>()
+                        scratch.begin(),
+                        scratch.begin() + h - 1,
+                        scratch.end(),
+                        std::greater<float>()
                     );
                     threshold = scratch[h - 1] / divisor;
                 }
@@ -572,8 +575,8 @@ class MLANN {
         // Zero-support forests still contribute a usable best-effort entry.
         do {
             const float threshold =
-                fixed_threshold > 0 ? fixed_threshold :
-                hits < neighbors.size() && neighbors[hits] > 0
+                fixed_threshold > 0 ? fixed_threshold
+                : hits < neighbors.size() && neighbors[hits] > 0
                     ? neighbors[hits]
                     : (probability_scores() ? std::numeric_limits<float>::min() : 1.f);
             while (hits < neighbors.size() && neighbors[hits] >= threshold)
@@ -850,7 +853,8 @@ class MLANN {
                     const auto count = hi - lo;
                     if (count >= b)
                         scores[depth_offset + offset] = tuning_node_score(
-                            uint32_t(count), scale, interval.second - interval.first);
+                            uint32_t(count), scale, interval.second - interval.first
+                        );
                 }
             }
         }
