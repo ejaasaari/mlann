@@ -72,8 +72,7 @@ inline Eigen::VectorXf principal_direction(
 // Median-split PCA forest fitted on all node rows with a random sparse support.
 class PCA : public MLANN {
   public:
-    PCA(const float* corpus_, int n_corpus_, int dim_)
-        : MLANN(corpus_, n_corpus_, dim_) {}
+    PCA(const float* corpus_, int n_corpus_, int dim_) : MLANN(corpus_, n_corpus_, dim_) {}
 
     void grow(
         int n_trees_,
@@ -119,8 +118,7 @@ class PCA : public MLANN {
              (knn.rows() != n_train || knn.cols() < 1 || knn.maxCoeff() >= uint32_t(n_corpus)))) {
             throw std::invalid_argument("Invalid forest data or dimensions.");
         }
-        const float requested_density =
-            density_ < 0 ? float(1.0 / std::sqrt(dim)) : density_;
+        const float requested_density = density_ < 0 ? float(1.0 / std::sqrt(dim)) : density_;
         if (!std::isfinite(requested_density) || requested_density < 0.f ||
             requested_density > 1.f) {
             throw std::invalid_argument("Density must belong to [0, 1].");
@@ -171,14 +169,7 @@ class PCA : public MLANN {
                     std::minstd_rand generator(std::random_device{}());
                     initialize_projections(tree, generator);
                     grow_subtree(
-                        scratch.rows.begin(),
-                        scratch.rows.end(),
-                        0,
-                        0,
-                        tree,
-                        knn,
-                        train,
-                        scratch
+                        scratch.rows.begin(), scratch.rows.end(), 0, 0, tree, knn, train, scratch
                     );
                     finish_tuning_tree(tree, scratch.rows);
                 } catch (...) {
@@ -224,8 +215,8 @@ class PCA : public MLANN {
     }
 
     size_t index_bytes() const override {
-        return MLANN::index_bytes() + sizeof(PCA) - sizeof(MLANN) +
-               payload_bytes(votes16_all) + size_t(projections.size()) * sizeof(float) +
+        return MLANN::index_bytes() + sizeof(PCA) - sizeof(MLANN) + payload_bytes(votes16_all) +
+               size_t(projections.size()) * sizeof(float) +
                size_t(projection_dims.size()) * sizeof(uint32_t);
     }
 
@@ -370,9 +361,8 @@ class PCA : public MLANN {
         }
         gather_points(begin, count, row, train, scratch.fit);
         const auto points = scratch.fit.leftCols(count);
-        const Eigen::VectorXf direction = pca_detail::principal_direction(
-            points, projections.row(row).transpose()
-        );
+        const Eigen::VectorXf direction =
+            pca_detail::principal_direction(points, projections.row(row).transpose());
         projections.row(row) = direction.transpose();
 
         // Fits contain every row, so their gathered coordinates can be reused.

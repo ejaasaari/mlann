@@ -122,9 +122,7 @@ class CraftML : public MLANN {
                     // Fixed per-tree initialization preserves reproducible tree prefixes.
                     tree.feature_seed = mlann_detail::mix(42ULL + 2ULL * t);
                     const uint64_t label_seed = mlann_detail::mix(42ULL + 2ULL * t + 1);
-                    std::mt19937 generator(
-                        static_cast<uint32_t>(mlann_detail::mix(label_seed))
-                    );
+                    std::mt19937 generator(static_cast<uint32_t>(mlann_detail::mix(label_seed)));
                     auto& projected = scratch.projected;
                     if (options_.feature_dim > 0) {
                         projected.resize(train.rows(), options_.feature_dim);
@@ -152,7 +150,9 @@ class CraftML : public MLANN {
                     );
                     auto& ids = scratch.ids;
                     std::iota(ids.begin(), ids.end(), 0);
-                    grow_node(tree, ids, 0, ids.size(), 0, features, knn, label_seed, generator, scratch);
+                    grow_node(
+                        tree, ids, 0, ids.size(), 0, features, knn, label_seed, generator, scratch
+                    );
                     if (retain_membership) {
                         tuning_permutations[t] = ids;
                         for (const auto& node : tree.nodes)
@@ -343,8 +343,14 @@ class CraftML : public MLANN {
     }
 
     void fill_tuning_subtree(
-        TuningTreePayload& payload, int tree, int node, int level, int d, int& cursor,
-        std::vector<uint32_t>& counts, std::vector<uint32_t>& touched
+        TuningTreePayload& payload,
+        int tree,
+        int node,
+        int level,
+        int d,
+        int& cursor,
+        std::vector<uint32_t>& counts,
+        std::vector<uint32_t>& touched
     ) const override {
         const auto& current = forest[tree].nodes[node];
         if (level == d || current.is_leaf()) {
@@ -370,8 +376,15 @@ class CraftML : public MLANN {
     std::vector<Tree> forest;
     std::vector<size_t> tuning_storage_bounds;
 
-    void subtree_size(int tree, int node, int level, int d, size_t& nodes,
-                      size_t& leaves, size_t& centroids) const {
+    void subtree_size(
+        int tree,
+        int node,
+        int level,
+        int d,
+        size_t& nodes,
+        size_t& leaves,
+        size_t& centroids
+    ) const {
         ++nodes;
         const auto& current = forest[tree].nodes[node];
         if (level == d || current.is_leaf()) {
@@ -388,9 +401,8 @@ class CraftML : public MLANN {
         size_t nodes = 0, leaves = 0, centroids = 0;
         subtree_size(tree, 0, 0, d, nodes, leaves, centroids);
         return sizeof(Tree) + sizeof(std::shared_ptr<const TuningTreePayload>) +
-               sizeof(TuningTreePayload) + nodes * sizeof(Node) +
-               (nodes - 1) * sizeof(uint32_t) + centroids * sizeof(float) +
-               leaves * sizeof(TuningLeafPayload) +
+               sizeof(TuningTreePayload) + nodes * sizeof(Node) + (nodes - 1) * sizeof(uint32_t) +
+               centroids * sizeof(float) + leaves * sizeof(TuningLeafPayload) +
                std::min(mass, leaves * size_t(n_corpus)) * (sizeof(uint32_t) + sizeof(float));
     }
 
@@ -405,7 +417,8 @@ class CraftML : public MLANN {
             target.nodes[result].centroids = current.centroids;
             target.nodes[result].children.resize(current.children.size());
             for (size_t i = 0; i < current.children.size(); ++i) {
-                const auto child = copy_subtree(target, tree, current.children[i], level + 1, d, cursor);
+                const auto child =
+                    copy_subtree(target, tree, current.children[i], level + 1, d, cursor);
                 target.nodes[result].children[i] = child;
             }
         }
@@ -655,8 +668,7 @@ class CraftML : public MLANN {
         std::mt19937& generator,
         TreeScratch& scratch
     ) const {
-        const int sample_size =
-            static_cast<int>(std::min(end - begin, size_t(node_sample_size)));
+        const int sample_size = static_cast<int>(std::min(end - begin, size_t(node_sample_size)));
 
         // A partial Fisher-Yates shuffle samples without replacement in O(sample size).
         for (int i = 0; i < sample_size; ++i) {

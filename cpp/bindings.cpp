@@ -488,9 +488,7 @@ static PyObject* enable_tuning(mlannIndex* self, PyObject* args) {
     if (!(dynamic_cast<KD*>(self->index) || dynamic_cast<RP*>(self->index) ||
           dynamic_cast<PCA*>(self->index) || dynamic_cast<RF*>(self->index) ||
           dynamic_cast<CraftML*>(self->index))) {
-        PyErr_SetString(
-            PyExc_ValueError, "Autotuning supports KD, RP, PCA, RF and CRAFTML only"
-        );
+        PyErr_SetString(PyExc_ValueError, "Autotuning supports KD, RP, PCA, RF and CRAFTML only");
         return nullptr;
     }
     try {

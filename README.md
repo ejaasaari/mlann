@@ -43,7 +43,7 @@ training_data = X[30_000:60_000]
 
 q = X[-1]
 
-index = mlann.MLANNIndex(data, "PCA")  # one of RP, PCA, RF, or NeighborMeanPLS
+index = mlann.MLANNIndex(data, "PCA")  # one of RP, PCA, RF
 knn = index.exact_search(training_data, training_k, dist=dist)  # required for training
 
 index.build(training_data, knn, n_trees, depth)
@@ -58,7 +58,6 @@ The following index types are available:
 - `RF`: random forest
 - `RP`: random projection tree
 - `PCA`: PCA tree
-- `NeighborMeanPLS`: full-input supervised oblique tree with PAL thresholds
 
 On most datasets, `RF` will likely provide the best query performance but can be slower to build. `RP` will likely be the fastest to build while offering the worst query performance, and `PCA` is a compromise between the two.
 
@@ -92,72 +91,3 @@ If you use the library in an academic context, please consider citing the follow
 ## License
 
 MLANN is available under the MIT License (see [LICENSE](LICENSE)). Note that third-party libraries in the [cpp/lib](cpp/lib) folder may be distributed under other open source licenses (see [licenses](licenses)).
-
-## NeighborMeanPLS
-
-This branch adds `NeighborMeanPLS` using the leading query/neighbor-mean cross-covariance direction, followed by the hard PAL threshold scan.
-
-```python
-index = mlann.MLANNIndex(corpus, "NeighborMeanPLS")
-index.build(training_queries, training_neighbors, n_trees=40, depth=15)
-neighbors = index.ann(queries, k=10, votes_required=0.000005, dist=mlann.IP)
-```
-
-The implementation in [cpp/neighbor-mean-pls.h](cpp/neighbor-mean-pls.h) uses all input dimensions,
-float throughout fitting, packed float projections and batched SIMD routing.
-It retains the optimized leading-eigenpair solver and applicable reductions
-from the combined implementation. Per-node diagnostics are removed. Defaults
-are 300 split samples and seed 17; the minimum split gain remains 1e-9 total
-natural-log units. `density` does not restrict this method's input support.
-
-Targets are the actual full-dimensional means of the corpus neighbors, accumulated in float and released after building.
-
-Queries reuse per-thread vote and candidate buffers and prefetch upcoming vote
-updates. Vote accumulation order and exact ranking of every elected candidate
-are preserved. Large Linux vote buffers request huge pages and fall back to
-ordinary pages when unavailable.
-
-Neighbor-mean PLS scores full vectors in four-candidate SIMD batches with
-look-ahead prefetching. Linux builds request huge-page backing for complete
-spans inside the existing corpus allocation. These changes use the existing
-index and query buffers. Unsupported SIMD builds use the original scorer;
-page advice may be declined without affecting correctness.
-Leaf labels are unique within each leaf, allowing SIMD vote updates while
-preserving accumulation and candidate election order.
-For k > 1, exact scoring feeds a heap of the best k candidates in the shared
-score buffer. Every elected vector is still scored in full. Result scores and
-candidate election are unchanged; equal-score result ordering is unspecified.
-This adds no corpus representation, index fields, or query buffer.
-
-C++ callers can supply `NeighborMeanPLS::Options` to the constructor to change the sample
-size and seed. Python uses those defaults.
-
-Build and test from this worktree:
-
-```bash
-python3 setup.py build_ext --inplace
-OMP_NUM_THREADS=2 python3 -m unittest discover -s tests -p 'test_neighbor_mean_pls.py'
-mkdir -p benchmarks/.build
-g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_mean_pls.cpp -o benchmarks/.build/test_method
-benchmarks/.build/test_method
-g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_huge_buffer.cpp -o benchmarks/.build/test_huge_buffer
-benchmarks/.build/test_huge_buffer
-g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_query.cpp -o benchmarks/.build/test_neighbor_query
-benchmarks/.build/test_neighbor_query
-g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_votes.cpp -o benchmarks/.build/test_neighbor_votes
-g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_topk.cpp -o benchmarks/.build/test_neighbor_topk
-benchmarks/.build/test_neighbor_topk
-benchmarks/.build/test_neighbor_votes
-g++ -std=c++17 -O3 -march=native -fopenmp -DEIGEN_DONT_PARALLELIZE -Icpp/lib tests/test_neighbor_topk.cpp -o benchmarks/.build/test_neighbor_topk
-benchmarks/.build/test_neighbor_topk
-```
-
-The benchmark runner accepts the added method:
-
-```bash
-python3 benchmarks/run_rf_yandex_pareto.py --index NeighborMeanPLS --output benchmarks/neighbor-mean-pls_results.csv --label NeighborMeanPLS
-```
-
-This branch is isolated from the same `dc4b882` baseline as `pls-centroid`.
-The branch retains the full-input float fitting implementation and adds the
-query optimizations described above.
