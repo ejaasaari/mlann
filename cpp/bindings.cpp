@@ -12,7 +12,6 @@
 #include "index/craftml.h"
 #include "index/kd.h"
 #include "index/pca.h"
-#include "index/pls.h"
 #include "index/rf.h"
 #include "index/rp.h"
 #include "numpy/arrayobject.h"
@@ -69,12 +68,8 @@ static int MLANN_init(mlannIndex* self, PyObject* args) {
         self->index = new CraftML(data, n, dim);
     else if (strcmp(index_type, "KD") == 0)
         self->index = new KD(data, n, dim);
-    else if (strcmp(index_type, "SparsePCA") == 0)
-        self->index = new SparsePCA(data, n, dim);
     else if (strcmp(index_type, "PCA") == 0)
         self->index = new PCA(data, n, dim);
-    else if (strcmp(index_type, "PLS") == 0)
-        self->index = new PLS(data, n, dim);
     else if (strcmp(index_type, "RF") == 0)
         self->index = new RF(data, n, dim);
     else {
@@ -491,10 +486,10 @@ static PyObject* enable_tuning(mlannIndex* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "|p", &structure_only))
         return nullptr;
     if (!(dynamic_cast<KD*>(self->index) || dynamic_cast<RP*>(self->index) ||
-          dynamic_cast<SparsePCA*>(self->index) || dynamic_cast<RF*>(self->index) ||
-          dynamic_cast<PLS*>(self->index) || dynamic_cast<CraftML*>(self->index))) {
+          dynamic_cast<PCA*>(self->index) || dynamic_cast<RF*>(self->index) ||
+          dynamic_cast<CraftML*>(self->index))) {
         PyErr_SetString(
-            PyExc_ValueError, "Autotuning supports KD, RP, SparsePCA, PCA, RF, PLS and CRAFTML only"
+            PyExc_ValueError, "Autotuning supports KD, RP, PCA, RF and CRAFTML only"
         );
         return nullptr;
     }

@@ -287,7 +287,7 @@ class MLANNIndex(object):
     An MLANN index object
     """
 
-    def __init__(self, data, index_type="SparsePCA"):
+    def __init__(self, data, index_type="PCA"):
         """
         Initializes an MLANN index object.
         :param data: Input data as an NxDim float32 numpy ndarray.
@@ -331,8 +331,8 @@ class MLANNIndex(object):
         Up to 1,024 rows are reserved for calibration, excluded from supervised
         fitting. Unsupervised trees use the whole corpus and require no labels.
         random_state controls calibration/cost sampling, not tree construction.
-        votes_required fixes a positive integer vote threshold for KD/RP/PCA
-        (including SparsePCA); None tunes the threshold as well. This applies
+        votes_required fixes a positive integer vote threshold for KD/RP/PCA;
+        None tunes the threshold as well. This applies
         to both single targets and all subsets of a reusable profile.
         CraftML also accepts its build-time branching/leaf/hash options;
         these stay fixed while tree count, depth and probability threshold vary.
@@ -441,11 +441,11 @@ class MLANNIndex(object):
     def _validate_autotune_input(self, training_queries, knn, options):
         if self.built or getattr(self, "_autotune_profile", None) is not None:
             raise RuntimeError("The index has already been built")
-        if self.index_type not in ("KD", "RP", "SparsePCA", "PCA", "RF", "PLS", "CRAFTML"):
-            raise ValueError("Autotuning supports KD, RP, SparsePCA, PCA, RF, PLS and CRAFTML only")
+        if self.index_type not in ("KD", "RP", "PCA", "RF", "CRAFTML"):
+            raise ValueError("Autotuning supports KD, RP, PCA, RF and CRAFTML only")
         if options.votes_required is not None:
-            if self.index_type not in ("KD", "RP", "SparsePCA", "PCA"):
-                raise ValueError("Fixed votes_required is supported only for KD, RP, SparsePCA and PCA")
+            if self.index_type not in ("KD", "RP", "PCA"):
+                raise ValueError("Fixed votes_required is supported only for KD, RP and PCA")
             _positive_integer("votes_required", options.votes_required)
             if options.votes_required > 2**24:
                 raise ValueError("votes_required must be <= 2**24 for exact float32 representation")
@@ -464,7 +464,7 @@ class MLANNIndex(object):
             _positive_integer("memory_budget", options.memory_budget)
         training_queries = self._distribution_features(training_queries, matrix=True)
         if options.unsupervised:
-            if self.index_type in ("RF", "PLS", "CRAFTML") or knn is not None or options.b != 1:
+            if self.index_type in ("RF", "CRAFTML") or knn is not None or options.b != 1:
                 raise ValueError("Unsupervised tuning requires KD/RP/PCA, no knn and b=1")
             rows = self.n_samples
         else:
@@ -518,7 +518,7 @@ class MLANNIndex(object):
         return master
 
     def _autotune_fallback(self, master, tuning, truth, trees, options):
-        threshold = float(np.finfo(np.float32).tiny) if self.index_type in ("RF", "PLS", "CRAFTML") else 1.0
+        threshold = float(np.finfo(np.float32).tiny) if self.index_type in ("RF", "CRAFTML") else 1.0
         if options.votes_required is not None:
             threshold = options.votes_required
         recalls = master.index._predict_recall(
@@ -591,7 +591,7 @@ class MLANNIndex(object):
     ):
         """
         Builds a normal MLANN index.
-        :param unsupervised: Build KD/SparsePCA/PCA/RP directly on the constructor's corpus,
+        :param unsupervised: Build KD/PCA/RP directly on the constructor's corpus,
                              with one vote per point in each routed leaf. Omit train and knn;
                              b must be 1. Default False preserves supervised leaf votes.
         :param depth: The depth of the trees; should be in the set {1, 2, ..., floor(log2(n))}.
@@ -599,10 +599,10 @@ class MLANNIndex(object):
         :param density: Feature density; "auto" uses 1/sqrt(dim), None uses 1.
                         KD chooses among max(1, floor(density * dim)) highest-variance
                         dimensions per node; density=1 includes every dimension.
-                        PLS uses all input dimensions.
         :param b: Minimum raw label count retained in a node (fixed build-time pruning).
-        RF scores at most 400 sampled rows per node. PCA fits at most 100;
-        PLS fits and scores at most 100; CraftML fits at most 200. These caps are fixed. Smaller nodes
+        PCA fits all node rows.
+        RF scores at most 400 sampled rows per node; CraftML fits at most 200.
+        The RF cap is fixed. Smaller nodes
         use all their rows. Partitioning and leaf votes always use all rows.
         :return:
         """
@@ -611,7 +611,7 @@ class MLANNIndex(object):
 
         if self.index_type == "CRAFTML":
             if unsupervised:
-                raise ValueError("unsupervised is only supported by KD, SparsePCA, PCA and RP")
+                raise ValueError("unsupervised is only supported by KD, PCA and RP")
             train = self._distribution_features(train, matrix=True)
             knn = np.asarray(knn)
             if (knn.ndim != 2 or knn.shape[0] != train.shape[0] or knn.shape[1] == 0
@@ -636,8 +636,8 @@ class MLANNIndex(object):
             raise TypeError("n_trees and depth are required")
         density = self._compute_density(density)
         if unsupervised:
-            if self.index_type not in ("KD", "SparsePCA", "PCA", "RP"):
-                raise ValueError("unsupervised is only supported by KD, SparsePCA, PCA and RP")
+            if self.index_type not in ("KD", "PCA", "RP"):
+                raise ValueError("unsupervised is only supported by KD, PCA and RP")
             if train is not None or knn is not None:
                 raise ValueError("Omit train and knn when unsupervised=True; trees use the corpus")
             if b != 1:

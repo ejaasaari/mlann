@@ -5,7 +5,6 @@
 #include <array>
 #include <cmath>
 #include <exception>
-#include <iterator>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -17,11 +16,6 @@
 #include "../mlann.h"
 
 namespace pca_detail {
-
-struct FitStats {
-    int iterations = 0;
-    bool fallback = false;
-};
 
 // Sparse PCA solves in the smaller feature or sample space. Double precision
 // keeps the direction accurate when the leading eigenvalues are close together.
@@ -49,56 +43,12 @@ inline Eigen::VectorXf direct_direction(const Eigen::MatrixXd& points) {
     return (direction / norm).cast<float>();
 }
 
-// PCA trades exact convergence for bounded build cost. Apply the covariance
-// through the samples, with no dense covariance matrix or eigensolver fallback.
-inline Eigen::VectorXf power_direction(
-    const Eigen::MatrixXf& centered,
-    Eigen::VectorXf direction,
-    FitStats* stats
-) {
-    constexpr int max_iterations = 20;
-    constexpr float tolerance = 1e-3f;
-    Eigen::VectorXf projected(centered.cols());
-    Eigen::VectorXf product(centered.rows());
-    for (int iteration = 0; iteration < max_iterations; ++iteration) {
-        projected.noalias() = centered.transpose() * direction;
-        product.noalias() = centered * projected;
-        if (stats)
-            ++stats->iterations;
-
-        const float norm = product.norm();
-        if (!(norm > 0)) {
-            // An initial direction in the nullspace has no covariance product. A
-            // nonzero sample gives iteration a direction within the data's span.
-            Eigen::Index column;
-            centered.colwise().squaredNorm().maxCoeff(&column);
-            direction = centered.col(column).normalized();
-            if (stats)
-                stats->fallback = true;
-            continue;
-        }
-
-        const float eigenvalue = direction.dot(product);
-        const float residual = (product - eigenvalue * direction).norm();
-        direction = product / norm;
-        if (residual <= tolerance * eigenvalue)
-            break;
-    }
-    return direction;
-}
-
-// Points are columns. SparsePCA fits in double precision; PCA scales centered
-// samples before float power iteration.
+// Points are columns; fit the leading direction in double precision.
 inline Eigen::VectorXf principal_direction(
     const Eigen::Ref<const Eigen::MatrixXf>& points,
-    Eigen::VectorXf initial,
-    bool approximate,
-    FitStats* stats = nullptr,
-    bool points_validated = false
+    Eigen::VectorXf initial
 ) {
-    if (stats)
-        *stats = {};
-    if (points.rows() == 0 || points.cols() < 2 || (!points_validated && !points.allFinite())) {
+    if (points.rows() == 0 || points.cols() < 2 || !points.allFinite()) {
         throw std::invalid_argument("PCA requires finite points and at least two samples");
     }
     if (initial.size() != points.rows() || !initial.allFinite() || initial.stableNorm() == 0) {
@@ -107,42 +57,23 @@ inline Eigen::VectorXf principal_direction(
     initial /= initial.cwiseAbs().maxCoeff();
     initial /= initial.norm();
 
-    if (!approximate) {
-        Eigen::MatrixXd centered = points.cast<double>();
-        const Eigen::VectorXd mean = centered.rowwise().mean();
-        centered.colwise() -= mean;
-        // Finite float inputs and an int-sized row count cannot overflow or
-        // underflow double covariance products, so no intermediate scaling is needed.
-        if (centered.isZero(0))
-            return initial;
-        return direct_direction(centered);
-    }
-
-    const Eigen::VectorXd mean = points.cast<double>().rowwise().mean();
-    double scale = 0;
-    for (Eigen::Index i = 0; i < points.cols(); ++i) {
-        scale = std::max(scale, (points.col(i).cast<double>() - mean).cwiseAbs().maxCoeff());
-    }
-    if (scale == 0)
-        return initial; // Every direction is valid for constant data.
-
-    Eigen::MatrixXf centered(points.rows(), points.cols());
-    for (Eigen::Index i = 0; i < points.cols(); ++i) {
-        centered.col(i) = ((points.col(i).cast<double>() - mean) / scale).cast<float>();
-    }
-    centered /= centered.norm();
-
-    return power_direction(centered, initial, stats);
+    Eigen::MatrixXd centered = points.cast<double>();
+    const Eigen::VectorXd mean = centered.rowwise().mean();
+    centered.colwise() -= mean;
+    // Finite float inputs and an int-sized row count cannot overflow or
+    // underflow double covariance products, so no intermediate scaling is needed.
+    if (centered.isZero(0))
+        return initial;
+    return direct_direction(centered);
 }
 
 } // namespace pca_detail
 
-// Median-split PCA forest. SparsePCA samples coordinates with replacement;
-// PCA uses every coordinate and fits at most 100 sampled rows per node.
-class SparsePCA : public MLANN {
+// Median-split PCA forest fitted on all node rows with a random sparse support.
+class PCA : public MLANN {
   public:
-    SparsePCA(const float* corpus_, int n_corpus_, int dim_)
-        : SparsePCA(corpus_, n_corpus_, dim_, false) {}
+    PCA(const float* corpus_, int n_corpus_, int dim_)
+        : MLANN(corpus_, n_corpus_, dim_) {}
 
     void grow(
         int n_trees_,
@@ -189,7 +120,7 @@ class SparsePCA : public MLANN {
             throw std::invalid_argument("Invalid forest data or dimensions.");
         }
         const float requested_density =
-            full_dimensions ? 1.f : (density_ < 0 ? float(1.0 / std::sqrt(dim)) : density_);
+            density_ < 0 ? float(1.0 / std::sqrt(dim)) : density_;
         if (!std::isfinite(requested_density) || requested_density < 0.f ||
             requested_density > 1.f) {
             throw std::invalid_argument("Density must belong to [0, 1].");
@@ -204,13 +135,12 @@ class SparsePCA : public MLANN {
         b = b_;
         density = requested_density;
         support = static_cast<int>(density * dim);
+        // density=0 retains the degenerate zero-projection behavior.
         const Eigen::Index node_count = Eigen::Index(n_inner_nodes) * n_trees;
 
         split_points.resize(n_inner_nodes, n_trees);
         projections.resize(node_count, support);
-        // Full-support nodes share implicit coordinates 0..dim-1.
-        if (!full_dimensions)
-            projection_dims.resize(node_count, support);
+        projection_dims.resize(node_count, support);
         labels_all.resize(n_trees);
         prepare_tuning(knn, unsupervised, n_train);
         // This bound includes duplicate IDs within a training row. Larger raw
@@ -238,8 +168,7 @@ class SparsePCA : public MLANN {
                         votes_all[tree].resize(n_leaves);
                     std::iota(scratch.rows.begin(), scratch.rows.end(), 0);
 
-                    std::random_device rd;
-                    std::minstd_rand generator(rd());
+                    std::minstd_rand generator(std::random_device{}());
                     initialize_projections(tree, generator);
                     grow_subtree(
                         scratch.rows.begin(),
@@ -249,7 +178,6 @@ class SparsePCA : public MLANN {
                         tree,
                         knn,
                         train,
-                        generator,
                         scratch
                     );
                     finish_tuning_tree(tree, scratch.rows);
@@ -279,28 +207,24 @@ class SparsePCA : public MLANN {
 
   public:
     std::unique_ptr<MLANN> make_view(int trees, int d) const override {
-        auto view = std::unique_ptr<SparsePCA>(
-            new SparsePCA(corpus.data(), n_corpus, dim, full_dimensions)
-        );
+        auto view = std::make_unique<PCA>(corpus.data(), n_corpus, dim);
         initialize_view(*view, trees, d);
         view->corpus_leaves = tuning_unit_labels;
         view->compact_leaf_votes = view->compact_view_votes(tuning_unit_labels, view->votes16_all);
         view->support = support;
         view->projections.resize(Eigen::Index(trees) * view->n_inner_nodes, support);
-        if (!full_dimensions)
-            view->projection_dims.resize(view->projections.rows(), support);
+        view->projection_dims.resize(view->projections.rows(), support);
         for (int t = 0; t < trees; ++t) {
             view->projections.middleRows(view->projection_row(t, 0), view->n_inner_nodes) =
                 projections.middleRows(projection_row(t, 0), view->n_inner_nodes);
-            if (!full_dimensions)
-                view->projection_dims.middleRows(view->projection_row(t, 0), view->n_inner_nodes) =
-                    projection_dims.middleRows(projection_row(t, 0), view->n_inner_nodes);
+            view->projection_dims.middleRows(view->projection_row(t, 0), view->n_inner_nodes) =
+                projection_dims.middleRows(projection_row(t, 0), view->n_inner_nodes);
         }
         return view;
     }
 
     size_t index_bytes() const override {
-        return MLANN::index_bytes() + sizeof(SparsePCA) - sizeof(MLANN) +
+        return MLANN::index_bytes() + sizeof(PCA) - sizeof(MLANN) +
                payload_bytes(votes16_all) + size_t(projections.size()) * sizeof(float) +
                size_t(projection_dims.size()) * sizeof(uint32_t);
     }
@@ -379,15 +303,10 @@ class SparsePCA : public MLANN {
     bool compact_leaf_votes = false;
     std::vector<std::vector<std::vector<uint16_t>>> votes16_all;
 
-    SparsePCA(const float* corpus_, int n_corpus_, int dim_, bool full_dimensions_)
-        : MLANN(corpus_, n_corpus_, dim_), full_dimensions(full_dimensions_) {}
-
   private:
     using IndexIterator = std::vector<int>::iterator;
     static constexpr int routing_batch_size = 64;
-    static constexpr int fitting_row_cap = 100;
     bool corpus_leaves = false;
-    const bool full_dimensions;
     int support = 0;
     RowMatrix projections;
     UIntRowMatrix projection_dims;
@@ -396,14 +315,11 @@ class SparsePCA : public MLANN {
         std::vector<int> rows;
         std::vector<int> votes;
         std::vector<uint32_t> touched_ids;
-        std::vector<int> sampled_rows;
         std::vector<float> row_scores;
         Eigen::MatrixXf fit;
 
         TreeScratch(int corpus_size, int train_size)
-            : rows(train_size), votes(corpus_size, 0), row_scores(train_size) {
-            sampled_rows.reserve(std::min(fitting_row_cap, train_size));
-        }
+            : rows(train_size), votes(corpus_size, 0), row_scores(train_size) {}
     };
 
     Eigen::Index projection_row(int tree, int node) const {
@@ -415,10 +331,8 @@ class SparsePCA : public MLANN {
         std::normal_distribution<float> normal(0, 1);
         for (int node = 0; node < n_inner_nodes; ++node) {
             const auto row = projection_row(tree, node);
-            if (!full_dimensions) {
-                for (int j = 0; j < support; ++j)
-                    projection_dims(row, j) = coordinate(generator);
-            }
+            for (int j = 0; j < support; ++j)
+                projection_dims(row, j) = coordinate(generator);
             for (int j = 0; j < support; ++j)
                 projections(row, j) = normal(generator);
         }
@@ -436,12 +350,8 @@ class SparsePCA : public MLANN {
         for (int i = 0; i < count; ++i) {
             const float* point = train.row(begin[i]).data();
             float* column = output.col(i).data();
-            if (full_dimensions) {
-                std::copy_n(point, support, column);
-            } else {
-                for (int j = 0; j < support; ++j)
-                    column[j] = point[projection_dims(row, j)];
-            }
+            for (int j = 0; j < support; ++j)
+                column[j] = point[projection_dims(row, j)];
         }
     }
 
@@ -450,7 +360,6 @@ class SparsePCA : public MLANN {
         IndexIterator end,
         Eigen::Index row,
         const Eigen::Ref<const RowMatrix>& train,
-        std::minstd_rand& generator,
         TreeScratch& scratch
     ) {
         const int count = end - begin;
@@ -459,74 +368,27 @@ class SparsePCA : public MLANN {
                 scratch.row_scores[*it] = 0.f;
             return;
         }
-        int fit_count = count;
-        if (full_dimensions && count > fitting_row_cap) {
-            scratch.sampled_rows.clear();
-            std::sample(
-                begin, end, std::back_inserter(scratch.sampled_rows), fitting_row_cap, generator
-            );
-            fit_count = fitting_row_cap;
-            gather_points(scratch.sampled_rows.begin(), fit_count, row, train, scratch.fit);
-        } else {
-            gather_points(begin, fit_count, row, train, scratch.fit);
-        }
-
-        const auto points = scratch.fit.leftCols(fit_count);
-        // grow_impl validates all training values before fitting any node.
+        gather_points(begin, count, row, train, scratch.fit);
+        const auto points = scratch.fit.leftCols(count);
         const Eigen::VectorXf direction = pca_detail::principal_direction(
-            points, projections.row(row).transpose(), full_dimensions, nullptr, full_dimensions
+            points, projections.row(row).transpose()
         );
         projections.row(row) = direction.transpose();
 
-        if (!full_dimensions) {
-            // Sparse fits contain every row, so their gathered coordinates can be reused.
-            for (int i = 0; i < count; ++i) {
-                const float* point = scratch.fit.col(i).data();
-                float score = 0.f;
-                for (int j = 0; j < support; ++j)
-                    score += point[j] * projections(row, j);
-                scratch.row_scores[begin[i]] = score;
-            }
-        } else {
-            // Interleave four rows to reuse weights and overlap independent sums,
-            // preserving each row's feature accumulation order.
-            int i = 0;
-            for (; i + 4 <= count; i += 4) {
-                const float* p0 = train.row(begin[i + 0]).data();
-                float s0 = 0.f;
-                const float* p1 = train.row(begin[i + 1]).data();
-                float s1 = 0.f;
-                const float* p2 = train.row(begin[i + 2]).data();
-                float s2 = 0.f;
-                const float* p3 = train.row(begin[i + 3]).data();
-                float s3 = 0.f;
-                for (int j = 0; j < support; ++j) {
-                    const float weight = projections(row, j);
-                    s0 += p0[j] * weight;
-                    s1 += p1[j] * weight;
-                    s2 += p2[j] * weight;
-                    s3 += p3[j] * weight;
-                }
-                scratch.row_scores[begin[i + 0]] = s0;
-                scratch.row_scores[begin[i + 1]] = s1;
-                scratch.row_scores[begin[i + 2]] = s2;
-                scratch.row_scores[begin[i + 3]] = s3;
-            }
-            for (; i < count; ++i)
-                scratch.row_scores[begin[i]] = project(train.row(begin[i]).data(), row);
+        // Fits contain every row, so their gathered coordinates can be reused.
+        for (int i = 0; i < count; ++i) {
+            const float* point = scratch.fit.col(i).data();
+            float score = 0.f;
+            for (int j = 0; j < support; ++j)
+                score += point[j] * projections(row, j);
+            scratch.row_scores[begin[i]] = score;
         }
     }
 
     float project(const float* point, Eigen::Index row) const {
         float score = 0.f;
-        if (full_dimensions) {
-            for (int j = 0; j < support; ++j)
-                score += point[j] * projections(row, j);
-        } else {
-            for (int j = 0; j < support; ++j) {
-                score += point[projection_dims(row, j)] * projections(row, j);
-            }
-        }
+        for (int j = 0; j < support; ++j)
+            score += point[projection_dims(row, j)] * projections(row, j);
         return score;
     }
 
@@ -581,7 +443,6 @@ class SparsePCA : public MLANN {
         int tree,
         const Eigen::Ref<const UIntRowMatrix>& knn,
         const Eigen::Ref<const RowMatrix>& train,
-        std::minstd_rand& generator,
         TreeScratch& scratch
     ) {
         if (level == depth) {
@@ -592,7 +453,7 @@ class SparsePCA : public MLANN {
         record_tuning_node(tree, node, begin, end);
         const int count = end - begin;
         const auto mid = end - count / 2;
-        fit_projection(begin, end, projection_row(tree, node), train, generator, scratch);
+        fit_projection(begin, end, projection_row(tree, node), train, scratch);
         const auto less = [&](int left, int right) {
             return scratch.row_scores[left] < scratch.row_scores[right];
         };
@@ -603,8 +464,8 @@ class SparsePCA : public MLANN {
             const auto left = std::max_element(begin, mid, less);
             split_points(node, tree) = (scratch.row_scores[*mid] + scratch.row_scores[*left]) / 2.0;
         }
-        grow_subtree(begin, mid, level + 1, 2 * node + 1, tree, knn, train, generator, scratch);
-        grow_subtree(mid, end, level + 1, 2 * node + 2, tree, knn, train, generator, scratch);
+        grow_subtree(begin, mid, level + 1, 2 * node + 1, tree, knn, train, scratch);
+        grow_subtree(mid, end, level + 1, 2 * node + 2, tree, knn, train, scratch);
     }
 
     void route_batch(const float* query, int first, int count, int* leaves) const {
@@ -619,10 +480,4 @@ class SparsePCA : public MLANN {
         for (int t = 0; t < count; ++t)
             leaves[t] = nodes[t] - n_inner_nodes;
     }
-};
-
-class PCA : public SparsePCA {
-  public:
-    PCA(const float* corpus_, int n_corpus_, int dim_)
-        : SparsePCA(corpus_, n_corpus_, dim_, true) {}
 };

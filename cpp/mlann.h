@@ -44,7 +44,7 @@ class MLANN {
 
     virtual void grow_unsupervised(int n_trees_, int depth_, float density_ = -1.0) {
         throw std::invalid_argument(
-            "Unsupervised builds are supported only by KD, SparsePCA, PCA and RP."
+            "Unsupervised builds are supported only by KD, PCA and RP."
         );
     }
 
@@ -171,7 +171,7 @@ class MLANN {
     }
 
     virtual std::unique_ptr<MLANN> make_view(int, int) const {
-        throw std::invalid_argument("Autotuning supports KD, RP, SparsePCA, PCA, RF and PLS only");
+        throw std::invalid_argument("Autotuning supports KD, RP, PCA, RF and CRAFTML only");
     }
 
     virtual std::unique_ptr<MLANN> make_timing_view(int trees, int d) const {
