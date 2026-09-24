@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -13,12 +14,14 @@
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 #include "detail/distance.h"
+#include "detail/huge-buffer.h"
 #include "detail/neighbor-query.h"
 #include "miniselect/pdqselect.h"
 
@@ -172,10 +175,6 @@ class MLANN {
         throw std::invalid_argument("Autotuning supports KD, RP, PCA, RF and CRAFTML only");
     }
 
-    virtual std::unique_ptr<MLANN> make_timing_view(int trees, int d) const {
-        return make_view(trees, d);
-    }
-
     struct Calibration {
         int trees, depth;
         float threshold;
@@ -234,6 +233,7 @@ class MLANN {
     struct CostEstimate {
         double votes = 0, candidates = 0, seconds = 0;
         size_t bytes_upper_bound = 0;
+        double touched = 0, elected_votes = 0;
     };
 
     struct FrontierConfiguration {
@@ -251,18 +251,13 @@ class MLANN {
         int cost_queries,
         Distance dist,
         size_t memory_budget = 0,
-        int query_k = 0,
         float fixed_threshold = 0
     ) const {
         check_view(n_trees, min_depth);
         if (!std::isfinite(fixed_threshold) || fixed_threshold < 0)
             throw std::invalid_argument("Invalid fixed vote threshold");
-        // Calibration may use a uniform subset of the requested top-k neighbors.
-        if (query_k == 0)
-            query_k = int(truth.cols());
         if (queries.rows() == 0 || queries.cols() != dim || !queries.allFinite() ||
             truth.rows() != queries.rows() || truth.cols() == 0 || truth.cols() > n_corpus ||
-            query_k < truth.cols() || query_k > n_corpus ||
             truth.maxCoeff() >= uint32_t(n_corpus) || sample.empty() || cost_queries < 1 ||
             cost_queries > queries.rows() || (dist != L2 && dist != IP))
             throw std::invalid_argument("Invalid frontier calibration data");
@@ -270,22 +265,34 @@ class MLANN {
             if (id >= uint32_t(n_corpus))
                 throw std::invalid_argument("Invalid sampled corpus ID");
 
+        size_t population = n_corpus;
+        const auto reachable_sample = sample_cost_ids(sample, dist, population);
+        const auto& cost_sample = reachable_sample.empty() ? sample : reachable_sample;
         std::vector<size_t> offsets(queries.rows() + 1, 0);
         for (int q = 0; q < queries.rows(); ++q)
-            offsets[q + 1] = offsets[q] + truth.cols() + (q < cost_queries ? sample.size() : 0);
+            offsets[q + 1] =
+                offsets[q] + truth.cols() + (q < cost_queries ? cost_sample.size() : 0);
         UIntRowMatrix ids(1, offsets.back());
         for (int q = 0; q < queries.rows(); ++q) {
             std::copy_n(truth.row(q).data(), truth.cols(), ids.data() + offsets[q]);
             if (q < cost_queries)
-                std::copy(sample.begin(), sample.end(), ids.data() + offsets[q] + truth.cols());
+                std::copy(
+                    cost_sample.begin(), cost_sample.end(), ids.data() + offsets[q] + truth.cols()
+                );
         }
-        const auto kernels = benchmark_query_kernels(queries.topRows(cost_queries), query_k, dist);
+        const auto kernels =
+            benchmark_query_kernels(queries.topRows(cost_queries), int(truth.cols()), dist);
         const size_t method_bytes = index_bytes() - MLANN::index_bytes();
         std::vector<FrontierConfiguration> best(truth.size() + 1);
         std::vector<float> scores(size_t(depth - min_depth + 1) * ids.size(), 0.f);
+        const bool track_support = kernels.weighted_mixed_votes;
+        std::vector<uint32_t> support(track_support ? scores.size() : 0, 0);
+        std::vector<uint32_t> candidate_support(
+            track_support ? cost_queries * cost_sample.size() : 0
+        );
         std::vector<double> votes(depth - min_depth + 1, 0.);
         std::vector<float> neighbor_scores(truth.size()),
-            candidate_scores(cost_queries * sample.size());
+            candidate_scores(cost_queries * cost_sample.size());
         stream_requested_scores(
             queries, ids, offsets, min_depth, [&](int tree, const float* weights) {
                 const float divisor = probability_scores() ? float(tree + 1) : 1.f;
@@ -298,11 +305,16 @@ class MLANN {
                             neighbor_scores[size_t(q) * truth.cols() + j] =
                                 scores[base + offsets[q] + j] / divisor;
                         if (q < cost_queries)
-                            for (size_t j = 0; j < sample.size(); ++j) {
+                            for (size_t j = 0; j < cost_sample.size(); ++j) {
                                 const size_t pos = base + offsets[q] + truth.cols() + j;
-                                candidate_scores[size_t(q) * sample.size() + j] =
+                                candidate_scores[size_t(q) * cost_sample.size() + j] =
                                     scores[pos] / divisor;
                                 votes[d - min_depth] += weights[pos] > 0;
+                                if (track_support) {
+                                    support[pos] += weights[pos] > 0;
+                                    candidate_support[size_t(q) * cost_sample.size() + j] =
+                                        support[pos];
+                                }
                             }
                     }
                     const size_t bound = tuning_storage_bound({tree + 1, d, 0, 0}, method_bytes);
@@ -317,7 +329,9 @@ class MLANN {
                         votes[d - min_depth],
                         bound,
                         kernels,
-                        fixed_threshold
+                        fixed_threshold,
+                        track_support ? &candidate_support : nullptr,
+                        population
                     );
                 }
             }
@@ -325,7 +339,8 @@ class MLANN {
         return compact_recall_frontier(best);
     }
 
-    // Uniform corpus-label sampling estimates work, not calibration recall.
+    // Uniform label sampling estimates work, not calibration recall. For a small
+    // reachable IP universe, omit known-zero IDs and scale by that universe.
     std::vector<CostEstimate> estimate_costs(
         const Eigen::Ref<const RowMatrix>& queries,
         const std::vector<Calibration>& configs,
@@ -343,19 +358,34 @@ class MLANN {
                 throw std::invalid_argument("Invalid cost threshold");
             min_depth = std::min(min_depth, c.depth);
         }
-        UIntRowMatrix ids(queries.rows(), sample.size());
-        for (size_t j = 0; j < sample.size(); ++j) {
-            if (sample[j] >= uint32_t(n_corpus))
+        for (auto id : sample)
+            if (id >= uint32_t(n_corpus))
                 throw std::invalid_argument("Invalid sampled corpus ID");
-            ids.col(j).setConstant(sample[j]);
-        }
+        size_t population = n_corpus;
+        const auto reachable_sample = sample_cost_ids(sample, dist, population);
+        const auto& cost_sample = reachable_sample.empty() ? sample : reachable_sample;
+        UIntRowMatrix ids(queries.rows(), cost_sample.size());
+        for (size_t j = 0; j < cost_sample.size(); ++j)
+            ids.col(j).setConstant(cost_sample[j]);
 
-        auto result = estimate_sampled_work(queries, ids, configs, min_depth);
+        auto result = estimate_sampled_work(
+            queries,
+            ids,
+            configs,
+            min_depth,
+            probability_scores() && !sparse_tuning_votes(),
+            population
+        );
         const auto kernels = benchmark_query_kernels(queries, k, dist);
         for (size_t i = 0; i < configs.size(); ++i)
-            result[i].seconds = configs[i].trees * configs[i].depth * kernels.route +
-                                result[i].votes * kernels.vote +
-                                result[i].candidates * kernels.distance;
+            result[i].seconds = kernels.seconds(
+                configs[i].trees,
+                configs[i].depth,
+                result[i].votes,
+                result[i].candidates,
+                result[i].touched,
+                result[i].elected_votes
+            );
         return result;
     }
 
@@ -470,9 +500,21 @@ class MLANN {
             return false;
         const auto& payload = *shared_payloads[tree];
         const auto& data = payload.leaves[leaf];
-        if (payload.unit) {
+        accumulate_tuning_leaf(data, payload.unit, payload.probability, totals, threshold, elected);
+        return true;
+    }
+
+    void accumulate_tuning_leaf(
+        const TuningLeafPayload& data,
+        bool unit,
+        bool probability,
+        float* totals,
+        float threshold,
+        std::vector<uint32_t>& elected
+    ) const {
+        if (unit) {
             mlann_detail::accumulate_unit_votes(data.labels, totals, threshold, elected);
-        } else if (payload.probability) {
+        } else if (probability) {
             for (size_t j = 0; j < data.labels.size(); ++j) {
                 float& total = totals[data.labels[j]];
                 const float previous = total;
@@ -490,7 +532,6 @@ class MLANN {
                 data.labels, data.weights, totals, threshold, elected
             );
         }
-        return true;
     }
     bool tuning_structure_only = false;
     bool tuning_unit_labels = false;
@@ -544,6 +585,88 @@ class MLANN {
 
     struct QueryKernelCosts {
         double route, vote, distance;
+        double setup = 0, election = 0;
+        double touch = 0, sort = 0;
+        std::vector<double> routing_by_depth;
+        double mixed_votes = 0;
+        bool weighted_mixed_votes = false;
+        struct LeafCosts {
+            int trees;
+            double vote, election, touch, mixed;
+            double seconds(double votes, double candidates, double touched, double fraction) const {
+                return votes * vote + candidates * election + touched * touch +
+                       mixed * votes * fraction * (1. - fraction);
+            }
+        };
+        std::vector<LeafCosts> leaf_by_trees;
+        std::vector<std::pair<double, double>> distance_by_candidates;
+        double rerank_seconds(double candidates) const {
+            if (distance_by_candidates.empty())
+                return candidates * distance;
+            auto hi = std::lower_bound(
+                distance_by_candidates.begin(),
+                distance_by_candidates.end(),
+                candidates,
+                [](const auto& point, double n) { return point.first < n; }
+            );
+            if (hi == distance_by_candidates.begin())
+                return candidates * hi->second;
+            if (hi == distance_by_candidates.end())
+                return candidates * distance_by_candidates.back().second;
+            const auto lo = hi - 1;
+            const double weight =
+                std::log(candidates / lo->first) / std::log(hi->first / lo->first);
+            return candidates * (lo->second + weight * (hi->second - lo->second));
+        }
+
+        double leaf_seconds(
+            int trees,
+            double votes,
+            double candidates,
+            double touched,
+            double elected_votes
+        ) const {
+            const double fraction = weighted_mixed_votes ? elected_votes / std::max(1., votes)
+                                                         : candidates / std::max(1., touched);
+            double leaf = LeafCosts{trees, vote, election, touch, mixed_votes}.seconds(
+                votes, candidates, touched, fraction
+            );
+            if (!leaf_by_trees.empty()) {
+                auto hi = std::lower_bound(
+                    leaf_by_trees.begin(),
+                    leaf_by_trees.end(),
+                    trees,
+                    [](const auto& point, int n) { return point.trees < n; }
+                );
+                if (hi == leaf_by_trees.end())
+                    leaf = leaf_by_trees.back().seconds(votes, candidates, touched, fraction);
+                else if (hi == leaf_by_trees.begin())
+                    leaf = hi->seconds(votes, candidates, touched, fraction);
+                else {
+                    const auto lo = hi - 1;
+                    const double weight = std::log(double(trees) / lo->trees) /
+                                          std::log(double(hi->trees) / lo->trees);
+                    leaf = (1. - weight) * lo->seconds(votes, candidates, touched, fraction) +
+                           weight * hi->seconds(votes, candidates, touched, fraction);
+                }
+            }
+            return leaf;
+        }
+
+        double seconds(
+            int trees,
+            int depth,
+            double votes,
+            double candidates,
+            double touched = 0,
+            double elected_votes = 0
+        ) const {
+            const double leaf = leaf_seconds(trees, votes, candidates, touched, elected_votes);
+            const double routing =
+                routing_by_depth.empty() ? depth * route : routing_by_depth[depth];
+            return setup + trees * routing + leaf + rerank_seconds(candidates) +
+                   sort * candidates * std::log2(std::max(1., candidates));
+        }
     };
 
     static bool lower_cost(const CostEstimate& a, const CostEstimate& b) {
@@ -560,15 +683,31 @@ class MLANN {
         double votes,
         size_t bound,
         const QueryKernelCosts& kernels,
-        float fixed_threshold
+        float fixed_threshold,
+        const std::vector<uint32_t>* support = nullptr,
+        size_t population = 0
     ) const {
         std::sort(neighbors.begin(), neighbors.end(), std::greater<float>());
-        std::sort(candidates.begin(), candidates.end(), std::greater<float>());
-        const double scale = double(n_corpus) / candidates.size();
+        std::vector<std::pair<float, uint32_t>> ranked;
+        if (support) {
+            ranked.reserve(candidates.size());
+            for (size_t i = 0; i < candidates.size(); ++i)
+                ranked.emplace_back(candidates[i], (*support)[i]);
+            std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                return a.first > b.first;
+            });
+            for (size_t i = 0; i < candidates.size(); ++i)
+                candidates[i] = ranked[i].first;
+        } else {
+            std::sort(candidates.begin(), candidates.end(), std::greater<float>());
+        }
+        const double scale = double(population ? population : n_corpus) / candidates.size();
         CostEstimate cost;
         cost.votes = votes * scale;
+        cost.touched = scale * std::count_if(candidates.begin(), candidates.end(), [](float s) {
+                           return s > 0;
+                       });
         cost.bytes_upper_bound = bound;
-        const double fixed_cost = trees * d * kernels.route + cost.votes * kernels.vote;
         size_t hits = 0, elected = 0;
         // Zero-support forests still contribute a usable best-effort entry.
         do {
@@ -579,10 +718,15 @@ class MLANN {
                     : (probability_scores() ? std::numeric_limits<float>::min() : 1.f);
             while (hits < neighbors.size() && neighbors[hits] >= threshold)
                 ++hits;
-            while (elected < candidates.size() && candidates[elected] >= threshold)
+            while (elected < candidates.size() && candidates[elected] >= threshold) {
+                if (support)
+                    cost.elected_votes += ranked[elected].second * scale;
                 ++elected;
+            }
             cost.candidates = elected * scale;
-            cost.seconds = fixed_cost + cost.candidates * kernels.distance;
+            cost.seconds = kernels.seconds(
+                trees, d, cost.votes, cost.candidates, cost.touched, cost.elected_votes
+            );
             auto& current = best[hits];
             if (!current.configuration.trees || lower_cost(cost, current.cost))
                 current = {{trees, d, threshold, double(hits) / neighbors.size()}, cost};
@@ -624,11 +768,14 @@ class MLANN {
         const Eigen::Ref<const RowMatrix>& queries,
         const Eigen::Ref<const UIntRowMatrix>& ids,
         const std::vector<Calibration>& configs,
-        int min_depth
+        int min_depth,
+        bool track_support = false,
+        size_t population = 0
     ) const {
         const size_t count = ids.size();
-        const double scale = double(n_corpus) / count;
+        const double scale = double(population ? population : n_corpus) / count;
         std::vector<float> scores(size_t(depth - min_depth + 1) * count, 0.f);
+        std::vector<uint32_t> support(track_support ? scores.size() : 0, 0);
         std::vector<double> votes(depth - min_depth + 1, 0.);
         std::vector<CostEstimate> result(configs.size());
         const size_t method_bytes = index_bytes() - MLANN::index_bytes();
@@ -637,6 +784,8 @@ class MLANN {
                 const size_t offset = size_t(d - min_depth) * count;
                 for (size_t j = 0; j < count; ++j) {
                     scores[offset + j] += weights[offset + j];
+                    if (track_support)
+                        support[offset + j] += weights[offset + j] > 0;
                     votes[d - min_depth] += weights[offset + j] > 0;
                 }
             }
@@ -649,6 +798,16 @@ class MLANN {
                 result[i].candidates = scale * std::count_if(first, first + count, [&](float s) {
                                            return s / divisor >= c.threshold;
                                        });
+                result[i].touched =
+                    scale * std::count_if(first, first + count, [](float s) { return s > 0; });
+                if (track_support) {
+                    double elected_votes = 0;
+                    const size_t offset = size_t(c.depth - min_depth) * count;
+                    for (size_t j = 0; j < count; ++j)
+                        if (scores[offset + j] / divisor >= c.threshold)
+                            elected_votes += support[offset + j];
+                    result[i].elected_votes = elected_votes * scale;
+                }
                 result[i].votes = scale * votes[c.depth - min_depth];
                 result[i].bytes_upper_bound = tuning_storage_bound(c, method_bytes);
             }
@@ -656,15 +815,518 @@ class MLANN {
         return result;
     }
 
-    double benchmark_routing(const Eigen::Ref<const RowMatrix>& queries) const {
+    virtual bool tuning_compact_votes() const { return false; }
+    virtual bool sparse_tuning_votes() const { return false; }
+
+    struct SampledTuningLeaf {
+        int tree, node;
+        TuningLeafPayload payload;
+    };
+    struct SampledLeafWork {
+        int query, depth;
+        std::vector<size_t> leaves;
+    };
+    struct LeafWorkSample {
+        std::vector<SampledTuningLeaf> leaves;
+        std::vector<SampledLeafWork> work;
+        size_t label_visits = 0;
+    };
+    static constexpr size_t leaf_work_budget = 16 << 20;
+    static constexpr size_t candidate_pool_scan_budget = 4 << 20;
+
+    LeafWorkSample sample_leaf_work(const Eigen::Ref<const RowMatrix>& queries) const {
+        // Reconstruct only reached nodes, never complete candidate forests. Bound
+        // logical input-label visits as well as construction, including cache hits.
+        LeafWorkSample sample;
+        std::unordered_map<uint64_t, size_t> cached;
+        std::vector<uint32_t> counts(tuning_unit_labels ? 0 : n_corpus, 0), touched;
+        const int query_count = int(std::min<Eigen::Index>(4, queries.rows()));
+        const int tree_count = std::min(32, n_trees);
+        const size_t query_budget = leaf_work_budget / query_count;
+        const size_t labels_per_row = tuning_unit_labels ? 1 : tuning_labels.cols();
+        for (int qi = 0; qi < query_count; ++qi) {
+            const int q = int(qi * queries.rows() / query_count);
+            std::vector<std::vector<int>> paths(tree_count, std::vector<int>(depth + 1));
+            for (int t = 0; t < tree_count; ++t)
+                tuning_path(queries.row(q).data(), t * n_trees / tree_count, paths[t].data());
+            // Paths repeat terminal nodes. Sample depths within the reached
+            // path so the probes include both terminal and internal workloads.
+            int probe_depth = 1;
+            for (const auto& path : paths) {
+                int reached = 0;
+                while (reached < depth && path[reached + 1] != path[reached])
+                    ++reached;
+                probe_depth = std::max(probe_depth, reached);
+            }
+            const std::array<int, 3> levels{
+                probe_depth, std::max(1, 3 * probe_depth / 4), std::max(1, probe_depth / 2)
+            };
+            size_t used = 0;
+            int previous_depth = -1;
+            for (int d : levels) {
+                if (d == previous_depth)
+                    continue;
+                previous_depth = d;
+                SampledLeafWork work{q, d, {}};
+                for (int t = 0; t < tree_count; ++t) {
+                    const int tree = t * n_trees / tree_count, node = paths[t][d];
+                    const auto interval = tuning_intervals[tree][node];
+                    const size_t visits = size_t(interval.second - interval.first) * labels_per_row;
+                    if (visits > query_budget - used)
+                        continue;
+                    const uint64_t key = (uint64_t(tree) << 32) | uint32_t(node);
+                    auto found = cached.find(key);
+                    if (found == cached.end()) {
+                        const size_t index = sample.leaves.size();
+                        sample.leaves.push_back({tree, node, {}});
+                        fill_tuning_leaf(sample.leaves.back().payload, tree, node, counts, touched);
+                        found = cached.emplace(key, index).first;
+                    }
+                    work.leaves.push_back(found->second);
+                    used += visits;
+                }
+                if (!work.leaves.empty())
+                    sample.work.push_back(std::move(work));
+            }
+            sample.label_visits += used;
+        }
+        return sample;
+    }
+
+    struct LeafCostObservation {
+        double votes, touched, candidates, seconds;
+        double elected_votes = 0, setup_seconds = 0;
+    };
+
+    virtual double benchmark_leaf_probe(
+        const LeafWorkSample& sample,
+        const SampledLeafWork& work,
+        float threshold,
+        float* totals,
+        std::vector<uint32_t>& elected,
+        size_t& candidates,
+        double& setup_seconds
+    ) const {
+        const auto setup_started = std::chrono::steady_clock::now();
+        std::fill_n(totals, n_corpus, 0.f);
+        setup_seconds = elapsed_seconds(setup_started);
+        elected.clear();
+        const auto before = std::chrono::steady_clock::now();
+        for (size_t index : work.leaves)
+            accumulate_tuning_leaf(
+                sample.leaves[index].payload,
+                tuning_unit_labels,
+                probability_scores(),
+                totals,
+                threshold,
+                elected
+            );
+        const double elapsed = elapsed_seconds(before);
+        candidates = elected.size();
+        return elapsed;
+    }
+
+    static Eigen::Vector3d solve_nonnegative_leaf_costs(
+        const Eigen::Matrix3d& normal,
+        const Eigen::Vector3d& rhs,
+        int dimensions
+    ) {
+        Eigen::Vector3d best = Eigen::Vector3d::Zero();
+        double error = std::numeric_limits<double>::infinity();
+        // At most three coefficients: enumerate nonnegative least-squares faces.
+        for (int mask = 0; mask < (1 << dimensions); ++mask) {
+            Eigen::Matrix3d a = normal;
+            Eigen::Vector3d b = rhs;
+            for (int j = 0; j < 3; ++j)
+                if (!(mask & (1 << j))) {
+                    a.row(j).setZero();
+                    a.col(j).setZero();
+                    a(j, j) = 1.;
+                    b[j] = 0.;
+                }
+            const Eigen::Vector3d fit = a.ldlt().solve(b);
+            if (!fit.allFinite() || fit.minCoeff() < 0)
+                continue;
+            const double loss = fit.dot(normal * fit) - 2 * fit.dot(rhs);
+            if (loss < error) {
+                error = loss;
+                best = fit;
+            }
+        }
+        return best;
+    }
+
+    void fit_leaf_costs(
+        QueryKernelCosts& costs,
+        const std::vector<LeafCostObservation>& data,
+        bool anchor_zero_election = false
+    ) const {
+        if (data.empty())
+            return; // Pruned/oversized leaves retain the bounded kernel fallback.
+        const bool sparse = sparse_tuning_votes();
+        const int dimensions = probability_scores() ? 3 : 2;
+        Eigen::Vector3d prior(
+            costs.vote * 1e9, costs.election * 1e9, (sparse ? costs.touch : costs.mixed_votes) * 1e9
+        );
+        double zero_election_vote = 0;
+        size_t zero_election_samples = 0;
+        if (anchor_zero_election && probability_scores() && !sparse) {
+            std::vector<double> rates;
+            for (const auto& row : data)
+                if (row.candidates == 0)
+                    rates.push_back(row.seconds * 1e9 / row.votes);
+            zero_election_samples = rates.size();
+            if (zero_election_samples) {
+                // Use the median of probe rates, as with dense scratch clearing.
+                // One cold or tiny reached leaf must not price every no-election
+                // case at its unusually high per-update cost.
+                std::sort(rates.begin(), rates.end());
+                zero_election_vote = .5 * (rates[(rates.size() - 1) / 2] + rates[rates.size() / 2]);
+                prior[0] = 0;
+            }
+        }
+        // Relative work weighting prevents the largest leaf from dominating.
+        // A weak prior stabilizes correlated update/touch counts and tiny samples.
+        Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+        Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+        for (const auto& row : data) {
+            const double fraction = costs.weighted_mixed_votes ? row.elected_votes / row.votes
+                                                               : row.candidates / row.touched;
+            // RF's conditional threshold crossings are most expensive when
+            // outcomes are mixed. Keep this separate from the zero-election cost.
+            Eigen::Vector3d x(
+                zero_election_samples ? 0. : 1.,
+                row.candidates / row.votes,
+                sparse            ? row.touched / row.votes
+                : dimensions == 3 ? fraction * (1. - fraction)
+                                  : 0.
+            );
+            normal.noalias() += x * x.transpose();
+            rhs.noalias() += x * (row.seconds * 1e9 / row.votes - zero_election_vote);
+        }
+        for (int j = 0; j < 3; ++j) {
+            const double ridge = .1 * std::max(normal(j, j), 1e-6 * data.size());
+            normal(j, j) += ridge;
+            rhs[j] += ridge * prior[j];
+        }
+        const auto best = solve_nonnegative_leaf_costs(normal, rhs, dimensions);
+        // RF's mixed threshold outcomes must not inflate the directly measured
+        // no-election cost, which dominates high-threshold configurations.
+        costs.vote = (zero_election_samples ? zero_election_vote : best[0]) * 1e-9;
+        costs.election = best[1] * 1e-9;
+        if (sparse)
+            costs.touch = best[2] * 1e-9;
+        else if (dimensions == 3)
+            costs.mixed_votes = best[2] * 1e-9;
+    }
+
+    struct LeafCostProbe {
+        SampledLeafWork work;
+        size_t votes, touched;
+        std::array<float, 4> thresholds;
+        std::array<double, 4> elected_votes;
+    };
+
+    struct LeafProbeScratch {
+        mlann_detail::HugeBuffer<float> totals;
+        std::vector<uint32_t> support, touched, elected;
+        std::vector<float> scores;
+
+        LeafProbeScratch(int corpus_size, bool track_support)
+            : support(track_support ? corpus_size : 0, 0) {
+            totals.resize(corpus_size);
+        }
+    };
+
+    std::vector<LeafCostProbe> prepare_leaf_probes(
+        const LeafWorkSample& sample,
+        int prefix,
+        LeafProbeScratch& scratch
+    ) const {
+        auto& totals = scratch.totals;
+        auto& support = scratch.support;
+        auto& touched = scratch.touched;
+        auto& elected = scratch.elected;
+        auto& scores = scratch.scores;
+        // Dense timing probes leave votes behind. Each prefix needs an empty
+        // accumulator so its touched-ID list includes every reached label.
+        std::fill_n(totals.data(), n_corpus, 0.f);
+        std::fill(support.begin(), support.end(), 0);
+        std::vector<LeafCostProbe> probes;
+        const float divisor = probability_scores() ? float(n_trees) : 1.f;
+        for (auto work : sample.work) {
+            work.leaves.resize(std::min(size_t(prefix), work.leaves.size()));
+            size_t votes = 0;
+            // Exact support and real score quantiles determine threshold probes.
+            for (size_t index : work.leaves) {
+                const auto& leaf = sample.leaves[index].payload;
+                votes += leaf.labels.size();
+                for (size_t j = 0; j < leaf.labels.size(); ++j) {
+                    const uint32_t id = leaf.labels[j];
+                    if (!support.empty())
+                        ++support[id];
+                    if (totals[id] == 0.f)
+                        touched.push_back(id);
+                    totals[id] += tuning_unit_labels      ? 1.f
+                                  : !leaf.compact.empty() ? leaf.compact[j]
+                                                          : leaf.weights[j];
+                }
+            }
+            scores.clear();
+            for (uint32_t id : touched)
+                scores.push_back(totals[id] / divisor);
+            auto reset = [&] {
+                for (uint32_t id : touched) {
+                    totals[id] = 0.f;
+                    if (!support.empty())
+                        support[id] = 0;
+                }
+                touched.clear();
+            };
+            if (votes < 128) {
+                reset();
+                continue; // Timer overhead would dominate; retain the prior.
+            }
+            std::sort(scores.begin(), scores.end());
+            const std::array<float, 4> thresholds{
+                scores.front(),
+                scores[scores.size() / 2],
+                scores[3 * scores.size() / 4],
+                std::nextafter(scores.back(), std::numeric_limits<float>::infinity())
+            };
+            elected.reserve(scores.size());
+            touched.reserve(scores.size());
+            std::array<double, 4> elected_votes{};
+            if (!support.empty())
+                for (uint32_t id : touched)
+                    for (int j = 0; j < 4; ++j)
+                        if (totals[id] / divisor >= thresholds[j])
+                            elected_votes[j] += support[id];
+            reset();
+            probes.push_back({std::move(work), votes, scores.size(), thresholds, elected_votes});
+        }
+        return probes;
+    }
+
+    std::vector<LeafCostObservation> measure_leaf_probes(
+        const LeafWorkSample& sample,
+        const std::vector<LeafCostProbe>& probes,
+        LeafProbeScratch& scratch
+    ) const {
+        auto& totals = scratch.totals;
+        auto& elected = scratch.elected;
+        std::vector<LeafCostObservation> observations(probes.size() * 4);
+        for (auto& observation : observations) {
+            observation.seconds = std::numeric_limits<double>::infinity();
+            observation.setup_seconds = std::numeric_limits<double>::infinity();
+        }
+        // Cycle through reached leaves between repeats, within one prefix
+        // size. Large prefixes must not evict every small-prefix payload.
+        for (int repeat = 0; repeat < 4; ++repeat) {
+            for (int threshold_index = 0; threshold_index < 4; ++threshold_index) {
+                for (size_t i = 0; i < probes.size(); ++i) {
+                    const auto& probe = probes[i];
+                    const float threshold = probe.thresholds[threshold_index];
+                    size_t candidates = 0;
+                    double setup_seconds = 0;
+                    const double seconds = benchmark_leaf_probe(
+                        sample,
+                        probe.work,
+                        threshold,
+                        totals.data(),
+                        elected,
+                        candidates,
+                        setup_seconds
+                    );
+                    auto& observation = observations[threshold_index * probes.size() + i];
+                    if (repeat)
+                        observation = {
+                            double(probe.votes),
+                            double(probe.touched),
+                            double(candidates),
+                            std::min(observation.seconds, seconds),
+                            probe.elected_votes[threshold_index],
+                            std::min(observation.setup_seconds, setup_seconds)
+                        };
+                }
+            }
+        }
+        return observations;
+    }
+
+    bool use_prefix_leaf_costs(Distance dist) const {
+        // Working sets change with forest size. Concentrated sparse IP support
+        // uses a pooled fit because tiny prefixes keep its payloads cache-resident.
+        if (!probability_scores())
+            return false;
+        if (dist == L2)
+            return true;
+        return sparse_tuning_votes() ? bounded_candidate_pool().empty()
+                                     : !small_ip_candidate_pool(dist).empty();
+    }
+
+    void calibrate_leaf_costs(
+        const Eigen::Ref<const RowMatrix>& queries,
+        QueryKernelCosts& costs,
+        Distance dist
+    ) const {
+        costs.weighted_mixed_votes = probability_scores() && !sparse_tuning_votes();
+        const auto sample = sample_leaf_work(queries);
+        LeafProbeScratch scratch(n_corpus, costs.weighted_mixed_votes);
+        std::vector<double> setup_samples;
+        const QueryKernelCosts prior = costs;
+        std::vector<int> prefixes{std::min(32, n_trees)};
+        const bool fit_prefixes = use_prefix_leaf_costs(dist);
+        if (fit_prefixes) {
+            prefixes = {1, std::min(8, n_trees), std::min(32, n_trees)};
+            prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
+        }
+        for (int prefix : prefixes) {
+            const auto probes = prepare_leaf_probes(sample, prefix, scratch);
+            const auto observations = measure_leaf_probes(sample, probes, scratch);
+            QueryKernelCosts fitted = prior;
+            fit_leaf_costs(fitted, observations, true);
+            if (!sparse_tuning_votes())
+                for (const auto& observation : observations)
+                    setup_samples.push_back(observation.setup_seconds);
+            if (fit_prefixes && !observations.empty())
+                costs.leaf_by_trees.push_back(
+                    {prefix, fitted.vote, fitted.election, fitted.touch, fitted.mixed_votes}
+                );
+            costs.vote = fitted.vote;
+            costs.election = fitted.election;
+            costs.touch = fitted.touch;
+            costs.mixed_votes = fitted.mixed_votes;
+        }
+        if (!setup_samples.empty()) {
+            // Clearing after real voting work is more representative than
+            // clearing immediately after a large synthetic rerank. Use the
+            // median of per-probe minima to resist occasional timer noise.
+            auto middle = setup_samples.begin() + setup_samples.size() / 2;
+            std::nth_element(setup_samples.begin(), middle, setup_samples.end());
+            costs.setup = *middle;
+        }
+    }
+
+    std::vector<uint32_t> small_ip_candidate_pool(Distance dist) const {
+        // Sparse CraftML keeps corpus sampling and sorted rerank calibration.
+        if (dist != IP || sparse_tuning_votes())
+            return {};
+        return bounded_candidate_pool();
+    }
+
+    std::vector<uint32_t> bounded_candidate_pool() const {
+        // A supervised forest can only elect IDs present in its training labels.
+        // Raw inner-product data can concentrate these labels in a small, reusable
+        // working set. Uniform corpus probes then time mostly unreachable vectors.
+        // Only replace the probe when the complete reachable set fits its existing
+        // 65,536-ID limit. Bound the discovery scan and retain the fallback otherwise.
+        if (tuning_unit_labels || !tuning_labels.size() ||
+            size_t(tuning_labels.size()) > candidate_pool_scan_budget)
+            return {};
+        const size_t limit = std::min(size_t(n_corpus), size_t(65536));
+        std::unordered_set<uint32_t> seen;
+        seen.reserve(std::min(limit, size_t(tuning_labels.size())));
+        for (Eigen::Index j = 0; j < tuning_labels.size(); ++j) {
+            seen.insert(tuning_labels.data()[j]);
+            if (seen.size() >= limit)
+                return {};
+        }
+        std::vector<uint32_t> labels(seen.begin(), seen.end());
+        std::sort(labels.begin(), labels.end());
+        return labels;
+    }
+
+    std::vector<uint32_t> sample_cost_ids(
+        const std::vector<uint32_t>& sample,
+        Distance dist,
+        size_t& population
+    ) const {
+        auto reachable = small_ip_candidate_pool(dist);
+        population = reachable.empty() ? size_t(n_corpus) : reachable.size();
+        if (reachable.size() > sample.size()) {
+            // Preserve caller-controlled randomization without increasing sample
+            // width. Sampling is uniform without replacement in the reachable set.
+            std::seed_seq seed(sample.begin(), sample.end());
+            std::mt19937 generator(seed);
+            std::shuffle(reachable.begin(), reachable.end(), generator);
+            reachable.resize(sample.size());
+        }
+        return reachable;
+    }
+
+    void calibrate_rerank_costs(
+        const Eigen::Ref<const RowMatrix>& queries,
+        int k,
+        Distance dist,
+        bool sorted,
+        QueryKernelCosts& costs,
+        const std::vector<uint32_t>& pool = {}
+    ) const {
+        // Small candidate batches have different cache and top-k costs. Cycle
+        // through query-specific samples before repeating a batch, rather than
+        // timing one tiny, permanently hot candidate list.
+        const int query_count = int(std::min<Eigen::Index>(64, queries.rows()));
+        const size_t population = pool.empty() ? size_t(n_corpus) : pool.size();
+        const size_t anchor = std::min(population, size_t(65536));
+        std::mt19937 generator(937);
+        std::vector<int> found(k);
+        for (size_t count : {size_t(16), size_t(64), size_t(256), size_t(1024)}) {
+            if (count >= anchor)
+                break;
+            std::vector<std::vector<uint32_t>> batches(query_count, std::vector<uint32_t>(count));
+            for (auto& labels : batches) {
+                const size_t shift = generator() % population;
+                for (size_t j = 0; j < count; ++j) {
+                    const auto id = (j * population / count + shift) % population;
+                    labels[j] = pool.empty() ? uint32_t(id) : pool[id];
+                }
+                if (sorted)
+                    std::sort(labels.begin(), labels.end());
+                else
+                    std::shuffle(labels.begin(), labels.end(), generator);
+            }
+            double best = std::numeric_limits<double>::infinity();
+            for (int repeat = 0; repeat < 4; ++repeat) {
+                const auto before = std::chrono::steady_clock::now();
+                for (int q = 0; q < query_count; ++q)
+                    exact_knn(
+                        Eigen::Map<const Eigen::RowVectorXf>(queries.row(q).data(), dim),
+                        k,
+                        batches[q],
+                        found.data(),
+                        dist,
+                        nullptr,
+                        mlann_detail::compute_neighbor_scores,
+                        mlann_detail::compute_neighbor_topk
+                    );
+                const double per_candidate = elapsed_seconds(before) / (query_count * count);
+                if (repeat)
+                    best = std::min(best, per_candidate);
+            }
+            costs.distance_by_candidates.emplace_back(double(count), best);
+        }
+        costs.distance_by_candidates.emplace_back(double(anchor), costs.distance);
+    }
+
+    // Forests override this with the same batched traversal used by query().
+    virtual void route_for_timing(const float* query, int* leaves) const {
         std::vector<int> path(depth + 1);
+        for (int t = 0; t < n_trees; ++t) {
+            tuning_path(query, t, path.data());
+            leaves[t] = path.back();
+        }
+    }
+
+    double benchmark_routing(const Eigen::Ref<const RowMatrix>& queries) const {
+        std::vector<int> leaves(n_trees);
         volatile int sink = 0;
         const auto before = std::chrono::steady_clock::now();
-        for (int q = 0; q < queries.rows(); ++q)
-            for (int t = 0; t < n_trees; ++t) {
-                tuning_path(queries.row(q).data(), t, path.data());
-                sink = path.back();
-            }
+        for (int q = 0; q < queries.rows(); ++q) {
+            route_for_timing(queries.row(q).data(), leaves.data());
+            for (int leaf : leaves)
+                sink = leaf;
+        }
         const double route_seconds =
             elapsed_seconds(before) / (queries.rows() * double(n_trees) * depth);
         (void) sink;
@@ -674,13 +1336,15 @@ class MLANN {
     void benchmark_vote_updates(
         const std::vector<uint32_t>& labels,
         const std::vector<float>& weights,
-        std::vector<float>& totals,
-        std::vector<uint32_t>& elected
+        const std::vector<uint16_t>& compact,
+        float* totals,
+        std::vector<uint32_t>& elected,
+        float threshold
     ) const {
         if (probability_scores()) {
             // Match RF's unscaled probability accumulation, not the faster
             // SIMD raw-vote kernel. Random ID order matches leaf payloads.
-            const float threshold = 0.5f / float(n_trees);
+            threshold /= float(n_trees);
             for (size_t j = 0; j < labels.size(); ++j) {
                 float& total = totals[labels[j]];
                 const float previous = total;
@@ -690,58 +1354,85 @@ class MLANN {
                     elected.push_back(labels[j]);
             }
         } else if (tuning_unit_labels) {
-            mlann_detail::accumulate_unit_votes(labels, totals.data(), 1.f, elected);
+            mlann_detail::accumulate_unit_votes(labels, totals, threshold, elected);
+        } else if (tuning_compact_votes()) {
+            mlann_detail::accumulate_neighbor_votes(labels, compact, totals, threshold, elected);
         } else {
-            mlann_detail::accumulate_neighbor_votes(labels, weights, totals.data(), 1.f, elected);
+            mlann_detail::accumulate_neighbor_votes(labels, weights, totals, threshold, elected);
         }
     }
 
-    QueryKernelCosts benchmark_query_kernels(
+    virtual QueryKernelCosts benchmark_query_kernels(
         const Eigen::Ref<const RowMatrix>& queries,
         int k,
         Distance dist
     ) const {
-        const double route_seconds = benchmark_routing(queries);
+        // Include dense scratch clearing and separate vote updates from election.
+        // Microbenchmarks use the deployed storage representation and routing path.
         const size_t bench_size = std::min(size_t(n_corpus), size_t(65536));
         std::vector<uint32_t> labels(bench_size);
-        for (size_t j = 0; j < bench_size; ++j)
-            labels[j] = uint32_t(j * size_t(n_corpus) / bench_size);
         std::mt19937 benchmark_rng(1729);
-        std::shuffle(labels.begin(), labels.end(), benchmark_rng);
-        std::vector<float> weights(bench_size, 1.f), totals(n_corpus, 0.f);
+        std::vector<float> weights(bench_size, 1.f);
+        std::vector<uint16_t> compact(bench_size, 1);
+        mlann_detail::HugeBuffer<float> totals;
+        totals.resize(n_corpus);
         std::vector<uint32_t> elected;
         elected.reserve(bench_size);
         std::vector<int> found(k);
-        double vote_seconds = std::numeric_limits<double>::infinity();
-        double distance_seconds = vote_seconds;
-        auto before = std::chrono::steady_clock::now();
-        for (int repeat = 0; repeat < 4; ++repeat) {
-            std::fill(totals.begin(), totals.end(), 0.f);
+        auto reachable = small_ip_candidate_pool(dist);
+        QueryKernelCosts costs;
+        costs.route = costs.vote = costs.distance = costs.setup = costs.election =
+            std::numeric_limits<double>::infinity();
+        for (int repeat = 0; repeat < 5; ++repeat) {
+            // Rotate the sample instead of reranking an unusually hot fixed subset.
+            const size_t shift = benchmark_rng() % size_t(n_corpus);
+            for (size_t j = 0; j < bench_size; ++j)
+                labels[j] = uint32_t((j * size_t(n_corpus) / bench_size + shift) % n_corpus);
+            std::shuffle(labels.begin(), labels.end(), benchmark_rng);
+            if (!reachable.empty())
+                std::shuffle(reachable.begin(), reachable.end(), benchmark_rng);
+            std::fill_n(totals.data(), n_corpus, 0.f);
             elected.clear();
+            auto before = std::chrono::steady_clock::now();
+            benchmark_vote_updates(labels, weights, compact, totals.data(), elected, 2.f);
+            const double updated = elapsed_seconds(before) / bench_size;
+            // Measure clearing after voting has touched the buffer. Timing the
+            // first clear after a large synthetic rerank overstates short queries.
             before = std::chrono::steady_clock::now();
-            benchmark_vote_updates(labels, weights, totals, elected);
-            double elapsed = elapsed_seconds(before);
-            if (repeat)
-                vote_seconds = std::min(vote_seconds, elapsed / bench_size);
+            std::fill_n(totals.data(), n_corpus, 0.f);
+            const double cleared = elapsed_seconds(before);
+            before = std::chrono::steady_clock::now();
+            benchmark_vote_updates(labels, weights, compact, totals.data(), elected, 1.f);
+            const double inserted = elapsed_seconds(before) / bench_size;
             before = std::chrono::steady_clock::now();
             exact_knn(
                 Eigen::Map<const Eigen::RowVectorXf>(
                     queries.row(repeat % queries.rows()).data(), dim
                 ),
                 k,
-                labels,
+                reachable.empty() ? labels : reachable,
                 found.data(),
                 dist,
                 nullptr,
                 mlann_detail::compute_neighbor_scores,
                 mlann_detail::compute_neighbor_topk
             );
-            elapsed = elapsed_seconds(before);
-            if (repeat)
-                distance_seconds = std::min(distance_seconds, elapsed / bench_size);
+            const double reranked =
+                elapsed_seconds(before) / (reachable.empty() ? bench_size : reachable.size());
+            const double routed = benchmark_routing(queries);
+            if (repeat) {
+                costs.setup = std::min(costs.setup, cleared);
+                costs.vote = std::min(costs.vote, updated);
+                costs.election = std::min(costs.election, std::max(0., inserted - updated));
+                costs.distance = std::min(costs.distance, reranked);
+                costs.route = std::min(costs.route, routed);
+            }
         }
 
-        return {route_seconds, vote_seconds, distance_seconds};
+        calibrate_leaf_costs(queries, costs, dist);
+        if (dist == L2 || !reachable.empty())
+            calibrate_rerank_costs(queries, k, dist, false, costs, reachable);
+        return costs;
     }
 
     struct TuningPostings {
@@ -863,7 +1554,7 @@ class MLANN {
 #ifdef _OPENMP
         workers = omp_get_max_threads();
 #endif
-        constexpr size_t budget = 128 * 1024 * 1024;
+        constexpr size_t budget = size_t(128) * 1024 * 1024;
         return int(std::max(
             size_t(1),
             std::min(
@@ -971,7 +1662,7 @@ class MLANN {
         return (1 << (d - level)) * (node + 1) - (1 << d);
     }
 
-    void fill_tuning_leaf(
+    virtual void fill_tuning_leaf(
         TuningLeafPayload& leaf,
         int tree,
         int node,

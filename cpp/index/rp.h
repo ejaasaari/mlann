@@ -256,6 +256,26 @@ class RP : public MLANN {
     }
 
   protected:
+    bool tuning_compact_votes() const override { return compact_leaf_votes; }
+    void route_for_timing(const float* data, int* leaves) const override {
+        // Query projection is one matrix-vector product for the whole forest,
+        // not one temporary allocation and product per tree as in tuning_path.
+        static thread_local Eigen::VectorXf projected;
+        projected.resize(n_pool);
+        const Eigen::Map<const Eigen::VectorXf> query(data, dim);
+        if (density < 1)
+            projected.noalias() = sparse_random_matrix * query;
+        else
+            projected.noalias() = dense_random_matrix * query;
+        for (int first = 0; first < n_trees; first += routing_batch_size)
+            route_batch(
+                projected.data(),
+                first,
+                std::min(routing_batch_size, n_trees - first),
+                leaves + first
+            );
+    }
+
     void tuning_path(const float* q, int tree, int* path) const override {
         Eigen::VectorXf projected;
         const Eigen::Map<const Eigen::VectorXf> query(q, dim);

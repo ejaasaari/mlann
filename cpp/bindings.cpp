@@ -500,15 +500,14 @@ static PyObject* enable_tuning(mlannIndex* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
-static PyObject* tuning_view_impl(mlannIndex* self, PyObject* args, bool timing) {
+static PyObject* tuning_view(mlannIndex* self, PyObject* args) {
     int trees, depth;
     if (!PyArg_ParseTuple(args, "ii", &trees, &depth))
         return nullptr;
     std::unique_ptr<MLANN> view;
     PyThreadState* state = PyEval_SaveThread();
     try {
-        view = timing ? self->index->make_timing_view(trees, depth)
-                      : self->index->make_view(trees, depth);
+        view = self->index->make_view(trees, depth);
     } catch (const std::exception& e) {
         PyEval_RestoreThread(state);
         PyErr_SetString(PyExc_ValueError, e.what());
@@ -524,14 +523,6 @@ static PyObject* tuning_view_impl(mlannIndex* self, PyObject* args, bool timing)
     result->n = self->n;
     result->dim = self->dim;
     return reinterpret_cast<PyObject*>(result);
-}
-
-static PyObject* tuning_view(mlannIndex* self, PyObject* args) {
-    return tuning_view_impl(self, args, false);
-}
-
-static PyObject* timing_view(mlannIndex* self, PyObject* args) {
-    return tuning_view_impl(self, args, true);
 }
 
 static PyObject* calibrate(mlannIndex* self, PyObject* args) {
@@ -593,12 +584,11 @@ static PyObject* calibrate(mlannIndex* self, PyObject* args) {
 static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
     PyArrayObject *queries, *truth, *sample;
     int min_depth, cost_queries, dist;
-    int query_k = 0;
     float fixed_threshold = 0;
     unsigned long long budget;
     if (!PyArg_ParseTuple(
             args,
-            "O!O!iO!iiK|if",
+            "O!O!iO!iiK|f",
             &PyArray_Type,
             &queries,
             &PyArray_Type,
@@ -609,7 +599,6 @@ static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
             &cost_queries,
             &dist,
             &budget,
-            &query_k,
             &fixed_threshold
         ))
         return nullptr;
@@ -635,7 +624,6 @@ static PyObject* calibrate_frontier(mlannIndex* self, PyObject* args) {
             cost_queries,
             static_cast<Distance>(dist),
             size_t(budget),
-            query_k,
             fixed_threshold
         );
     } catch (const std::exception& e) {
@@ -843,7 +831,6 @@ static PyMethodDef MLANNMethods[] = {
      (PyCFunction) estimate_costs,
      METH_VARARGS,
      "Sample query work without materializing forests"},
-    {"_make_timing_view", (PyCFunction) timing_view, METH_VARARGS, "Create a native timing view"},
     {"_make_view",
      (PyCFunction) tuning_view,
      METH_VARARGS,

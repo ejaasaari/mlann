@@ -269,9 +269,7 @@ class CraftML : public MLANN {
         accumulate(q, scratch, stats);
         scratch.candidates.clear();
         if (budget == -1) {
-            for (uint32_t id : scratch.touched)
-                if (scratch.votes[id] / n_trees >= threshold)
-                    scratch.candidates.push_back(id);
+            collect_candidates(scratch, threshold);
         } else {
             scratch.ranked.clear();
             for (uint32_t id : scratch.touched)
@@ -311,6 +309,131 @@ class CraftML : public MLANN {
     }
 
   protected:
+    double benchmark_leaf_probe(
+        const LeafWorkSample& sample,
+        const SampledLeafWork& work,
+        float threshold,
+        float*,
+        std::vector<uint32_t>&,
+        size_t& candidates,
+        double& setup_seconds
+    ) const override {
+        // Use the deployed thread-local scratch and helpers, including sparse
+        // clearing. A standalone scatter loop can compile and cache differently.
+        setup_seconds = 0;
+        auto& scratch = query_scratch();
+        scratch.clear(n_corpus);
+        const auto before = std::chrono::steady_clock::now();
+        for (size_t index : work.leaves) {
+            const auto& leaf = sample.leaves[index].payload;
+            scratch.add(leaf.labels, leaf.weights);
+        }
+        collect_candidates(scratch, threshold);
+        candidates = scratch.candidates.size();
+        scratch.clear(n_corpus);
+        return elapsed_seconds(before);
+    }
+
+    double benchmark_routing_depth(
+        const Eigen::Ref<const RowMatrix>& queries,
+        int limit,
+        RowMatrix& projected
+    ) const {
+        volatile uint32_t sink = 0;
+        const auto before = std::chrono::steady_clock::now();
+        for (int q = 0; q < queries.rows(); ++q)
+            for (int first = 0; first < n_trees; first += routing_batch_size) {
+                const int batch = std::min(routing_batch_size, n_trees - first);
+                std::array<uint32_t, routing_batch_size> nodes;
+                route_batch(queries.row(q).data(), first, batch, limit, projected, nodes.data());
+                for (int t = 0; t < batch; ++t)
+                    sink = nodes[t];
+            }
+        const double seconds = elapsed_seconds(before) / (queries.rows() * double(n_trees));
+        (void) sink;
+        return seconds;
+    }
+
+    QueryKernelCosts benchmark_query_kernels(
+        const Eigen::Ref<const RowMatrix>& queries,
+        int k,
+        Distance dist
+    ) const override {
+        // Tuned CraftML has sparse clearing, shared scalar leaf updates, a scan
+        // over all touched IDs, and sorted reranking. Dense-forest costs do not apply.
+        QueryScratch scratch;
+        scratch.clear(n_corpus);
+        const size_t count = std::min(size_t(n_corpus), size_t(65536));
+        std::vector<uint32_t> labels(count);
+        std::vector<float> weights(count, 1.f);
+        std::vector<int> found(k);
+        scratch.touched.reserve(count);
+        scratch.candidates.reserve(count);
+        std::mt19937 generator(1729);
+        QueryKernelCosts costs{0, 0, 0};
+        costs.vote = costs.distance = costs.election = costs.touch = costs.sort =
+            std::numeric_limits<double>::infinity();
+        costs.routing_by_depth.assign(depth + 1, std::numeric_limits<double>::infinity());
+        for (int repeat = 0; repeat < 5; ++repeat) {
+            const size_t shift = generator() % size_t(n_corpus);
+            for (size_t j = 0; j < count; ++j)
+                labels[j] = uint32_t((j * size_t(n_corpus) / count + shift) % n_corpus);
+            std::shuffle(labels.begin(), labels.end(), generator);
+            auto before = std::chrono::steady_clock::now();
+            scratch.add(labels, weights);
+            const double fresh = elapsed_seconds(before) / count;
+            before = std::chrono::steady_clock::now();
+            scratch.add(labels, weights);
+            const double update = elapsed_seconds(before) / count;
+            // Scan every touched ID even when no candidate reaches the threshold.
+            before = std::chrono::steady_clock::now();
+            collect_candidates(scratch, 3.f / n_trees);
+            const double scan = elapsed_seconds(before) / count;
+            before = std::chrono::steady_clock::now();
+            collect_candidates(scratch, 1.f / n_trees);
+            const double elect = elapsed_seconds(before) / count;
+            before = std::chrono::steady_clock::now();
+            miniselect::pdqsort_branchless(scratch.candidates.begin(), scratch.candidates.end());
+            const double sort =
+                elapsed_seconds(before) / (count * std::log2(std::max(size_t(2), count)));
+            before = std::chrono::steady_clock::now();
+            exact_knn(
+                Eigen::Map<const Eigen::RowVectorXf>(
+                    queries.row(repeat % queries.rows()).data(), dim
+                ),
+                k,
+                scratch.candidates,
+                found.data(),
+                dist,
+                nullptr,
+                mlann_detail::compute_neighbor_scores,
+                mlann_detail::compute_neighbor_topk
+            );
+            const double distance = elapsed_seconds(before) / count;
+            before = std::chrono::steady_clock::now();
+            scratch.clear(n_corpus);
+            const double clear = elapsed_seconds(before) / count;
+            if (repeat) {
+                costs.vote = std::min(costs.vote, update);
+                costs.touch = std::min(costs.touch, std::max(0., fresh - update) + scan + clear);
+                costs.election = std::min(costs.election, std::max(0., elect - scan));
+                costs.sort = std::min(costs.sort, sort);
+                costs.distance = std::min(costs.distance, distance);
+            }
+            // Multiway trees can terminate before the requested depth.
+            for (int d = 1; d <= depth; ++d) {
+                const double routed = benchmark_routing_depth(queries, d, scratch.projected);
+                if (repeat)
+                    costs.routing_by_depth[d] = std::min(costs.routing_by_depth[d], routed);
+            }
+        }
+        calibrate_leaf_costs(queries, costs, dist);
+        if (dist == L2)
+            calibrate_rerank_costs(queries, k, dist, true, costs);
+        return costs;
+    }
+
+    bool sparse_tuning_votes() const override { return true; }
     bool probability_scores() const override { return true; }
     float tuning_node_score(uint32_t count, float, int rows) const override {
         return float(count) / rows;
@@ -342,6 +465,24 @@ class CraftML : public MLANN {
         return leaves;
     }
 
+    void fill_tuning_leaf(
+        TuningLeafPayload& leaf,
+        int tree,
+        int node,
+        std::vector<uint32_t>& counts,
+        std::vector<uint32_t>& touched
+    ) const override {
+        count_node(tree, node, counts, touched);
+        leaf.labels.reserve(touched.size());
+        leaf.weights.reserve(touched.size());
+        for (auto id : touched) {
+            leaf.labels.push_back(id);
+            leaf.weights.push_back(float(counts[id]) / forest[tree].nodes[node].training_size);
+            counts[id] = 0;
+        }
+        touched.clear();
+    }
+
     void fill_tuning_subtree(
         TuningTreePayload& payload,
         int tree,
@@ -354,16 +495,7 @@ class CraftML : public MLANN {
     ) const override {
         const auto& current = forest[tree].nodes[node];
         if (level == d || current.is_leaf()) {
-            auto& leaf = payload.leaves[cursor++];
-            count_node(tree, node, counts, touched);
-            leaf.labels.reserve(touched.size());
-            leaf.weights.reserve(touched.size());
-            for (auto id : touched) {
-                leaf.labels.push_back(id);
-                leaf.weights.push_back(float(counts[id]) / current.training_size);
-                counts[id] = 0;
-            }
-            touched.clear();
+            fill_tuning_leaf(payload.leaves[cursor++], tree, node, counts, touched);
         } else {
             for (auto child : current.children)
                 fill_tuning_subtree(payload, tree, child, level + 1, d, cursor, counts, touched);
@@ -467,6 +599,16 @@ class CraftML : public MLANN {
                     votes[id] = 0.f;
             }
             touched.clear();
+        }
+
+        // Autotuned views retain separate shared label/weight arrays.
+        void add(const std::vector<uint32_t>& labels, const std::vector<float>& weights) {
+            for (size_t j = 0; j < labels.size(); ++j) {
+                const auto id = labels[j];
+                if (votes[id] == 0.f)
+                    touched.push_back(id);
+                votes[id] += weights[j];
+            }
         }
 
         // Leaf IDs are unique and probabilities positive. Zero marks unseen IDs.
@@ -575,55 +717,65 @@ class CraftML : public MLANN {
         return best;
     }
 
+    void collect_candidates(QueryScratch& scratch, float threshold) const {
+        scratch.candidates.clear();
+        for (uint32_t id : scratch.touched)
+            if (scratch.votes[id] / n_trees >= threshold)
+                scratch.candidates.push_back(id);
+    }
+
+    void route_batch(
+        const float* q,
+        int first,
+        int count,
+        int limit,
+        RowMatrix& projected,
+        uint32_t* nodes
+    ) const {
+        const int feature_dim = options.feature_dim;
+        if (feature_dim > 0)
+            projected.resize(routing_batch_size, feature_dim);
+        std::fill_n(nodes, count, 0);
+        std::array<int, routing_batch_size> active;
+        for (int t = 0; t < count; ++t) {
+            active[t] = t;
+            if (feature_dim > 0)
+                project(
+                    q, dim, projected.row(t).data(), feature_dim, forest[first + t].feature_seed
+                );
+        }
+        int remaining = count;
+        for (int level = 0; level < limit && remaining; ++level) {
+            int next = 0;
+            for (int i = 0; i < remaining; ++i) {
+                const int t = active[i];
+                const auto& tree = forest[first + t];
+                const auto& node = tree.nodes[nodes[t]];
+                if (node.is_leaf())
+                    continue;
+                const float* features = feature_dim > 0 ? projected.row(t).data() : q;
+                nodes[t] = node.children[route(features, node.centroids)];
+                active[next++] = t;
+            }
+            remaining = next;
+        }
+    }
+
     // Leave raw sums in the table; callers normalize while collecting results.
     void accumulate(const float* q, QueryScratch& scratch, QueryStats* stats) const {
         check_query(q);
         scratch.clear(n_corpus);
-        const int feature_dim = options.feature_dim;
-        if (feature_dim > 0)
-            scratch.projected.resize(routing_batch_size, feature_dim);
         for (int first = 0; first < n_trees; first += routing_batch_size) {
             const int count = std::min(routing_batch_size, n_trees - first);
-            std::array<uint32_t, routing_batch_size> nodes{};
-            std::array<int, routing_batch_size> active;
-            for (int t = 0; t < count; ++t) {
-                active[t] = t;
-                if (feature_dim > 0)
-                    project(
-                        q,
-                        dim,
-                        scratch.projected.row(t).data(),
-                        feature_dim,
-                        forest[first + t].feature_seed
-                    );
-            }
-            int remaining = count;
-            while (remaining) {
-                int next = 0;
-                for (int i = 0; i < remaining; ++i) {
-                    const int t = active[i];
-                    const auto& tree = forest[first + t];
-                    const auto& node = tree.nodes[nodes[t]];
-                    if (node.is_leaf())
-                        continue;
-                    const float* features = feature_dim > 0 ? scratch.projected.row(t).data() : q;
-                    nodes[t] = node.children[route(features, node.centroids)];
-                    active[next++] = t;
-                }
-                remaining = next;
-            }
+            std::array<uint32_t, routing_batch_size> nodes;
+            route_batch(q, first, count, depth, scratch.projected, nodes.data());
             for (int t = 0; t < count; ++t) {
                 const auto& node = forest[first + t].nodes[nodes[t]];
                 if (node.leaf_slot >= 0) {
                     const auto& leaf = shared_payloads[first + t]->leaves[node.leaf_slot];
                     if (stats)
                         stats->visited_labels += leaf.labels.size();
-                    for (size_t j = 0; j < leaf.labels.size(); ++j) {
-                        const auto id = leaf.labels[j];
-                        if (scratch.votes[id] == 0.f)
-                            scratch.touched.push_back(id);
-                        scratch.votes[id] += leaf.weights[j];
-                    }
+                    scratch.add(leaf.labels, leaf.weights);
                 } else {
                     if (stats)
                         stats->visited_labels += node.labels.size();

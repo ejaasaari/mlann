@@ -193,6 +193,13 @@ class RF : public MLANN {
     }
 
   protected:
+    void route_for_timing(const float* query, int* leaves) const override {
+        for (int first = 0; first < n_trees; first += routing_batch_size)
+            route_batch(
+                query, first, std::min(routing_batch_size, n_trees - first), leaves + first
+            );
+    }
+
     bool probability_scores() const override { return true; }
     void tuning_path(const float* q, int tree, int* path) const override {
         path[0] = 0;

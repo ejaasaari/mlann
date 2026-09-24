@@ -283,6 +283,14 @@ class PCA : public MLANN {
     }
 
   protected:
+    bool tuning_compact_votes() const override { return compact_leaf_votes; }
+    void route_for_timing(const float* query, int* leaves) const override {
+        for (int first = 0; first < n_trees; first += routing_batch_size)
+            route_batch(
+                query, first, std::min(routing_batch_size, n_trees - first), leaves + first
+            );
+    }
+
     void tuning_path(const float* q, int tree, int* path) const override {
         path[0] = 0;
         for (int level = 0; level < depth; ++level) {
