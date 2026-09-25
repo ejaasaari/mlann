@@ -300,7 +300,7 @@ class MLANNIndex(object):
         self.built = False
 
     def autotune(
-        self, training_queries, knn=None, *,
+        self, training_queries, knn=None, *, calibration_queries=None,
         k, target_recall=None, n_trees_max, depth_max, depth_min=1,
         density="auto", b=1,
         unsupervised=False, dist=L2, memory_budget=None,
@@ -312,8 +312,13 @@ class MLANNIndex(object):
         """Build one maximum forest; select and materialize one configuration.
 
         Supply representative training_queries and their corpus-neighbor labels.
-        Up to 1,024 rows are reserved for calibration, excluded from supervised
-        fitting. Unsupervised trees use the whole corpus and require no labels.
+        If calibration_queries is None, up to 1,024 training rows are reserved
+        for calibration, excluded from supervised fitting. Otherwise, all
+        training rows are used for fitting and all supplied calibration rows
+        are used for calibration, cost sampling and timing. calibration_queries
+        must be a nonempty float32 matrix with the corpus dimension; its exact
+        neighbors are computed automatically, so knn labels only training_queries.
+        Unsupervised trees use the whole corpus and require no labels.
         random_state controls calibration/cost sampling, not tree construction.
         votes_required fixes a positive integer vote threshold for KD/RP/PCA;
         None tunes the threshold as well. This applies
@@ -357,7 +362,8 @@ class MLANNIndex(object):
         with _autotune_stage(stages, "validation"):
             queries, labels = self._validate_autotune_input(training_queries, knn, options)
             rng = np.random.default_rng(random_state)
-            training = self._prepare_autotune_training(queries, labels, options, rng)
+            training = self._prepare_autotune_training(
+                queries, labels, options, rng, calibration_queries)
             tuning, query_counts = training.calibration, training.query_counts
             del queries, labels
         with _autotune_stage(stages, "structure_build"):
@@ -482,11 +488,15 @@ class MLANNIndex(object):
         self._compute_density(options.density)
         return training_queries, knn
 
-    def _prepare_autotune_training(self, queries, labels, options, rng):
-        fitting_rows, tuning_rows = _autotune_split(
-            len(queries), 0 if options.unsupervised else
-            (1 if self.index_type == "CRAFTML" else 1 << options.depth_min), rng)
-        calibration = np.ascontiguousarray(queries[tuning_rows])
+    def _prepare_autotune_training(self, queries, labels, options, rng, calibration_queries=None):
+        if calibration_queries is None:
+            fitting_rows, tuning_rows = _autotune_split(
+                len(queries), 0 if options.unsupervised else
+                (1 if self.index_type == "CRAFTML" else 1 << options.depth_min), rng)
+            calibration = np.ascontiguousarray(queries[tuning_rows])
+        else:
+            calibration = self._distribution_features(calibration_queries, matrix=True)
+            fitting_rows = np.arange(len(queries))
         if options.unsupervised:
             return _AutotuneTraining(
                 None, None, calibration, options.depth_max,
