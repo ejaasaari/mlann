@@ -56,11 +56,11 @@ class vml_assign_traits {
                                                    : int(Dst::MaxRowsAtCompileTime),
     MaxSizeAtCompileTime = Dst::SizeAtCompileTime,
 
-    MightEnableVml = StorageOrdersAgree && DstHasDirectAccess && SrcHasDirectAccess &&
+    MightEnableVml = bool(StorageOrdersAgree) && bool(DstHasDirectAccess) && bool(SrcHasDirectAccess) &&
                      Src::InnerStrideAtCompileTime == 1 && Dst::InnerStrideAtCompileTime == 1,
-    MightLinearize = MightEnableVml && (int(Dst::Flags) & int(Src::Flags) & LinearAccessBit),
-    VmlSize = MightLinearize ? MaxSizeAtCompileTime : InnerMaxSize,
-    LargeEnough = VmlSize == Dynamic || VmlSize >= EIGEN_MKL_VML_THRESHOLD
+    MightLinearize = bool(MightEnableVml) && (int(Dst::Flags) & int(Src::Flags) & LinearAccessBit),
+    VmlSize = bool(MightLinearize) ? MaxSizeAtCompileTime : InnerMaxSize,
+    LargeEnough = (VmlSize == Dynamic) || VmlSize >= EIGEN_MKL_VML_THRESHOLD
   };
 
  public:
@@ -89,7 +89,7 @@ class vml_assign_traits {
     static void run(DstXprType &dst, const SrcXprType &src, const assign_op<EIGENTYPE, EIGENTYPE> &func) { \
       resize_if_allowed(dst, src, func);                                                                   \
       eigen_assert(dst.rows() == src.rows() && dst.cols() == src.cols());                                  \
-      if (vml_assign_traits<DstXprType, SrcXprNested>::Traversal == LinearTraversal) {                     \
+      if (vml_assign_traits<DstXprType, SrcXprNested>::Traversal == (int)LinearTraversal) {                \
         VMLOP(dst.size(), (const VMLTYPE *)src.nestedExpression().data(),                                  \
               (VMLTYPE *)dst.data() EIGEN_PP_EXPAND(EIGEN_VMLMODE_EXPAND_x##VMLMODE));                     \
       } else {                                                                                             \

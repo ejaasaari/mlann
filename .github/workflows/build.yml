@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - 'setup.py'
+      - '.github/workflows/build.yml'
       - 'cpp/**'
   pull_request:
     paths:
       - 'setup.py'
+      - '.github/workflows/build.yml'
       - 'cpp/**'
 
 jobs:
@@ -18,15 +20,26 @@ jobs:
           - os: ubuntu-24.04
             c: gcc
             cpp: g++
+            target_arch: x86-64-v3
+          - os: ubuntu-24.04
+            c: gcc
+            cpp: g++
+            target_arch: x86-64-v4
           - os: ubuntu-24.04
             c: clang
             cpp: clang++
+            target_arch: x86-64-v3
+          - os: ubuntu-24.04
+            c: clang
+            cpp: clang++
+            target_arch: x86-64-v4
           - os: macos-15
             c: /opt/homebrew/opt/llvm/bin/clang
             cpp: /opt/homebrew/opt/llvm/bin/clang++
             ldflags: -L/opt/homebrew/opt/llvm/lib
           - os: windows-latest
 
+    name: ${{ matrix.os }} / ${{ matrix.cpp }} / ${{ matrix.target_arch }}
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -62,5 +75,6 @@ jobs:
         CC: ${{ matrix.c }}
         CXX: ${{ matrix.cpp }}
         LDFLAGS: ${{ matrix.ldflags }}
+        MLANN_TARGET_ARCH: ${{ matrix.target_arch }}
       run: |
         pip install -v .

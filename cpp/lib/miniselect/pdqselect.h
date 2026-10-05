@@ -932,6 +932,6 @@ inline void pdqselect_branchless(Iter begin, Iter mid, Iter end) {
 
 #undef PDQSORT_PREFER_MOVE
 
-#endif
-
 }  // namespace miniselect
+
+#endif
