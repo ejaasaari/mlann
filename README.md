@@ -1,6 +1,8 @@
 # MLANN
 
-Approximate nearest neighbor search library implementing the [Multilabel Classification Framework](https://proceedings.neurips.cc/paper_files/paper/2022/file/e8752f3e51f33a2e06daf044c40ce412-Paper-Conference.pdf) (NeurIPS '22). This is a research library and will not offer state-of-the-art performance in most scenarios. However, it can be useful in extreme out-of-distribution (OOD) settings or in maximum inner product search (MIPS) where a small portion of queries have the highest inner products with most queries.
+Approximate nearest neighbor search library implementing the [Multilabel Classification Framework](https://proceedings.neurips.cc/paper_files/paper/2022/file/e8752f3e51f33a2e06daf044c40ce412-Paper-Conference.pdf) (NeurIPS '22). This is a research library and might not offer state-of-the-art performance in most scenarios. However, it is useful in extreme out-of-distribution (OOD) settings or in maximum inner product search (MIPS) where a small portion of queries have the highest inner products with most queries, such as approximate attention computation:
+
+![Approximate attention computation](fig/yi-llama-qps-recall.png)
 
 An [extended version](https://www.jmlr.org/papers/volume25/23-0286/23-0286.pdf) of the paper was published in Journal of Machine Learning Research (JMLR).
 
@@ -52,25 +54,23 @@ print('Exact:      ', index.exact_search(q, k, dist=dist))
 print('Approximate:', index.ann(q, k))
 ```
 
-Autotuning automatically selects the tree count, depth, and voting threshold. See the [autotuning paper](https://arxiv.org/abs/1812.07484) (PAKDD 2019).
+Autotuning automatically selects the tree count, depth, and voting threshold. See the [autotuning paper](https://arxiv.org/abs/1812.07484).
 
 The following distances are available: `L2`, `IP`. Cosine distance can be used with `IP` by normalizing vectors.
 
-The following index types are available:
-
-- `KD`: k-d tree
-- `RP`: random projection tree
-- `PCA`: PCA tree
-- `RF`: random forest
-- `CRAFTML`: [CraftML](https://proceedings.mlr.press/v80/siblini18a.html)
+## Index types
 
 | Index | Build time | Index memory | Query time |
 | --- | --- | --- | --- |
-| `KD` | 🟢 Fast | 🔴 High | 🟡 Moderate |
-| `RP` | 🟢 Fast | 🔴 High | 🟡 Moderate |
-| `PCA` | 🟢 Fast | 🟡 Moderate | 🟢 Fast |
-| `RF` | 🟡 Moderate | 🔴 High | 🟡 Moderate |
-| `CRAFTML` | 🟡 Moderate | 🟢 Low | 🟢 Fast |
+| k-d tree (`KD`) | 🟢 Fast | 🔴 High | 🟡 Moderate |
+| random projection tree (`RP`) | 🟢 Fast | 🔴 High | 🟡 Moderate |
+| PCA tree (`PCA`) | 🟢 Fast | 🟡 Moderate | 🟢 Fast |
+| random forest (`RF`) | 🟡 Moderate | 🔴 High | 🟡 Moderate |
+| [CRAFTML](https://proceedings.mlr.press/v80/siblini18a.html) (`CRAFTML`) | 🟡 Moderate | 🟢 Low | 🟢 Fast |
+
+<img src="fig/mlann-classifiers.png" width="61%">
+
+## Training data
 
 Building an MLANN index requires a training set of queries and their k nearest neighbors. If no separate training set is available, the database vectors can be used also as the training set. The k nearest neighbors can be computed e.g. by using
 
