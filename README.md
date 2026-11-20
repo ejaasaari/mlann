@@ -68,7 +68,7 @@ The following distances are available: `L2`, `IP`. Cosine distance can be used w
 | random forest (`RF`) | 🟡 Moderate | 🔴 High | 🟡 Moderate |
 | [CRAFTML](https://proceedings.mlr.press/v80/siblini18a.html) (`CRAFTML`) | 🟡 Moderate | 🟢 Low | 🟢 Fast |
 
-<img src="fig/mlann-classifiers.png" width="61%">
+<img src="fig/mlann-classifiers.png" width="70%">
 
 ## Training data
 
