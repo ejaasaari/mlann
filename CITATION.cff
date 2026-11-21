@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use MLANN in your research, please cite the paper below."
+type: software
+title: MLANN
+authors:
+  - given-names: Elias
+    family-names: Jääsaari
+repository-code: "https://github.com/ejaasaari/mlann"
+license: MIT
+preferred-citation:
+  type: conference-paper
+  title: A Multilabel Classification Framework for Approximate Nearest Neighbor Search
+  authors:
+    - given-names: Ville
+      family-names: Hyvönen
+    - given-names: Elias
+      family-names: Jääsaari
+    - given-names: Teemu
+      family-names: Roos
+  collection-title: Advances in Neural Information Processing Systems
+  volume: 35
+  year: 2022
+  start: 35741
+  end: 35754
+  doi: "10.52202/068431-2590"
